@@ -45,6 +45,13 @@ memmap2 = "0.9"
 # rdma enables the libfabric piece transport (AWS EFA and RoCE/InfiniBand verbs).
 # Requires libfabric headers and library at build time; see build.rs.
 rdma = []
+# urma enables the UMDK/URMA piece transport.
+# Requires UMDK headers and liburma at build time; see build.rs.
+urma = ["dep:bindgen", "dep:cc"]
+
+[build-dependencies]
+bindgen = { version = "0.72.1", optional = true }
+cc = { version = "1.2.32", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

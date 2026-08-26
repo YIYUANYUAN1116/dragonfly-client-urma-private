@@ -446,6 +446,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1543,8 +1545,10 @@ name = "dragonfly-client-storage"
 version = "1.4.2"
 dependencies = [
  "bincode",
+ "bindgen",
  "bytes",
  "bytesize",
+ "cc",
  "chrono",
  "crc32fast",
  "criterion",

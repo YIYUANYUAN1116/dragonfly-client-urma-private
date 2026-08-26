@@ -52,6 +52,9 @@ pub mod rdma;
 pub mod server;
 pub mod storage_engine;
 
+#[cfg(feature = "urma")]
+pub(crate) mod urma;
+
 /// The fallback interval for re-checking the piece metadata while waiting for an
 /// in-flight piece completion notification, guarding against missed notifications
 /// (e.g. the piece metadata is deleted outside the download flow).
