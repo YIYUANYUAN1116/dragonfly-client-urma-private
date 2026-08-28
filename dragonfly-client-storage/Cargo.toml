@@ -48,6 +48,9 @@ rdma = []
 # urma enables the UMDK/URMA piece transport.
 # Requires UMDK headers and liburma at build time; see build.rs.
 urma = ["dep:bindgen", "dep:cc"]
+# Enables deterministic real-provider failure injection for URMA validation binaries. Production
+# builds that only enable `urma` cannot activate these failpoints through the environment.
+urma-test-failpoints = ["urma"]
 
 [build-dependencies]
 bindgen = { version = "0.72.1", optional = true }

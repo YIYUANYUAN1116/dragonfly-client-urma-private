@@ -322,6 +322,7 @@ impl UrmaServerHandler {
 
             collect_upload_piece_started_metrics();
             info!(
+                lane_id = session.lane_id().unwrap_or_default(),
                 piece_kind = ?request.kind,
                 piece_number = request.piece_number,
                 "start upload piece content over urma"
@@ -457,7 +458,10 @@ impl UrmaServerHandler {
             )));
         }
         session.finish_piece().await.map_err(client_error)?;
-        debug!(piece_id, "finished uploading piece content over urma");
+        debug!(
+            lane_id = session.lane_id().unwrap_or_default(),
+            piece_id, "finished uploading piece content over urma"
+        );
         Ok(piece.length)
     }
 

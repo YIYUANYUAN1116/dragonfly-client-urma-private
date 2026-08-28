@@ -19,6 +19,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     time,
 };
+use tracing::{debug, info, warn};
 
 fn control_error(error: ClientError) -> Error {
     Error::Protocol(format!("URMA rendezvous failed: {error}"))
@@ -194,6 +195,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
+        info!(role = "client", lane_id, "urma peer lane established");
         Ok(Self {
             stream,
             fabric,
@@ -220,6 +222,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         {
             return Err(Error::Protocol("invalid URMA Piece request".into()));
         }
+        debug!(
+            role = "client",
+            lane_id = self.open_lane()?,
+            piece_kind = ?request.kind,
+            piece_number = request.piece_number,
+            "urma piece request on peer lane"
+        );
         if let Err(error) = write_control(
             &mut self.stream,
             &Frame::Request(request.clone()),
@@ -334,6 +343,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         }
         match read_control(&mut self.stream, self.control_timeout, "receive Piece Done").await {
             Ok(Frame::Done) => {
+                debug!(
+                    role = "client",
+                    lane_id = self.open_lane()?,
+                    "urma piece finished on peer lane"
+                );
                 self.piece = None;
                 Ok(())
             }
@@ -351,7 +365,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 .await;
         }
         let lane_id = self.lane_id.take().expect("open peer lane");
+        info!(role = "client", lane_id, "closing urma peer lane");
         self.fabric.close_lane(lane_id).await
+    }
+
+    pub(crate) fn lane_id(&self) -> Option<u16> {
+        self.lane_id
     }
 
     fn open_lane(&self) -> Result<u16> {
@@ -361,6 +380,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
 
     async fn abort<T>(&mut self, error: Error) -> Result<T> {
         if let Some(lane_id) = self.lane_id.take() {
+            warn!(role = "client", lane_id, %error, "aborting urma peer lane");
             let _ = self.fabric.abort_lane(lane_id).await;
         }
         Err(error)
@@ -370,6 +390,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
 impl<S> Drop for UrmaClientSession<S> {
     fn drop(&mut self) {
         if let Some(lane_id) = self.lane_id.take() {
+            debug!(role = "client", lane_id, "dropping active urma peer lane");
             let _ = self.fabric.try_abort_lane(lane_id);
         }
     }
@@ -435,6 +456,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
+        info!(role = "server", lane_id, "urma peer lane established");
         Ok(Self {
             stream,
             fabric,
@@ -481,6 +503,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             shape: None,
             next_chunk: 0,
         });
+        debug!(
+            role = "server",
+            lane_id = self.open_lane()?,
+            piece_kind = ?request.kind,
+            piece_number = request.piece_number,
+            "urma piece request received on peer lane"
+        );
         Ok(request)
     }
 
@@ -641,6 +670,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         {
             return self.abort(error).await;
         }
+        debug!(
+            role = "server",
+            lane_id = self.open_lane()?,
+            "urma piece finished on peer lane"
+        );
         self.piece = None;
         Ok(())
     }
@@ -670,7 +704,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
                 .await;
         }
         let lane_id = self.lane_id.take().expect("open peer lane");
+        info!(role = "server", lane_id, "closing urma peer lane");
         self.fabric.close_lane(lane_id).await
+    }
+
+    pub(crate) fn lane_id(&self) -> Option<u16> {
+        self.lane_id
     }
 
     fn open_lane(&self) -> Result<u16> {
@@ -680,6 +719,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
 
     async fn abort<T>(&mut self, error: Error) -> Result<T> {
         if let Some(lane_id) = self.lane_id.take() {
+            warn!(role = "server", lane_id, %error, "aborting urma peer lane");
             let _ = self.fabric.abort_lane(lane_id).await;
         }
         Err(error)
@@ -700,6 +740,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
 impl<S> Drop for UrmaServerSession<S> {
     fn drop(&mut self) {
         if let Some(lane_id) = self.lane_id.take() {
+            debug!(role = "server", lane_id, "dropping active urma peer lane");
             let _ = self.fabric.try_abort_lane(lane_id);
         }
     }

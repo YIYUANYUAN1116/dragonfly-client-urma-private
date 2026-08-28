@@ -920,7 +920,7 @@ pub mod urma {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Instant;
-    use tracing::{info, warn};
+    use tracing::{debug, info, warn};
 
     /// FABRIC_RETRY_INTERVAL is how long to wait before retrying fabric initialization after a
     /// failure.
@@ -1187,6 +1187,7 @@ pub mod urma {
                         Some(client.clone())
                     }
                     Some(_) => {
+                        debug!(parent_addr = addr, "retiring idle cached urma client");
                         clients.remove(addr);
                         None
                     }
@@ -1206,8 +1207,13 @@ pub mod urma {
                         }
                         None => {}
                     }
+                    debug!(parent_addr = addr, "reusing cached urma client");
                     return Ok(client);
                 }
+                warn!(
+                    parent_addr = addr,
+                    "retiring cached urma client after fabric failure"
+                );
                 self.retire_client(addr).await;
             }
             let (fabric, capability) = self.fabric().await?;
@@ -1225,6 +1231,11 @@ pub mod urma {
                 capability,
                 advertisement.capability,
                 rendezvous_addr.to_string(),
+            );
+            info!(
+                parent_addr = addr,
+                rendezvous_addr = %rendezvous_addr,
+                "created cached urma client"
             );
             self.clients
                 .lock()

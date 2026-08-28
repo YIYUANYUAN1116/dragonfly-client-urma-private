@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time;
-use tracing::{debug, error, instrument, Span};
+use tracing::{debug, error, instrument, warn, Span};
 
 /// Cap of concurrent receive windows buffered between the transfer task and the
 /// storage writer, mirroring the TCP/QUIC client backpressure.
@@ -45,6 +45,49 @@ const TRANSFER_HEALTHY: u8 = 0;
 const TRANSFER_ACTIVE: u8 = 1;
 const TRANSFER_SUCCEEDED: u8 = 2;
 const TRANSFER_FAILED: u8 = 3;
+
+/// Validation-only failpoint. It is compiled out unless `urma-test-failpoints` is explicitly
+/// enabled, so a production `urma` build cannot be faulted through its environment.
+const FAIL_AFTER_RECV_WINDOWS_ENV: &str = "DF_URMA_FAIL_AFTER_RECV_WINDOWS";
+
+#[cfg(any(feature = "urma-test-failpoints", test))]
+fn parse_fail_after_recv_windows(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|windows| *windows > 0)
+}
+
+fn fail_after_recv_windows() -> Option<u64> {
+    #[cfg(feature = "urma-test-failpoints")]
+    {
+        let value = std::env::var(FAIL_AFTER_RECV_WINDOWS_ENV).ok()?;
+        match parse_fail_after_recv_windows(&value) {
+            Some(windows) => Some(windows),
+            None => {
+                warn!(
+                    env = FAIL_AFTER_RECV_WINDOWS_ENV,
+                    value, "ignoring invalid urma receive-window failpoint"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "urma-test-failpoints"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fail_after_recv_windows;
+
+    #[test]
+    fn receive_window_failpoint_requires_a_positive_integer() {
+        assert_eq!(parse_fail_after_recv_windows("3"), Some(3));
+        for invalid in ["", "0", "-1", "not-a-number"] {
+            assert_eq!(parse_fail_after_recv_windows(invalid), None);
+        }
+    }
+}
 
 type SessionSlot = Arc<tokio::sync::Mutex<Option<UrmaClientSession<TcpStream>>>>;
 
@@ -138,6 +181,9 @@ pub struct UrmaClient {
     /// transfer_state lets the downloader observe failures that happen after
     /// this method has returned the streaming body.
     transfer_state: Arc<AtomicU8>,
+
+    /// Number of real receive windows to complete before injecting a validation failure.
+    fail_after_recv_windows: Option<u64>,
 }
 
 /// UrmaClient implements the UMDK/URMA piece download client.
@@ -154,6 +200,14 @@ impl UrmaClient {
         let transfer_timeout = config.storage.server.urma.transfer_timeout;
         let mut lane_config = UrmaLaneConfig::default();
         lane_config.recv_depth = config.storage.server.urma.max_inflight_chunks;
+        let fail_after_recv_windows = fail_after_recv_windows();
+        if let Some(windows) = fail_after_recv_windows {
+            warn!(
+                windows,
+                env = FAIL_AFTER_RECV_WINDOWS_ENV,
+                "urma real-provider receive failpoint armed"
+            );
+        }
         Self {
             config,
             fabric,
@@ -165,6 +219,7 @@ impl UrmaClient {
             transfer_timeout,
             session: Arc::new(tokio::sync::Mutex::new(None)),
             transfer_state: Arc::new(AtomicU8::new(TRANSFER_HEALTHY)),
+            fail_after_recv_windows,
         }
     }
 
@@ -277,8 +332,8 @@ impl UrmaClient {
                 "previous urma transfer failed; retire the cached peer session".into(),
             ));
         }
-        let mut session = match session_slot.take() {
-            Some(session) => session,
+        let (mut session, reused_session) = match session_slot.take() {
+            Some(session) => (session, true),
             None => {
                 let stream = TcpStream::connect(&self.addr).await?;
                 let socket = SockRef::from(&stream);
@@ -289,7 +344,7 @@ impl UrmaClient {
                         .with_time(super::DEFAULT_KEEPALIVE_TIME)
                         .with_retries(super::DEFAULT_KEEPALIVE_RETRIES),
                 )?;
-                UrmaClientSession::connect(
+                let session = UrmaClientSession::connect(
                     stream,
                     self.fabric.clone(),
                     self.lane_config,
@@ -298,9 +353,18 @@ impl UrmaClient {
                     self.control_timeout,
                 )
                 .await
-                .map_err(urma_error)?
+                .map_err(urma_error)?;
+                (session, false)
             }
         };
+        debug!(
+            parent_addr = self.addr,
+            lane_id = session.lane_id().unwrap_or_default(),
+            reused_session,
+            piece_kind = ?kind,
+            piece_number = number,
+            "urma client selected peer lane"
+        );
 
         // The control-plane negotiated the effective message size before the
         // lane was bound; a chunk of that size keeps uploads single-SGE.
@@ -328,11 +392,33 @@ impl UrmaClient {
         let transfer_timeout = self.transfer_timeout;
         let piece_timeout = self.config.download.piece_timeout;
         let transfer_state = self.transfer_state.clone();
+        let fail_after_recv_windows = self.fail_after_recv_windows;
         transfer_state.store(TRANSFER_ACTIVE, Ordering::Release);
         tokio::spawn(async move {
             let mut transfer = Box::pin(async {
+                let mut completed_windows = 0u64;
                 loop {
                     let window = session.receive_next_window(transfer_timeout).await?;
+                    completed_windows += 1;
+                    if fail_after_recv_windows == Some(completed_windows) {
+                        // Publish a non-final completed window first so Storage contains a real
+                        // partial Piece when the normal error/fallback path resets it. The final
+                        // window stays behind the existing Done gate.
+                        if !session.piece_complete()
+                            && window_tx.send(Ok(Bytes::from(window))).await.is_err()
+                        {
+                            transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
+                            return Ok(());
+                        }
+                        warn!(
+                            lane_id = session.lane_id().unwrap_or_default(),
+                            completed_windows,
+                            "injecting urma failure after real receive completions"
+                        );
+                        return Err(UrmaError::Protocol(format!(
+                            "injected failure after {completed_windows} completed receive windows"
+                        )));
+                    }
                     if session.piece_complete() {
                         // Storage stops polling after it receives the expected
                         // byte count. Hold the final bytes until Done has been

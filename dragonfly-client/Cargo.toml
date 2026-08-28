@@ -37,6 +37,8 @@ rdma = ["dragonfly-client-storage/rdma"]
 # urma enables the UMDK/URMA piece transport.
 # Requires UMDK headers and liburma at build time.
 urma = ["dragonfly-client-storage/urma"]
+# Opt-in validation-only URMA failpoints; never include this feature in production packages.
+urma-test-failpoints = ["urma", "dragonfly-client-storage/urma-test-failpoints"]
 
 [dependencies]
 dragonfly-client-core.workspace = true
