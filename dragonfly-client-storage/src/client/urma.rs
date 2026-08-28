@@ -144,16 +144,16 @@ pub struct UrmaClient {
 impl UrmaClient {
     /// Creates a new UrmaClient for one parent address. The remote capability
     /// is obtained from [`discover`] by the downloader before construction.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<Config>,
         fabric: UrmaFabricHandle,
         capability: UrmaCapability,
-        lane_config: UrmaLaneConfig,
         remote_capability: UrmaCapability,
         addr: String,
     ) -> Self {
         let transfer_timeout = config.storage.server.urma.transfer_timeout;
+        let mut lane_config = UrmaLaneConfig::default();
+        lane_config.recv_depth = config.storage.server.urma.max_inflight_chunks;
         Self {
             config,
             fabric,

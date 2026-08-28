@@ -14,7 +14,7 @@ use super::{
 };
 use std::thread::{self, JoinHandle};
 use std::{
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -29,10 +29,25 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 
+/// Process-wide weak registry used by dfdaemon's server and downloader adapters. Native UMDK
+/// permits one Runtime owner in this implementation, so independently starting both adapters
+/// would make the second one fail with `AlreadyInitialized`.
+static SHARED_FABRIC: OnceLock<Mutex<Weak<FabricInner>>> = OnceLock::new();
+
+fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> Result<()> {
+    if active == requested {
+        return Ok(());
+    }
+    Err(Error::InvalidConfiguration(format!(
+        "URMA Fabric is already running for device {} EID {}, requested device {} EID {}",
+        active.device_name, active.eid_index, requested.device_name, requested.eid_index
+    )))
+}
+
 /// Dragonfly-facing Jetty sizing. Native tokens and handles remain private to
 /// the owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UrmaLaneConfig {
+pub(crate) struct UrmaLaneConfig {
     pub send_depth: u32,
     pub recv_depth: u32,
     pub max_send_sge: u32,
@@ -99,8 +114,39 @@ impl UrmaFabric {
     /// Starts the owner thread and waits until native initialization either
     /// succeeds or rolls back. A successful return therefore means the runtime
     /// is ready, not merely that a thread was spawned.
-    pub fn start(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
+    pub(crate) fn start(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
         Self::start_with_capacity(config, DEFAULT_COMMAND_CAPACITY)
+    }
+
+    /// Returns the ready process Fabric for an identical runtime configuration, or starts it.
+    /// The weak registry does not extend the native lifetime; the last handle still owns shutdown.
+    pub fn get_or_start(
+        device_name: impl Into<String>,
+        eid_index: u32,
+    ) -> Result<UrmaFabricHandle> {
+        let config = RuntimeConfig::new(device_name, eid_index);
+        let mut shared = SHARED_FABRIC
+            .get_or_init(|| Mutex::new(Weak::new()))
+            .lock()
+            .unwrap();
+        if let Some(inner) = shared.upgrade() {
+            validate_shared_config(&inner.runtime_config, &config)?;
+            let readiness = inner.readiness.borrow().clone();
+            return match readiness {
+                FabricReadiness::Ready => Ok(UrmaFabricHandle { inner }),
+                FabricReadiness::Starting => Err(Error::InvalidConfiguration(
+                    "shared URMA Fabric is still starting".into(),
+                )),
+                FabricReadiness::Failed(error) => Err(Error::Protocol(format!(
+                    "shared URMA Fabric failed: {error}"
+                ))),
+                FabricReadiness::Stopped => Err(fabric_stopped()),
+            };
+        }
+
+        let handle = Self::start(config)?;
+        *shared = Arc::downgrade(&handle.inner);
+        Ok(handle)
     }
 
     fn start_with_capacity(
@@ -118,6 +164,7 @@ impl UrmaFabric {
         let (readiness_tx, readiness_rx) = watch::channel(FabricReadiness::Starting);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
 
+        let runtime_config = config.clone();
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
             .spawn(move || run_owner(config, command_rx, readiness_tx, startup_tx))
@@ -131,6 +178,7 @@ impl UrmaFabric {
                     command_tx: Mutex::new(Some(command_tx)),
                     command_slots,
                     readiness: readiness_rx,
+                    runtime_config,
                     transport_type,
                     max_message_size,
                     shutdown: AsyncMutex::new(()),
@@ -378,6 +426,7 @@ struct FabricInner {
     command_tx: Mutex<Option<mpsc::UnboundedSender<CommandEnvelope>>>,
     command_slots: Arc<Semaphore>,
     readiness: watch::Receiver<FabricReadiness>,
+    runtime_config: RuntimeConfig,
     transport_type: u32,
     max_message_size: u64,
     shutdown: AsyncMutex<()>,
@@ -721,6 +770,14 @@ mod tests {
     fn zero_command_capacity_is_rejected_before_spawning() {
         let result = UrmaFabric::start_with_capacity(RuntimeConfig::new("urma0", 0), 0);
         assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn shared_fabric_requires_identical_runtime_configuration() {
+        let active = RuntimeConfig::new("urma0", 2);
+        assert!(validate_shared_config(&active, &active).is_ok());
+        assert!(validate_shared_config(&active, &RuntimeConfig::new("urma1", 2)).is_err());
+        assert!(validate_shared_config(&active, &RuntimeConfig::new("urma0", 3)).is_err());
     }
 
     #[test]

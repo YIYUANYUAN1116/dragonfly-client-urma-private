@@ -15,25 +15,35 @@
  */
 
 use crate::rendezvous::{
-    PieceKind, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
+    PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
-use crate::urma::fabric::{UrmaFabricHandle, UrmaLaneConfig};
-use crate::urma::rendezvous::{CommonPieceRequest, PieceMetadata, UrmaCapability};
+use crate::urma::fabric::{FabricReadiness, UrmaFabric, UrmaFabricHandle, UrmaLaneConfig};
+use crate::urma::rendezvous::{
+    write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
+    UrmaAdvertisement, UrmaCapability,
+};
 use crate::urma::session::UrmaServerSession;
 use crate::urma::Error as UrmaError;
 use crate::Storage;
+use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use dragonfly_client_metric::{
     collect_upload_piece_failure_metrics, collect_upload_piece_finished_metrics,
     collect_upload_piece_started_metrics, collect_upload_piece_traffic_metrics,
 };
 use leaky_bucket::RateLimiter;
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time;
-use tracing::{debug, info, instrument, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
+
+use dragonfly_client_util::shutdown;
 
 fn client_error(error: UrmaError) -> ClientError {
     ClientError::Unknown(error.to_string())
@@ -52,10 +62,207 @@ fn negotiate_transfer(
     Ok((chunk_size, max_inflight_chunks))
 }
 
+/// Optional dfdaemon URMA rendezvous server. Native setup or listener failure disables only this
+/// fast path; the normal TCP Piece server remains the discovery endpoint and fallback transport.
+pub struct UrmaServer {
+    config: Arc<Config>,
+    addr: SocketAddr,
+    storage: Arc<Storage>,
+    upload_bandwidth_limiter: Arc<RateLimiter>,
+    shutdown: shutdown::Shutdown,
+    _shutdown_complete: mpsc::UnboundedSender<()>,
+    capability_registry: Option<CapabilityRegistry>,
+}
+
+struct PublishedCapability(CapabilityRegistry);
+
+impl Drop for PublishedCapability {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl UrmaServer {
+    pub fn new(
+        config: Arc<Config>,
+        addr: SocketAddr,
+        storage: Arc<Storage>,
+        upload_bandwidth_limiter: Arc<RateLimiter>,
+        shutdown: shutdown::Shutdown,
+        shutdown_complete_tx: mpsc::UnboundedSender<()>,
+    ) -> Self {
+        Self {
+            config,
+            addr,
+            storage,
+            upload_bandwidth_limiter,
+            shutdown,
+            _shutdown_complete: shutdown_complete_tx,
+            capability_registry: None,
+        }
+    }
+
+    /// Publishes discovery only after native startup and listener bind both succeed.
+    pub fn with_capability_registry(mut self, registry: CapabilityRegistry) -> Self {
+        self.capability_registry = Some(registry);
+        self
+    }
+
+    pub async fn run(&mut self) -> ClientResult<()> {
+        let urma_config = &self.config.storage.server.urma;
+        let Some(device) = urma_config
+            .device
+            .as_deref()
+            .filter(|device| !device.is_empty())
+        else {
+            return Err(ClientError::Unsupported(
+                "storage.server.urma.device is required".to_string(),
+            ));
+        };
+        let Some(fabric_tag) = urma_config
+            .fabric_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+        else {
+            return Err(ClientError::Unsupported(
+                "storage.server.urma.fabricTag is required".to_string(),
+            ));
+        };
+
+        let fabric =
+            UrmaFabric::get_or_start(device, urma_config.eid_index).map_err(client_error)?;
+        let capability = UrmaCapability {
+            transport_type: fabric.transport_type(),
+            fabric_tag: fabric_tag.to_string(),
+            max_message_size: fabric.max_message_size(),
+        };
+        let mut lane_config = UrmaLaneConfig::default();
+        lane_config.send_depth = urma_config.max_inflight_chunks;
+        lane_config.recv_depth = urma_config.max_inflight_chunks;
+        let handler = Arc::new(UrmaServerHandler::new(
+            self.storage.clone(),
+            self.upload_bandwidth_limiter.clone(),
+            fabric.clone(),
+            capability.clone(),
+            lane_config,
+            urma_config.transfer_timeout,
+            urma_config.transfer_timeout,
+            self.config.download.piece_timeout,
+        ));
+        let admission = Arc::new(Semaphore::new(
+            urma_config.max_concurrent_transfers as usize,
+        ));
+
+        let socket = Socket::new(
+            Domain::for_address(self.addr),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )?;
+        socket.set_tcp_nodelay(true)?;
+        socket.set_nonblocking(true)?;
+        socket.set_tcp_keepalive(
+            &TcpKeepalive::new()
+                .with_interval(super::DEFAULT_KEEPALIVE_INTERVAL)
+                .with_time(super::DEFAULT_KEEPALIVE_TIME)
+                .with_retries(super::DEFAULT_KEEPALIVE_RETRIES),
+        )?;
+        socket.bind(&self.addr.into())?;
+        socket.listen(1024)?;
+        let listener = TcpListener::from_std(socket.into()).inspect_err(|error| {
+            error!("failed to bind urma rendezvous server: {error}");
+        })?;
+        info!(
+            address = %self.addr,
+            transport_type = capability.transport_type,
+            "storage urma server ready"
+        );
+        let published = self.capability_registry.as_ref().map(|registry| {
+            registry.publish(UrmaAdvertisement {
+                capability,
+                port: self.addr.port(),
+            });
+            PublishedCapability(registry.clone())
+        });
+
+        let mut readiness = fabric.subscribe_readiness();
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, remote_address) = accepted?;
+                    let Ok(permit) = admission.clone().try_acquire_owned() else {
+                        debug!(%remote_address, "urma connection admission full");
+                        let timeout = urma_config.transfer_timeout;
+                        connections.spawn(async move {
+                            let mut stream = stream;
+                            let _ = time::timeout(
+                                timeout,
+                                write_frame(
+                                    &mut stream,
+                                    &Frame::Error(RendezvousError {
+                                        code: ERROR_CODE_BUSY,
+                                        message: "urma connection admission is full".to_string(),
+                                    }),
+                                ),
+                            )
+                            .await;
+                        });
+                        continue;
+                    };
+                    let handler = handler.clone();
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = handler.handle(stream, remote_address.to_string()).await {
+                            debug!(%remote_address, %error, "urma peer connection retired");
+                        }
+                    });
+                }
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        warn!(%error, "urma connection task failed");
+                    }
+                }
+                changed = readiness.changed() => {
+                    if changed.is_err() {
+                        return Err(ClientError::Unknown(
+                            "urma Fabric readiness channel closed".to_string(),
+                        ));
+                    }
+                    match readiness.borrow().clone() {
+                        FabricReadiness::Ready | FabricReadiness::Starting => {}
+                        FabricReadiness::Failed(error) => {
+                            return Err(ClientError::Unknown(format!(
+                                "urma Fabric failed: {error}"
+                            )));
+                        }
+                        FabricReadiness::Stopped => {
+                            return Err(ClientError::Unknown(
+                                "urma Fabric stopped while listener was active".to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ = self.shutdown.recv() => {
+                    info!("urma server shutting down");
+                    break;
+                }
+            }
+        }
+
+        // Stop discovery and close the listening socket before draining accepted lanes. A peer
+        // must never discover a capability whose accept loop has already stopped.
+        drop(published);
+        drop(listener);
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        fabric.shutdown().await.map_err(client_error)
+    }
+}
+
 /// Storage-facing handler for one persistent URMA peer connection. Listener,
 /// readiness publication and connection admission remain dfdaemon wiring
 /// responsibilities; this type owns only the Piece upload contract.
-pub struct UrmaServerHandler {
+struct UrmaServerHandler {
     storage: Arc<Storage>,
     upload_bandwidth_limiter: Arc<RateLimiter>,
     fabric: UrmaFabricHandle,
@@ -68,7 +275,7 @@ pub struct UrmaServerHandler {
 
 impl UrmaServerHandler {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         storage: Arc<Storage>,
         upload_bandwidth_limiter: Arc<RateLimiter>,
         fabric: UrmaFabricHandle,
@@ -93,7 +300,7 @@ impl UrmaServerHandler {
     /// Accepts one peer lane and serves sequential Piece requests until the
     /// peer disconnects or a conservative Phase A error retires the session.
     #[instrument(skip_all, fields(remote_address, task_id, piece_id))]
-    pub async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
+    async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
         Span::current().record("remote_address", remote_address.as_str());
         let mut session = UrmaServerSession::accept(
             stream,

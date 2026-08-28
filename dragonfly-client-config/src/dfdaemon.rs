@@ -340,6 +340,13 @@ fn default_storage_server_urma_max_inflight_chunks() -> u32 {
     512
 }
 
+/// default_storage_server_urma_max_concurrent_transfers bounds persistent peer lanes and their
+/// Storage readers independently of the native command queue and registered buffer pool.
+#[inline]
+fn default_storage_server_urma_max_concurrent_transfers() -> u32 {
+    64
+}
+
 /// default_storage_server_urma_transfer_timeout is the maximum time a URMA operation may remain
 /// in flight before it is cancelled and the caller falls back to TCP.
 #[inline]
@@ -1264,6 +1271,12 @@ pub struct UrmaServer {
     #[validate(range(min = 1, max = 4096))]
     pub max_inflight_chunks: u32,
 
+    /// Maximum number of accepted URMA peer lanes served concurrently. Admission is rejected
+    /// with a typed BUSY response so the downloader can fall back without retiring capability.
+    #[serde(default = "default_storage_server_urma_max_concurrent_transfers")]
+    #[validate(range(min = 1, max = 65535))]
+    pub max_concurrent_transfers: u32,
+
     /// Maximum duration of one URMA operation before cancellation and TCP fallback.
     #[serde(
         default = "default_storage_server_urma_transfer_timeout",
@@ -1304,6 +1317,7 @@ impl Default for UrmaServer {
             eid_index: default_storage_server_urma_eid_index(),
             fabric_tag: None,
             max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
+            max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
         }
     }
@@ -2503,6 +2517,7 @@ key: /etc/ssl/private/client.pem
                     "eidIndex": 2,
                     "fabricTag": "rack-a",
                     "maxInflightChunks": 256,
+                    "maxConcurrentTransfers": 48,
                     "transferTimeout": "45s"
                 }
             },
@@ -2544,6 +2559,7 @@ key: /etc/ssl/private/client.pem
         assert_eq!(storage.server.urma.eid_index, 2);
         assert_eq!(storage.server.urma.fabric_tag.as_deref(), Some("rack-a"));
         assert_eq!(storage.server.urma.max_inflight_chunks, 256);
+        assert_eq!(storage.server.urma.max_concurrent_transfers, 48);
         assert_eq!(
             storage.server.urma.transfer_timeout,
             Duration::from_secs(45)
@@ -2581,6 +2597,7 @@ key: /etc/ssl/private/client.pem
         assert_eq!(urma.eid_index, 0);
         assert!(urma.fabric_tag.is_none());
         assert_eq!(urma.max_inflight_chunks, 512);
+        assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
     }
 
@@ -2603,6 +2620,15 @@ key: /etc/ssl/private/client.pem
 
         let urma = UrmaServer {
             max_inflight_chunks: 4097,
+            ..Default::default()
+        };
+        assert!(urma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_urma_max_concurrent_transfers() {
+        let urma = UrmaServer {
+            max_concurrent_transfers: 0,
             ..Default::default()
         };
         assert!(urma.validate().is_err());

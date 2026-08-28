@@ -11,7 +11,7 @@ pub mod fabric;
 mod ffi;
 mod lane;
 pub mod rendezvous;
-pub mod runtime;
+pub(crate) mod runtime;
 pub(crate) mod session;
 
 pub(crate) use error::native_error;

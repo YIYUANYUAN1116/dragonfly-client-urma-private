@@ -915,9 +915,8 @@ pub mod rdma {
 pub mod urma {
     use super::*;
     use dragonfly_client_storage::client::urma::{discover, UrmaClient};
-    use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle, UrmaLaneConfig};
+    use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
-    use dragonfly_client_storage::urma::runtime::RuntimeConfig;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::time::Instant;
@@ -1060,7 +1059,7 @@ pub mod urma {
                 ));
             };
 
-            match UrmaFabric::start(RuntimeConfig::new(device, urma_config.eid_index)) {
+            match UrmaFabric::get_or_start(device, urma_config.eid_index) {
                 Ok(fabric) => {
                     let capability = UrmaCapability {
                         transport_type: fabric.transport_type(),
@@ -1220,14 +1219,10 @@ pub mod urma {
             })?;
             rendezvous_addr.set_port(advertisement.port);
 
-            let mut lane_config = UrmaLaneConfig::default();
-            lane_config.recv_depth = self.config.storage.server.urma.max_inflight_chunks;
-
             let client = UrmaClient::new(
                 self.config.clone(),
                 fabric,
                 capability,
-                lane_config,
                 advertisement.capability,
                 rendezvous_addr.to_string(),
             );

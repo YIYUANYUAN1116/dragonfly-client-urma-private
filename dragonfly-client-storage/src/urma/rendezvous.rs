@@ -11,6 +11,7 @@ pub(crate) use crate::rendezvous::{
     PieceMetadata, PieceRequest as CommonPieceRequest, ReceiveWindow, RendezvousError,
 };
 use dragonfly_client_core::{Error, Result};
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// "DFUR" distinguishes URMA control traffic from the existing RDMA wire.
@@ -67,6 +68,27 @@ impl UrmaCapability {
 pub struct UrmaAdvertisement {
     pub capability: UrmaCapability,
     pub port: u16,
+}
+
+/// Publishes URMA readiness to the already-advertised TCP Piece endpoint. The registry contains
+/// an advertisement only after both the process Fabric and rendezvous listener are ready.
+#[derive(Clone, Default)]
+pub struct CapabilityRegistry {
+    inner: Arc<RwLock<Option<UrmaAdvertisement>>>,
+}
+
+impl CapabilityRegistry {
+    pub(crate) fn publish(&self, advertisement: UrmaAdvertisement) {
+        *self.inner.write().unwrap() = Some(advertisement);
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.inner.write().unwrap() = None;
+    }
+
+    pub(crate) fn get(&self) -> Option<UrmaAdvertisement> {
+        self.inner.read().unwrap().clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +217,20 @@ mod tests {
             fabric_tag: "rack-a".into(),
             max_message_size: 64 * 1024,
         }
+    }
+
+    #[test]
+    fn capability_registry_tracks_listener_lifetime() {
+        let registry = CapabilityRegistry::default();
+        assert!(registry.get().is_none());
+        let advertisement = UrmaAdvertisement {
+            capability: capability(),
+            port: 4008,
+        };
+        registry.publish(advertisement.clone());
+        assert_eq!(registry.get(), Some(advertisement));
+        registry.clear();
+        assert!(registry.get().is_none());
     }
 
     #[tokio::test]

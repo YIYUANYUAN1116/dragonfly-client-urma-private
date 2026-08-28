@@ -1,7 +1,7 @@
 use super::{buffer::BufferPoolConfig, Error, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeConfig {
+pub(crate) struct RuntimeConfig {
     pub(crate) device_name: String,
     pub(crate) eid_index: u32,
     pub(crate) send_jfc_depth: u32,
@@ -10,7 +10,7 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub fn new(device_name: impl Into<String>, eid_index: u32) -> Self {
+    pub(crate) fn new(device_name: impl Into<String>, eid_index: u32) -> Self {
         Self {
             device_name: device_name.into(),
             eid_index,
