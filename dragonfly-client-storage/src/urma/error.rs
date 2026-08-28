@@ -2,13 +2,23 @@ use std::fmt;
 
 use super::ffi::FfiError;
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum Error {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
     AlreadyInitialized,
     InvalidConfiguration(String),
     Protocol(String),
+    PeerRejected {
+        code: u32,
+        message: String,
+    },
+    ControlTimeout {
+        operation: &'static str,
+    },
+    OperationTimeout {
+        sequence: Option<u64>,
+    },
     Completion {
         status: i32,
         opcode: u32,
@@ -29,8 +39,8 @@ pub(crate) enum Error {
     },
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum NativeFailure {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeFailure {
     Contract(&'static str),
     MissingHandle,
     Status(i32),
@@ -53,6 +63,18 @@ impl fmt::Display for Error {
             }
             Self::InvalidConfiguration(detail) => write!(f, "invalid configuration: {detail}"),
             Self::Protocol(detail) => write!(f, "protocol error: {detail}"),
+            Self::PeerRejected { code, message } => {
+                write!(
+                    f,
+                    "URMA peer rejected request: code={code} message={message}"
+                )
+            }
+            Self::ControlTimeout { operation } => {
+                write!(f, "URMA control operation timed out: {operation}")
+            }
+            Self::OperationTimeout { sequence } => {
+                write!(f, "URMA operation timed out: sequence={sequence:?}")
+            }
             Self::Completion {
                 status,
                 opcode,

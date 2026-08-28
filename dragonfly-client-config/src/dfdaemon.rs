@@ -320,6 +320,33 @@ fn default_storage_server_rdma_transfer_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
+/// default_storage_server_urma_port is the default TCP rendezvous port of the URMA storage
+/// server. Piece payloads do not travel over this port.
+#[inline]
+fn default_storage_server_urma_port() -> u16 {
+    4008
+}
+
+/// default_storage_server_urma_eid_index is the default UMDK EID index used to open the device.
+#[inline]
+fn default_storage_server_urma_eid_index() -> u32 {
+    0
+}
+
+/// default_storage_server_urma_max_inflight_chunks bounds the posted receive windows for one
+/// piece transfer, keeping the receive queue bounded regardless of piece or chunk size.
+#[inline]
+fn default_storage_server_urma_max_inflight_chunks() -> u32 {
+    512
+}
+
+/// default_storage_server_urma_transfer_timeout is the maximum time a URMA operation may remain
+/// in flight before it is cancelled and the caller falls back to TCP.
+#[inline]
+fn default_storage_server_urma_transfer_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
 /// Returns the default keep of the task's metadata and content when the dfdaemon restarts.
 #[inline]
 fn default_storage_keep() -> bool {
@@ -1004,6 +1031,11 @@ pub struct StorageServer {
     /// TCP as a fallback transport.
     #[validate]
     pub rdma: RdmaServer,
+
+    /// URMA piece-transfer server configuration. URMA is disabled by default and always retains
+    /// TCP as a fallback transport.
+    #[validate]
+    pub urma: UrmaServer,
 }
 
 /// Implement Default for StorageServer.
@@ -1015,6 +1047,7 @@ impl Default for StorageServer {
             tcp_fastopen: false,
             quic_port: default_storage_server_quic_port(),
             rdma: RdmaServer::default(),
+            urma: UrmaServer::default(),
         }
     }
 }
@@ -1192,6 +1225,86 @@ impl Default for RdmaServer {
             max_concurrent_transfers: default_storage_server_rdma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_rdma_transfer_timeout(),
             mmap_content: false,
+        }
+    }
+}
+
+/// UrmaServer configures the optional Linux/UMDK bulk-piece transport. Settings other than
+/// `enable` are also used by a URMA downloader; `enable` controls only whether this daemon serves
+/// pieces over URMA. The TCP storage server remains required for discovery and per-piece fallback.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[validate(schema(function = "validate_urma_server", skip_on_field_errors = true))]
+#[serde(default, rename_all = "camelCase")]
+pub struct UrmaServer {
+    /// Enable serving pieces over URMA. Downloading is selected independently with
+    /// `download.protocol: urma`.
+    pub enable: bool,
+
+    /// TCP port used for reliable rendezvous, capability exchange, metadata, and errors. Bulk
+    /// piece bytes move over the bound URMA Jetty rather than this socket.
+    #[serde(default = "default_storage_server_urma_port")]
+    #[validate(range(min = 1))]
+    pub port: u16,
+
+    /// UMDK device name passed to `urma_get_device_by_name`, for example `urma0`.
+    pub device: Option<String>,
+
+    /// UMDK EID index used to open the local URMA device.
+    #[serde(default = "default_storage_server_urma_eid_index")]
+    pub eid_index: u32,
+
+    /// Operator-supplied reachability-domain label. Peers attempt URMA only when both advertise
+    /// the same non-empty value.
+    #[validate(length(min = 1))]
+    pub fabric_tag: Option<String>,
+
+    /// Maximum number of receive windows posted concurrently for one piece transfer. Peers
+    /// negotiate the lower value.
+    #[serde(default = "default_storage_server_urma_max_inflight_chunks")]
+    #[validate(range(min = 1, max = 4096))]
+    pub max_inflight_chunks: u32,
+
+    /// Maximum duration of one URMA operation before cancellation and TCP fallback.
+    #[serde(
+        default = "default_storage_server_urma_transfer_timeout",
+        with = "humantime_serde"
+    )]
+    pub transfer_timeout: Duration,
+}
+
+/// URMA_MIN_TRANSFER_TIMEOUT is the shortest URMA operation timeout that is not self-defeating.
+/// The timeout covers a whole receive window reaching the peer, so a value below this turns every
+/// large transfer into a cancellation and a TCP fallback.
+const URMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// URMA_MAX_TRANSFER_TIMEOUT bounds how long a stuck transfer can pin receive buffers before it
+/// is abandoned in favour of TCP.
+const URMA_MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// validate_urma_server rejects URMA settings that are individually parseable but cannot work.
+fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), ValidationError> {
+    if urma.transfer_timeout < URMA_MIN_TRANSFER_TIMEOUT
+        || urma.transfer_timeout > URMA_MAX_TRANSFER_TIMEOUT
+    {
+        return Err(ValidationError::new(
+            "transferTimeout must be between 1s and 10m",
+        ));
+    }
+
+    Ok(())
+}
+
+/// UrmaServer implements Default.
+impl Default for UrmaServer {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            port: default_storage_server_urma_port(),
+            device: None,
+            eid_index: default_storage_server_urma_eid_index(),
+            fabric_tag: None,
+            max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
+            transfer_timeout: default_storage_server_urma_transfer_timeout(),
         }
     }
 }
@@ -2382,6 +2495,15 @@ key: /etc/ssl/private/client.pem
                     "maxInflightChunks": 8,
                     "maxConcurrentTransfers": 32,
                     "transferTimeout": "15s"
+                },
+                "urma": {
+                    "enable": true,
+                    "port": 4008,
+                    "device": "urma0",
+                    "eidIndex": 2,
+                    "fabricTag": "rack-a",
+                    "maxInflightChunks": 256,
+                    "transferTimeout": "45s"
                 }
             },
             "dir": "/tmp/storage",
@@ -2416,6 +2538,16 @@ key: /etc/ssl/private/client.pem
             storage.server.rdma.transfer_timeout,
             Duration::from_secs(15)
         );
+        assert!(storage.server.urma.enable);
+        assert_eq!(storage.server.urma.port, 4008);
+        assert_eq!(storage.server.urma.device.as_deref(), Some("urma0"));
+        assert_eq!(storage.server.urma.eid_index, 2);
+        assert_eq!(storage.server.urma.fabric_tag.as_deref(), Some("rack-a"));
+        assert_eq!(storage.server.urma.max_inflight_chunks, 256);
+        assert_eq!(
+            storage.server.urma.transfer_timeout,
+            Duration::from_secs(45)
+        );
         assert_eq!(storage.dir, PathBuf::from("/tmp/storage"));
         assert!(storage.keep);
         assert_eq!(storage.write_piece_timeout, Duration::from_secs(20));
@@ -2438,6 +2570,56 @@ key: /etc/ssl/private/client.pem
         assert_eq!(rdma.max_inflight_chunks, 16);
         assert_eq!(rdma.max_concurrent_transfers, 64);
         assert_eq!(rdma.transfer_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn default_urma_server_is_safe() {
+        let urma = UrmaServer::default();
+        assert!(!urma.enable);
+        assert_eq!(urma.port, 4008);
+        assert!(urma.device.is_none());
+        assert_eq!(urma.eid_index, 0);
+        assert!(urma.fabric_tag.is_none());
+        assert_eq!(urma.max_inflight_chunks, 512);
+        assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reject_empty_urma_fabric_tag() {
+        let urma = UrmaServer {
+            fabric_tag: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(urma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_urma_max_inflight_chunks() {
+        let urma = UrmaServer {
+            max_inflight_chunks: 0,
+            ..Default::default()
+        };
+        assert!(urma.validate().is_err());
+
+        let urma = UrmaServer {
+            max_inflight_chunks: 4097,
+            ..Default::default()
+        };
+        assert!(urma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_urma_transfer_timeout() {
+        for transfer_timeout in [Duration::from_millis(0), Duration::from_secs(601)] {
+            let urma = UrmaServer {
+                transfer_timeout,
+                ..Default::default()
+            };
+            assert!(
+                urma.validate().is_err(),
+                "accepted transfer timeout {transfer_timeout:?}"
+            );
+        }
     }
 
     #[test]

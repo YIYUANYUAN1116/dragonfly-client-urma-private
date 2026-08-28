@@ -89,6 +89,8 @@ impl DownloaderFactory {
             )),
             #[cfg(feature = "rdma")]
             "rdma" => Arc::new(rdma::RDMADownloader::new(config.clone())),
+            #[cfg(feature = "urma")]
+            "urma" => Arc::new(urma::URMADownloader::new(config.clone())),
             _ => {
                 error!("unsupported protocol: {}", protocol);
                 return Err(Error::InvalidParameter);
@@ -879,6 +881,510 @@ pub mod rdma {
             // punished for something that happened to it long ago.
             downloader.record_failure(addr, Failure::Transport);
             assert_eq!(backoff_of(&downloader, addr), UNHEALTHY_PARENT_MIN_BACKOFF);
+        }
+
+        #[test]
+        fn an_expired_penalty_allows_a_retry_without_resetting_the_backoff() {
+            let downloader = test_downloader();
+            let addr = "127.0.0.1:4001";
+
+            downloader.record_failure(addr, Failure::Transport);
+            downloader.record_failure(addr, Failure::Transport);
+            downloader
+                .unhealthy_parents
+                .lock()
+                .unwrap()
+                .get_mut(addr)
+                .unwrap()
+                .until = Instant::now() - Duration::from_secs(1);
+
+            assert!(downloader.check_parent(addr).is_ok());
+            downloader.record_failure(addr, Failure::Transport);
+            assert_eq!(
+                backoff_of(&downloader, addr),
+                UNHEALTHY_PARENT_MIN_BACKOFF * 4,
+                "a retry that fails again must keep escalating"
+            );
+        }
+    }
+}
+
+/// urma provides the UMDK/URMA piece downloader. It is an optimization layer: every error
+/// surfaces to the caller, which falls back to the TCP downloader for that piece.
+#[cfg(feature = "urma")]
+pub mod urma {
+    use super::*;
+    use dragonfly_client_storage::client::urma::{discover, UrmaClient};
+    use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle, UrmaLaneConfig};
+    use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
+    use dragonfly_client_storage::urma::runtime::RuntimeConfig;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+    use tracing::{info, warn};
+
+    /// FABRIC_RETRY_INTERVAL is how long to wait before retrying fabric initialization after a
+    /// failure.
+    const FABRIC_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// INCOMPATIBLE_PARENT_TTL is how long a parent that reported fabric incompatibility is
+    /// skipped before URMA is attempted again. Incompatibility is a property of the peer's
+    /// configuration, so retrying sooner than this cannot succeed.
+    const INCOMPATIBLE_PARENT_TTL: Duration = Duration::from_secs(60);
+
+    /// UNHEALTHY_PARENT_MIN_BACKOFF is how long a parent is skipped after its first URMA transfer
+    /// failure. A transfer failure, unlike incompatibility, may be a transient blip, so the first
+    /// penalty is short enough that one bad piece does not cost a working parent its fast path.
+    const UNHEALTHY_PARENT_MIN_BACKOFF: Duration = Duration::from_secs(2);
+
+    /// UNHEALTHY_PARENT_MAX_BACKOFF caps the penalty applied to a parent that keeps failing.
+    /// Without a cap a parent that recovers would stay on the TCP path indefinitely.
+    const UNHEALTHY_PARENT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+    /// CAPABLE_PARENT_TTL bounds how long a successful discovery result is reused.
+    const CAPABLE_PARENT_TTL: Duration = Duration::from_secs(60);
+
+    /// PEER_SESSION_IDLE_TIMEOUT retires an unused persistent lane without
+    /// coupling its lifetime to the shorter capability refresh interval.
+    const PEER_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(420);
+
+    /// Failure says why URMA to a parent did not work, which decides how long to avoid it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Failure {
+        /// Incompatible means the peers cannot form a URMA pair at all.
+        Incompatible,
+
+        /// Transport means an attempt failed, which may or may not repeat: an unreachable parent,
+        /// a parent at its transfer admission limit, or a transfer that died part way.
+        Transport,
+    }
+
+    fn classify_failure(error: &Error) -> Failure {
+        if matches!(error, Error::Unsupported(_)) {
+            Failure::Incompatible
+        } else {
+            Failure::Transport
+        }
+    }
+
+    /// ParentPenalty skips URMA for a parent that just failed.
+    struct ParentPenalty {
+        /// until is when URMA may be attempted against this parent again.
+        until: Instant,
+
+        /// backoff is the penalty applied on the most recent failure, and the basis for the next.
+        backoff: Duration,
+    }
+
+    /// FabricState tracks the lazily initialized process-shared fabric endpoint.
+    enum FabricState {
+        /// Uninitialized means no initialization has been attempted yet.
+        Uninitialized,
+
+        /// Failed records when initialization last failed, for retry backoff.
+        Failed(Instant),
+
+        /// Ready holds the shared facade and the local negotiation capability.
+        Ready(UrmaFabricHandle, UrmaCapability),
+    }
+
+    /// URMADownloader downloads pieces over UMDK/URMA with a shared fabric endpoint. The endpoint
+    /// is opened lazily on the first download so a misconfigured or unsupported host degrades to
+    /// TCP instead of failing at startup.
+    pub struct URMADownloader {
+        /// config is the configuration of the dfdaemon.
+        config: Arc<Config>,
+
+        /// fabric is the lazily initialized shared endpoint.
+        fabric: tokio::sync::Mutex<FabricState>,
+
+        /// unhealthy_parents skips parents whose last URMA attempt failed, so every piece does not
+        /// pay a doomed rendezvous round trip.
+        unhealthy_parents: std::sync::Mutex<HashMap<String, ParentPenalty>>,
+
+        /// capable_parents caches successful discovery so every piece does not add a control round
+        /// trip. Transfer failures evict the entry immediately.
+        capable_parents: std::sync::Mutex<HashMap<String, (Instant, UrmaAdvertisement)>>,
+
+        /// clients keeps one persistent Session slot per parent. A client
+        /// serializes Piece transfers on its lane and reconnects after failure.
+        clients: tokio::sync::Mutex<HashMap<String, (Instant, UrmaClient)>>,
+    }
+
+    /// URMADownloader implements the downloader over the UMDK/URMA transport.
+    impl URMADownloader {
+        /// new returns a new URMADownloader.
+        pub fn new(config: Arc<Config>) -> Self {
+            Self {
+                config,
+                fabric: tokio::sync::Mutex::new(FabricState::Uninitialized),
+                unhealthy_parents: std::sync::Mutex::new(HashMap::new()),
+                capable_parents: std::sync::Mutex::new(HashMap::new()),
+                clients: tokio::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// fabric returns the shared facade and local capability, initializing them on first use
+        /// and applying retry backoff after failures.
+        async fn fabric(&self) -> Result<(UrmaFabricHandle, UrmaCapability)> {
+            let mut state = self.fabric.lock().await;
+            match &*state {
+                FabricState::Ready(fabric, capability) if !fabric.is_failed() => {
+                    return Ok((fabric.clone(), capability.clone()));
+                }
+                FabricState::Ready(_, _) => {
+                    // A retired facade cannot recover by returning errors forever. Drop it and let
+                    // the normal initialization path create a fresh device endpoint.
+                    *state = FabricState::Uninitialized;
+                }
+                FabricState::Failed(at) if at.elapsed() < FABRIC_RETRY_INTERVAL => {
+                    return Err(Error::Unsupported(
+                        "urma fabric initialization failed recently".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+
+            let urma_config = &self.config.storage.server.urma;
+            let Some(device) = urma_config.device.as_deref().filter(|d| !d.is_empty()) else {
+                *state = FabricState::Failed(Instant::now());
+                return Err(Error::Unsupported(
+                    "urma requires storage.server.urma.device".to_string(),
+                ));
+            };
+            let Some(fabric_tag) = urma_config.fabric_tag.as_deref().filter(|t| !t.is_empty())
+            else {
+                *state = FabricState::Failed(Instant::now());
+                return Err(Error::Unsupported(
+                    "urma requires storage.server.urma.fabricTag".to_string(),
+                ));
+            };
+
+            match UrmaFabric::start(RuntimeConfig::new(device, urma_config.eid_index)) {
+                Ok(fabric) => {
+                    let capability = UrmaCapability {
+                        transport_type: fabric.transport_type(),
+                        fabric_tag: fabric_tag.to_string(),
+                        max_message_size: fabric.max_message_size(),
+                    };
+                    info!(
+                        "urma downloader ready: transport type {}, fabric tag {}",
+                        capability.transport_type, capability.fabric_tag
+                    );
+                    *state = FabricState::Ready(fabric.clone(), capability.clone());
+                    Ok((fabric, capability))
+                }
+                Err(err) => {
+                    warn!("urma fabric initialization failed: {}", err);
+                    *state = FabricState::Failed(Instant::now());
+                    Err(Error::Unknown(format!(
+                        "urma fabric initialization failed: {err}"
+                    )))
+                }
+            }
+        }
+
+        /// retire_failed_fabric removes a poisoned shared endpoint after a transfer failure.
+        /// Ordinary peer incompatibility leaves the shared endpoint intact.
+        async fn retire_failed_fabric(&self) {
+            let mut state = self.fabric.lock().await;
+            let mut retired = false;
+            if matches!(&*state, FabricState::Ready(fabric, _) if fabric.is_failed()) {
+                *state = FabricState::Uninitialized;
+                retired = true;
+            }
+            drop(state);
+            if retired {
+                self.clients.lock().await.clear();
+            }
+        }
+
+        async fn retire_client(&self, addr: &str) {
+            self.clients.lock().await.remove(addr);
+        }
+
+        /// check_parent errors fast for parents that are still serving a penalty.
+        fn check_parent(&self, addr: &str) -> Result<()> {
+            match self.unhealthy_parents.lock().unwrap().get(addr) {
+                Some(penalty) if penalty.until > Instant::now() => Err(Error::Unsupported(
+                    format!("parent {addr} recently failed over urma"),
+                )),
+                _ => Ok(()),
+            }
+        }
+
+        /// record_failure penalizes a parent whose URMA attempt failed, and drops any discovery
+        /// result cached for it.
+        fn record_failure(&self, addr: &str, failure: Failure) {
+            self.capable_parents.lock().unwrap().remove(addr);
+
+            let mut unhealthy_parents = self.unhealthy_parents.lock().unwrap();
+            let backoff = match failure {
+                Failure::Incompatible => INCOMPATIBLE_PARENT_TTL,
+                Failure::Transport => unhealthy_parents
+                    .get(addr)
+                    .map(|penalty| (penalty.backoff * 2).min(UNHEALTHY_PARENT_MAX_BACKOFF))
+                    .unwrap_or(UNHEALTHY_PARENT_MIN_BACKOFF),
+            };
+
+            unhealthy_parents.insert(
+                addr.to_string(),
+                ParentPenalty {
+                    until: Instant::now() + backoff,
+                    backoff,
+                },
+            );
+        }
+
+        /// record_success clears a parent's penalty once an attempt against it works again.
+        fn record_success(&self, addr: &str) {
+            self.unhealthy_parents.lock().unwrap().remove(addr);
+        }
+
+        /// advertisement returns a cached live capability or discovers it through the parent's
+        /// advertised TCP piece endpoint.
+        async fn advertisement(
+            &self,
+            addr: &str,
+            local: &UrmaCapability,
+        ) -> Result<UrmaAdvertisement> {
+            let cached = self.capable_parents.lock().unwrap().get(addr).cloned();
+            if let Some((at, advertisement)) = cached {
+                if at.elapsed() < CAPABLE_PARENT_TTL {
+                    return Ok(advertisement);
+                }
+                self.capable_parents.lock().unwrap().remove(addr);
+            }
+
+            let advertisement = discover(addr, self.config.storage.server.urma.transfer_timeout)
+                .await
+                .map_err(|err| {
+                    self.record_failure(addr, classify_failure(&err));
+                    Error::Unsupported(format!("urma discovery from {addr} failed: {err}"))
+                })?;
+            local
+                .compatible(&advertisement.capability)
+                .map_err(|reason| {
+                    self.record_failure(addr, Failure::Incompatible);
+                    Error::Unsupported(format!("urma incompatible: {reason}"))
+                })?;
+            self.capable_parents
+                .lock()
+                .unwrap()
+                .insert(addr.to_string(), (Instant::now(), advertisement.clone()));
+            Ok(advertisement)
+        }
+
+        /// client builds a UrmaClient for one parent address.
+        async fn client(&self, addr: &str) -> Result<UrmaClient> {
+            self.check_parent(addr)?;
+            let cached = {
+                let mut clients = self.clients.lock().await;
+                match clients.get_mut(addr) {
+                    Some((last_used, client))
+                        if last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT =>
+                    {
+                        *last_used = Instant::now();
+                        Some(client.clone())
+                    }
+                    Some(_) => {
+                        clients.remove(addr);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(client) = cached {
+                if !client.fabric_failed() {
+                    match client.take_transfer_outcome() {
+                        Some(true) => self.record_success(addr),
+                        Some(false) => {
+                            self.retire_client(addr).await;
+                            self.record_failure(addr, Failure::Transport);
+                            return Err(Error::Unsupported(format!(
+                                "parent {addr} failed its previous urma transfer"
+                            )));
+                        }
+                        None => {}
+                    }
+                    return Ok(client);
+                }
+                self.retire_client(addr).await;
+            }
+            let (fabric, capability) = self.fabric().await?;
+            // advertisement records its own failures, since only it can tell an unreachable parent
+            // apart from one that answered and is incompatible.
+            let advertisement = self.advertisement(addr, &capability).await?;
+            let mut rendezvous_addr: SocketAddr = addr.parse().map_err(|err| {
+                Error::Unsupported(format!("invalid parent piece address {addr}: {err}"))
+            })?;
+            rendezvous_addr.set_port(advertisement.port);
+
+            let mut lane_config = UrmaLaneConfig::default();
+            lane_config.recv_depth = self.config.storage.server.urma.max_inflight_chunks;
+
+            let client = UrmaClient::new(
+                self.config.clone(),
+                fabric,
+                capability,
+                lane_config,
+                advertisement.capability,
+                rendezvous_addr.to_string(),
+            );
+            self.clients
+                .lock()
+                .await
+                .insert(addr.to_string(), (Instant::now(), client.clone()));
+            Ok(client)
+        }
+    }
+
+    /// URMADownloader implements the Downloader trait.
+    #[async_trait]
+    impl Downloader for URMADownloader {
+        /// download_piece downloads a piece from the other peer over the URMA transport.
+        #[instrument(skip_all)]
+        async fn download_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(PieceContentStream, u64, String)> {
+            let client = self.client(addr).await?;
+            match client.download_piece(number, task_id).await {
+                Ok(downloaded) => Ok(downloaded),
+                Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
+                    self.retire_client(addr).await;
+                    self.record_failure(addr, classify_failure(&err));
+                    Err(err)
+                }
+            }
+        }
+
+        /// download_persistent_piece downloads a persistent piece from the other peer over the
+        /// URMA transport.
+        #[instrument(skip_all)]
+        async fn download_persistent_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(PieceContentStream, u64, String)> {
+            let client = self.client(addr).await?;
+            match client.download_persistent_piece(number, task_id).await {
+                Ok(downloaded) => Ok(downloaded),
+                Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
+                    self.retire_client(addr).await;
+                    self.record_failure(addr, classify_failure(&err));
+                    Err(err)
+                }
+            }
+        }
+
+        /// download_persistent_cache_piece downloads a persistent cache piece from the other peer
+        /// over the URMA transport.
+        #[instrument(skip_all)]
+        async fn download_persistent_cache_piece(
+            &self,
+            addr: &str,
+            number: u32,
+            _host_id: &str,
+            task_id: &str,
+        ) -> Result<(PieceContentStream, u64, String)> {
+            let client = self.client(addr).await?;
+            match client
+                .download_persistent_cache_piece(number, task_id)
+                .await
+            {
+                Ok(downloaded) => Ok(downloaded),
+                Err(err) => {
+                    if client.fabric_failed() {
+                        self.retire_failed_fabric().await;
+                    }
+                    self.retire_client(addr).await;
+                    self.record_failure(addr, classify_failure(&err));
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn test_downloader() -> URMADownloader {
+            URMADownloader::new(Arc::new(Config::default()))
+        }
+
+        fn backoff_of(downloader: &URMADownloader, addr: &str) -> Duration {
+            downloader.unhealthy_parents.lock().unwrap()[addr].backoff
+        }
+
+        #[test]
+        fn transport_failures_park_a_parent_and_back_off() {
+            let downloader = test_downloader();
+            let addr = "127.0.0.1:4001";
+            assert!(downloader.check_parent(addr).is_ok());
+
+            downloader.record_failure(addr, Failure::Transport);
+            assert!(downloader.check_parent(addr).is_err());
+            assert_eq!(backoff_of(&downloader, addr), UNHEALTHY_PARENT_MIN_BACKOFF);
+
+            downloader.record_failure(addr, Failure::Transport);
+            assert_eq!(
+                backoff_of(&downloader, addr),
+                UNHEALTHY_PARENT_MIN_BACKOFF * 2
+            );
+
+            for _ in 0..16 {
+                downloader.record_failure(addr, Failure::Transport);
+            }
+            assert_eq!(
+                backoff_of(&downloader, addr),
+                UNHEALTHY_PARENT_MAX_BACKOFF,
+                "backoff must stay bounded so a recovered parent is retried"
+            );
+        }
+
+        #[test]
+        fn incompatible_parents_skip_the_doubling() {
+            let downloader = test_downloader();
+            let addr = "127.0.0.1:4001";
+
+            downloader.record_failure(addr, Failure::Incompatible);
+            assert_eq!(backoff_of(&downloader, addr), INCOMPATIBLE_PARENT_TTL);
+            assert!(downloader.check_parent(addr).is_err());
+        }
+
+        #[test]
+        fn urma_unsupported_errors_are_classified_as_incompatible() {
+            assert_eq!(
+                classify_failure(&Error::Unsupported("fabric mismatch".into())),
+                Failure::Incompatible
+            );
+            assert_eq!(
+                classify_failure(&Error::Unknown("completion failed".into())),
+                Failure::Transport
+            );
+        }
+
+        #[test]
+        fn success_clears_the_penalty() {
+            let downloader = test_downloader();
+            let addr = "127.0.0.1:4001";
+
+            downloader.record_failure(addr, Failure::Transport);
+            downloader.record_success(addr);
+            assert!(downloader.check_parent(addr).is_ok());
         }
 
         #[test]

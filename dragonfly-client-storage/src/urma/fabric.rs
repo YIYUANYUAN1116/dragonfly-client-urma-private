@@ -2,11 +2,12 @@
 //!
 //! The migrated native wrappers are deliberately `!Send` and `!Sync`. The
 //! fabric creates, uses, and destroys [`UrmaRuntime`] on one OS thread. Async
-//! Dragonfly code communicates with that thread through bounded commands and
-//! never receives a raw UMDK handle.
+//! Dragonfly code communicates with that thread through bounded business
+//! admission plus a non-dropping lifecycle path, and never receives a raw
+//! UMDK handle.
 
 use super::{
-    completion::LaneCompletion,
+    completion::{LaneCompletion, OperationCompletionTx},
     lane::{JettyConfig, JettyDescriptor},
     runtime::{RuntimeConfig, UrmaRuntime},
     Error, Result,
@@ -16,13 +17,10 @@ use std::{
     sync::{mpsc as std_mpsc, Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 /// Default number of commands that may wait for the owner thread.
 const DEFAULT_COMMAND_CAPACITY: usize = 16;
-
-/// Number of completion events retained until the async consumer catches up.
-const DEFAULT_COMPLETION_CAPACITY: usize = 128;
 
 /// Bounds command latency while completions are actively being polled.
 const MAX_COMMANDS_PER_TICK: usize = 16;
@@ -34,12 +32,12 @@ const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 /// Dragonfly-facing Jetty sizing. Native tokens and handles remain private to
 /// the owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct UrmaLaneConfig {
-    pub(crate) send_depth: u32,
-    pub(crate) recv_depth: u32,
-    pub(crate) max_send_sge: u32,
-    pub(crate) max_recv_sge: u32,
-    pub(crate) token: u32,
+pub struct UrmaLaneConfig {
+    pub send_depth: u32,
+    pub recv_depth: u32,
+    pub max_send_sge: u32,
+    pub max_recv_sge: u32,
+    pub token: u32,
 }
 
 impl Default for UrmaLaneConfig {
@@ -95,13 +93,13 @@ pub(crate) enum FabricReadiness {
 }
 
 /// Namespace for starting the process-level URMA fabric.
-pub(crate) struct UrmaFabric;
+pub struct UrmaFabric;
 
 impl UrmaFabric {
     /// Starts the owner thread and waits until native initialization either
     /// succeeds or rolls back. A successful return therefore means the runtime
     /// is ready, not merely that a thread was spawned.
-    pub(crate) fn start(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
+    pub fn start(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
         Self::start_with_capacity(config, DEFAULT_COMMAND_CAPACITY)
     }
 
@@ -115,24 +113,26 @@ impl UrmaFabric {
             ));
         }
 
-        let (command_tx, command_rx) = mpsc::channel(command_capacity);
-        let (completion_tx, completion_rx) = mpsc::channel(DEFAULT_COMPLETION_CAPACITY);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let command_slots = Arc::new(Semaphore::new(command_capacity));
         let (readiness_tx, readiness_rx) = watch::channel(FabricReadiness::Starting);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
 
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
-            .spawn(move || run_owner(config, command_rx, completion_tx, readiness_tx, startup_tx))
+            .spawn(move || run_owner(config, command_rx, readiness_tx, startup_tx))
             .map_err(|error| {
                 Error::InvalidConfiguration(format!("failed to spawn URMA owner thread: {error}"))
             })?;
 
         match startup_rx.recv() {
-            Ok(Ok(())) => Ok(UrmaFabricHandle {
+            Ok(Ok((transport_type, max_message_size))) => Ok(UrmaFabricHandle {
                 inner: Arc::new(FabricInner {
                     command_tx: Mutex::new(Some(command_tx)),
-                    completion_rx: AsyncMutex::new(completion_rx),
+                    command_slots,
                     readiness: readiness_rx,
+                    transport_type,
+                    max_message_size,
                     shutdown: AsyncMutex::new(()),
                     join: Mutex::new(Some(join)),
                 }),
@@ -153,14 +153,67 @@ impl UrmaFabric {
 
 /// Cloneable, Tokio-safe facade for the thread-owned URMA runtime.
 #[derive(Clone)]
-pub(crate) struct UrmaFabricHandle {
+pub struct UrmaFabricHandle {
     inner: Arc<FabricInner>,
+}
+
+/// One posted URMA operation. Dropping this handle abandons only the async
+/// wait; the owner thread keeps the native WR and registered slot alive until
+/// its CQE is reaped.
+pub(crate) struct UrmaOpHandle {
+    sequence: Option<u64>,
+    completion: oneshot::Receiver<Result<LaneCompletion>>,
+    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
+}
+
+impl UrmaOpHandle {
+    pub(crate) async fn wait(self) -> Result<FabricCompletion> {
+        self.completion
+            .await
+            .map_err(|_| fabric_stopped())?
+            .map(Into::into)
+    }
+
+    /// Times out the logical wait and marks its lane ERROR without pretending
+    /// that liburma cancelled this individual WR. Native ownership remains in
+    /// CompletionRouter until a CQE or shutdown flush retires it.
+    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<FabricCompletion> {
+        match tokio::time::timeout(timeout, self.completion).await {
+            Ok(result) => result.map_err(|_| fabric_stopped())?.map(Into::into),
+            Err(_) => {
+                if let Some((command_tx, lane_id)) = self.abort {
+                    abort_lane(command_tx, lane_id).await?;
+                }
+                Err(Error::OperationTimeout {
+                    sequence: self.sequence,
+                })
+            }
+        }
+    }
 }
 
 impl UrmaFabricHandle {
     /// Returns a receiver for readiness and terminal-state changes.
     pub(crate) fn subscribe_readiness(&self) -> watch::Receiver<FabricReadiness> {
         self.inner.readiness.clone()
+    }
+
+    /// transport_type returns the URMA transport type negotiated from the
+    /// device at startup, used as one side of peer capability negotiation.
+    pub fn transport_type(&self) -> u32 {
+        self.inner.transport_type
+    }
+
+    /// max_message_size returns the effective single-message payload limit: the
+    /// smaller of the device capability and one registered buffer slot.
+    pub fn max_message_size(&self) -> u64 {
+        self.inner.max_message_size
+    }
+
+    /// is_failed reports whether the owner thread has entered a failed state
+    /// and the shared facade should be retired and recreated.
+    pub fn is_failed(&self) -> bool {
+        matches!(*self.inner.readiness.borrow(), FabricReadiness::Failed(_))
     }
 
     /// Creates a local lane and returns its stable id plus the serialized local
@@ -180,10 +233,28 @@ impl UrmaFabricHandle {
         .await
     }
 
-    pub(crate) async fn post_receive(&self, lane_id: u16, sequence: Option<u64>) -> Result<()> {
-        self.submit(|reply| FabricCommand::PostReceive {
+    pub(crate) async fn post_receive(
+        &self,
+        lane_id: u16,
+        sequence: Option<u64>,
+    ) -> Result<UrmaOpHandle> {
+        self.submit_operation(lane_id, sequence, |completion, reply| {
+            FabricCommand::PostReceive {
+                lane_id,
+                sequence,
+                completion,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Applies a validated peer RecvPosted window to the lane. Window ordering
+    /// remains a Piece-session responsibility; the Fabric owns only the count.
+    pub(crate) async fn grant_send_credit(&self, lane_id: u16, count: u32) -> Result<()> {
+        self.submit(|reply| FabricCommand::GrantSendCredit {
             lane_id,
-            sequence,
+            count,
             reply,
         })
         .await
@@ -194,20 +265,15 @@ impl UrmaFabricHandle {
         lane_id: u16,
         bytes: Vec<u8>,
         sequence: Option<u64>,
-    ) -> Result<()> {
-        self.submit(|reply| FabricCommand::Send {
+    ) -> Result<UrmaOpHandle> {
+        self.submit_operation(lane_id, sequence, |completion, reply| FabricCommand::Send {
             lane_id,
             bytes,
             sequence,
+            completion,
             reply,
         })
         .await
-    }
-
-    /// Receives the next successfully routed CQE. Only one logical consumer
-    /// should call this method; concurrent clones serialize on the receiver.
-    pub(crate) async fn recv_completion(&self) -> Option<FabricCompletion> {
-        self.inner.completion_rx.lock().await.recv().await
     }
 
     pub(crate) async fn close_lane(&self, lane_id: u16) -> Result<()> {
@@ -215,23 +281,68 @@ impl UrmaFabricHandle {
             .await
     }
 
+    pub(crate) async fn abort_lane(&self, lane_id: u16) -> Result<()> {
+        let command_tx = self.command_sender()?;
+        abort_lane(command_tx, lane_id).await
+    }
+
+    /// Cancellation hook for Drop paths that cannot await. Lifecycle commands
+    /// bypass normal command admission so a full business queue cannot lose an
+    /// abort request.
+    pub(crate) fn try_abort_lane(&self, lane_id: u16) -> Result<()> {
+        let command_tx = self.command_sender()?;
+        let (reply, _ignored) = oneshot::channel();
+        command_tx
+            .send(CommandEnvelope::urgent(FabricCommand::AbortLane {
+                lane_id,
+                reply,
+            }))
+            .map_err(|_| fabric_stopped())
+    }
+
     async fn submit<T>(
         &self,
         make_command: impl FnOnce(oneshot::Sender<Result<T>>) -> FabricCommand,
     ) -> Result<T> {
-        let command_tx = self
+        let command_tx = self.command_sender()?;
+        let permit = self
             .inner
+            .command_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| fabric_stopped())?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(CommandEnvelope::admitted(make_command(reply_tx), permit))
+            .map_err(|_| fabric_stopped())?;
+        reply_rx.await.map_err(|_| fabric_stopped())?
+    }
+
+    fn command_sender(&self) -> Result<mpsc::UnboundedSender<CommandEnvelope>> {
+        self.inner
             .command_tx
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(fabric_stopped)?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        command_tx
-            .send(make_command(reply_tx))
-            .await
-            .map_err(|_| fabric_stopped())?;
-        reply_rx.await.map_err(|_| fabric_stopped())?
+            .ok_or_else(fabric_stopped)
+    }
+
+    async fn submit_operation(
+        &self,
+        lane_id: u16,
+        sequence: Option<u64>,
+        make_command: impl FnOnce(OperationCompletionTx, oneshot::Sender<Result<()>>) -> FabricCommand,
+    ) -> Result<UrmaOpHandle> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit(|reply| make_command(completion_tx, reply))
+            .await?;
+        let command_tx = self.command_sender()?;
+        Ok(UrmaOpHandle {
+            sequence,
+            completion: completion_rx,
+            abort: Some((command_tx, lane_id)),
+        })
     }
 
     /// Shuts the native resource tree down and joins the owner thread.
@@ -242,12 +353,9 @@ impl UrmaFabricHandle {
 
         let shutdown_result = if let Some(command_tx) = command_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
-            match command_tx
-                .send(FabricCommand::Shutdown {
-                    reply: Some(reply_tx),
-                })
-                .await
-            {
+            match command_tx.send(CommandEnvelope::urgent(FabricCommand::Shutdown {
+                reply: Some(reply_tx),
+            })) {
                 Ok(()) => reply_rx.await.unwrap_or_else(|_| {
                     Err(Error::Shutdown {
                         failures: vec!["URMA owner thread dropped shutdown reply".into()],
@@ -267,9 +375,11 @@ impl UrmaFabricHandle {
 }
 
 struct FabricInner {
-    command_tx: Mutex<Option<mpsc::Sender<FabricCommand>>>,
-    completion_rx: AsyncMutex<mpsc::Receiver<FabricCompletion>>,
+    command_tx: Mutex<Option<mpsc::UnboundedSender<CommandEnvelope>>>,
+    command_slots: Arc<Semaphore>,
     readiness: watch::Receiver<FabricReadiness>,
+    transport_type: u32,
+    max_message_size: u64,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -277,7 +387,9 @@ struct FabricInner {
 impl Drop for FabricInner {
     fn drop(&mut self) {
         if let Some(command_tx) = self.command_tx.get_mut().unwrap().take() {
-            let _ = command_tx.try_send(FabricCommand::Shutdown { reply: None });
+            let _ = command_tx.send(CommandEnvelope::urgent(FabricCommand::Shutdown {
+                reply: None,
+            }));
             drop(command_tx);
         }
         if let Some(join) = self.join.get_mut().unwrap().take() {
@@ -299,15 +411,26 @@ enum FabricCommand {
     PostReceive {
         lane_id: u16,
         sequence: Option<u64>,
+        completion: OperationCompletionTx,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GrantSendCredit {
+        lane_id: u16,
+        count: u32,
         reply: oneshot::Sender<Result<()>>,
     },
     Send {
         lane_id: u16,
         bytes: Vec<u8>,
         sequence: Option<u64>,
+        completion: OperationCompletionTx,
         reply: oneshot::Sender<Result<()>>,
     },
     CloseLane {
+        lane_id: u16,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    AbortLane {
         lane_id: u16,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -316,12 +439,32 @@ enum FabricCommand {
     },
 }
 
+struct CommandEnvelope {
+    command: FabricCommand,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl CommandEnvelope {
+    fn admitted(command: FabricCommand, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            command,
+            _permit: Some(permit),
+        }
+    }
+
+    fn urgent(command: FabricCommand) -> Self {
+        Self {
+            command,
+            _permit: None,
+        }
+    }
+}
+
 fn run_owner(
     config: RuntimeConfig,
-    mut command_rx: mpsc::Receiver<FabricCommand>,
-    completion_tx: mpsc::Sender<FabricCompletion>,
+    mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
-    startup_tx: std_mpsc::SyncSender<Result<()>>,
+    startup_tx: std_mpsc::SyncSender<Result<(u32, u64)>>,
 ) {
     let runtime = match UrmaRuntime::start(config) {
         Ok(runtime) => runtime,
@@ -332,8 +475,9 @@ fn run_owner(
         }
     };
 
+    let probe = (runtime.transport_type(), runtime.max_message_size());
     readiness_tx.send_replace(FabricReadiness::Ready);
-    if startup_tx.send(Ok(())).is_err() {
+    if startup_tx.send(Ok(probe)).is_err() {
         let _ = shutdown_runtime(runtime, &readiness_tx);
         return;
     }
@@ -343,9 +487,9 @@ fn run_owner(
     loop {
         if runtime.outstanding() == 0 {
             match command_rx.blocking_recv() {
-                Some(command) => {
+                Some(envelope) => {
                     if let OwnerControl::Shutdown(reply) =
-                        handle_command(command, &mut runtime, poisoned.as_deref())
+                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
                     {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
@@ -361,9 +505,9 @@ fn run_owner(
 
         for _ in 0..MAX_COMMANDS_PER_TICK {
             match command_rx.try_recv() {
-                Ok(command) => {
+                Ok(envelope) => {
                     if let OwnerControl::Shutdown(reply) =
-                        handle_command(command, &mut runtime, poisoned.as_deref())
+                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
                     {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
@@ -378,17 +522,8 @@ fn run_owner(
         }
 
         match runtime.poll_once() {
-            Ok(completions) => {
-                let idle = completions.is_empty();
-                for completion in completions {
-                    if let Err(error) = completion_tx.try_send(completion.into()) {
-                        poison_once(
-                            &mut poisoned,
-                            format!("URMA completion consumer is unavailable: {error}"),
-                            &readiness_tx,
-                        );
-                    }
-                }
+            Ok(completed) => {
+                let idle = completed == 0;
                 if idle {
                     thread::sleep(PROGRESS_IDLE_INTERVAL);
                 } else {
@@ -443,10 +578,21 @@ fn handle_command(
         FabricCommand::PostReceive {
             lane_id,
             sequence,
+            completion,
             reply,
         } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.post_receive(lane_id, sequence));
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.post_receive(lane_id, sequence, completion));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::GrantSendCredit {
+            lane_id,
+            count,
+            reply,
+        } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.grant_send_credit(lane_id, count));
             let _ = reply.send(result);
             OwnerControl::Continue
         }
@@ -454,15 +600,20 @@ fn handle_command(
             lane_id,
             bytes,
             sequence,
+            completion,
             reply,
         } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.send(lane_id, &bytes, sequence));
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.send(lane_id, &bytes, sequence, completion));
             let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::CloseLane { lane_id, reply } => {
             let _ = reply.send(runtime.close_lane(lane_id));
+            OwnerControl::Continue
+        }
+        FabricCommand::AbortLane { lane_id, reply } => {
+            let _ = reply.send(runtime.abort_lane(lane_id));
             OwnerControl::Continue
         }
         FabricCommand::Shutdown { reply } => OwnerControl::Shutdown(reply),
@@ -493,6 +644,20 @@ fn fabric_stopped() -> Error {
     Error::Shutdown {
         failures: vec!["URMA owner thread is stopped".into()],
     }
+}
+
+async fn abort_lane(
+    command_tx: mpsc::UnboundedSender<CommandEnvelope>,
+    lane_id: u16,
+) -> Result<()> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    command_tx
+        .send(CommandEnvelope::urgent(FabricCommand::AbortLane {
+            lane_id,
+            reply: reply_tx,
+        }))
+        .map_err(|_| fabric_stopped())?;
+    reply_rx.await.map_err(|_| fabric_stopped())?
 }
 
 impl From<LaneCompletion> for FabricCompletion {
@@ -562,6 +727,45 @@ mod tests {
     fn handle_is_safe_to_move_between_tokio_tasks() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<UrmaFabricHandle>();
+        assert_send_sync::<UrmaOpHandle>();
+    }
+
+    #[tokio::test]
+    async fn operation_handle_receives_its_own_completion() {
+        let (tx, rx) = oneshot::channel();
+        let handle = UrmaOpHandle {
+            sequence: Some(9),
+            completion: rx,
+            abort: None,
+        };
+        tx.send(Ok(LaneCompletion::Sent {
+            lane_id: 7,
+            sequence: Some(9),
+        }))
+        .unwrap();
+
+        assert_eq!(
+            handle.wait().await.unwrap(),
+            FabricCompletion::Sent {
+                lane_id: 7,
+                sequence: Some(9)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_timeout_abandons_only_the_waiter() {
+        let (_tx, rx) = oneshot::channel();
+        let handle = UrmaOpHandle {
+            sequence: Some(11),
+            completion: rx,
+            abort: None,
+        };
+
+        assert_eq!(
+            handle.wait_timeout(Duration::ZERO).await,
+            Err(Error::OperationTimeout { sequence: Some(11) })
+        );
     }
 
     #[test]

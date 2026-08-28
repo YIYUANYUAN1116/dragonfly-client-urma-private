@@ -1,6 +1,6 @@
 use super::{
     buffer::{SlotId, SlotKind, UrmaBufferPool},
-    completion::{CompletionRouter, LaneCompletion},
+    completion::{CompletionRouter, OperationCompletionTx},
     ffi, native_error,
     runtime::UrmaDeviceCapability,
     Error, Result,
@@ -69,29 +69,38 @@ impl WrToken {
 }
 
 #[derive(Default)]
-struct ReceiveCredit {
-    posted: usize,
-    ever_posted: bool,
+struct LaneCredits {
+    remote_receives_available: usize,
 }
 
-impl ReceiveCredit {
-    fn posted(&mut self) {
-        self.posted += 1;
-        self.ever_posted = true;
-    }
-
-    fn completed(&mut self) {
-        self.posted = self.posted.saturating_sub(1);
-    }
-
-    fn require_before_send(&self) -> Result<()> {
-        if self.ever_posted {
-            Ok(())
-        } else {
-            Err(Error::Protocol(
-                "SEND is forbidden before at least one RECV is posted".into(),
-            ))
+impl LaneCredits {
+    fn grant_remote_receives(&mut self, count: u32) -> Result<()> {
+        if count == 0 {
+            return Err(Error::Protocol(
+                "remote receive credit grant must be non-zero".into(),
+            ));
         }
+        let count = usize::try_from(count)
+            .map_err(|_| Error::Protocol("remote receive credit does not fit usize".into()))?;
+        self.remote_receives_available = self
+            .remote_receives_available
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("remote receive credit overflow".into()))?;
+        Ok(())
+    }
+
+    fn require_remote_receive(&self) -> Result<()> {
+        if self.remote_receives_available == 0 {
+            return Err(Error::Protocol(
+                "SEND is forbidden until the peer grants RecvPosted credit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume_remote_receive(&mut self) {
+        debug_assert_ne!(self.remote_receives_available, 0);
+        self.remote_receives_available -= 1;
     }
 }
 
@@ -356,7 +365,7 @@ pub(crate) struct UrmaLane {
     state: LaneState,
     capability: UrmaDeviceCapability,
     jetty: UrmaJetty,
-    receive_credit: ReceiveCredit,
+    credits: LaneCredits,
 }
 
 impl UrmaLane {
@@ -377,7 +386,7 @@ impl UrmaLane {
             state: LaneState::JettyCreated,
             capability,
             jetty,
-            receive_credit: ReceiveCredit::default(),
+            credits: LaneCredits::default(),
         })
     }
 
@@ -425,11 +434,17 @@ impl UrmaLane {
         Ok(())
     }
 
+    pub(crate) fn grant_send_credit(&mut self, count: u32) -> Result<()> {
+        self.require(LaneState::Ready)?;
+        self.credits.grant_remote_receives(count)
+    }
+
     pub(crate) fn post_receive(
         &mut self,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
         sequence: Option<u64>,
+        completion: OperationCompletionTx,
     ) -> Result<()> {
         if !matches!(self.state, LaneState::Bound | LaneState::Ready) {
             return Err(self.state_error("post receive"));
@@ -451,9 +466,7 @@ impl UrmaLane {
                 return Err(error);
             }
         };
-        completions.track(user_ctx, wr, sequence)?;
-        self.receive_credit.posted();
-        Ok(())
+        completions.track(user_ctx, wr, sequence, completion)
     }
 
     pub(crate) fn send(
@@ -462,9 +475,10 @@ impl UrmaLane {
         completions: &mut CompletionRouter,
         bytes: &[u8],
         sequence: Option<u64>,
+        completion: OperationCompletionTx,
     ) -> Result<()> {
         self.require(LaneState::Ready)?;
-        self.receive_credit.require_before_send()?;
+        self.credits.require_remote_receive()?;
         let slot = pool
             .allocate(SlotKind::Tx)
             .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
@@ -494,21 +508,20 @@ impl UrmaLane {
                 return Err(error);
             }
         };
-        completions.track(user_ctx, wr, sequence)
-    }
-
-    pub(crate) fn observe_completion(&mut self, completion: &LaneCompletion) {
-        if matches!(completion, LaneCompletion::Received { .. }) {
-            self.receive_credit.completed();
-        }
+        self.credits.consume_remote_receive();
+        completions.track(user_ctx, wr, sequence, completion)
     }
 
     pub(crate) fn begin_draining(&mut self) -> Result<()> {
-        if self.state == LaneState::Closed {
+        if matches!(self.state, LaneState::Draining | LaneState::Closed) {
             return Ok(());
         }
         self.state = LaneState::Draining;
         self.jetty.mark_error()
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.state == LaneState::Draining
     }
 
     pub(crate) fn close(&mut self, outstanding: usize) -> Result<()> {
@@ -602,7 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn send_requires_a_preposted_receive() {
-        assert!(ReceiveCredit::default().require_before_send().is_err());
+    fn send_requires_remote_recv_posted_credit() {
+        let mut credits = LaneCredits::default();
+        assert!(credits.require_remote_receive().is_err());
+        assert!(credits.grant_remote_receives(0).is_err());
+
+        credits.grant_remote_receives(1).unwrap();
+        assert!(credits.require_remote_receive().is_ok());
+        credits.consume_remote_receive();
+        assert!(credits.require_remote_receive().is_err());
     }
 }

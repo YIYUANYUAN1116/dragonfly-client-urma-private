@@ -7,9 +7,12 @@
 mod buffer;
 mod completion;
 mod error;
-pub(crate) mod fabric;
+pub mod fabric;
 mod ffi;
 mod lane;
-mod runtime;
+pub mod rendezvous;
+pub mod runtime;
+pub(crate) mod session;
 
-pub(crate) use error::{native_error, Error, Result};
+pub(crate) use error::native_error;
+pub use error::{Error, Result};

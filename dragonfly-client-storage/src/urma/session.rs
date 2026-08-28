@@ -1,0 +1,843 @@
+//! Persistent peer session over the thread-owned URMA fabric.
+//!
+//! A TCP control connection and one bound Jetty are established once, then
+//! reused for sequential Piece transfers. Storage lookup and stream exposure
+//! stay in the future `client::urma` / `server::urma` adapters.
+
+use super::{
+    fabric::{FabricCompletion, UrmaFabricHandle, UrmaLaneConfig, UrmaOpHandle},
+    rendezvous::{
+        read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
+        PieceMetadata, ReceiveWindow, RendezvousError, UrmaCapability,
+    },
+    Error, Result,
+};
+use crate::rendezvous::{ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
+use dragonfly_client_core::Error as ClientError;
+use std::time::Duration;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time,
+};
+
+fn control_error(error: ClientError) -> Error {
+    Error::Protocol(format!("URMA rendezvous failed: {error}"))
+}
+
+fn unexpected(frame: Frame, phase: &str) -> Error {
+    match frame {
+        Frame::Error(error) => Error::PeerRejected {
+            code: error.code,
+            message: error.message,
+        },
+        frame => Error::Protocol(format!("unexpected URMA frame during {phase}: {frame:?}")),
+    }
+}
+
+async fn read_control<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<Frame> {
+    time::timeout(timeout, read_frame(stream))
+        .await
+        .map_err(|_| Error::ControlTimeout { operation })?
+        .map_err(control_error)
+}
+
+async fn write_control<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &Frame,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<()> {
+    time::timeout(timeout, write_frame(stream, frame))
+        .await
+        .map_err(|_| Error::ControlTimeout { operation })?
+        .map_err(control_error)
+}
+
+#[derive(Clone, Debug)]
+struct TransferShape {
+    metadata: PieceMetadata,
+    chunk_count: u64,
+}
+
+impl TransferShape {
+    fn negotiate(
+        request: &CommonPieceRequest,
+        metadata: PieceMetadata,
+        max_message_size: u64,
+        max_inflight_chunks: u32,
+    ) -> Result<Self> {
+        if request.task_id.is_empty()
+            || request.chunk_size == 0
+            || request.max_inflight_chunks == 0
+            || metadata.length == 0
+            || metadata.chunk_size == 0
+            || metadata.chunk_size > request.chunk_size
+            || metadata.chunk_size > max_message_size
+            || metadata.max_inflight_chunks == 0
+            || metadata.max_inflight_chunks > request.max_inflight_chunks
+            || metadata.max_inflight_chunks > max_inflight_chunks
+        {
+            return Err(Error::Protocol(format!(
+                "invalid URMA Piece negotiation: request chunk={} inflight={}, metadata length={} chunk={} inflight={}",
+                request.chunk_size,
+                request.max_inflight_chunks,
+                metadata.length,
+                metadata.chunk_size,
+                metadata.max_inflight_chunks
+            )));
+        }
+        Ok(Self {
+            chunk_count: metadata.length.div_ceil(metadata.chunk_size),
+            metadata,
+        })
+    }
+
+    fn window(&self, start_chunk: u64) -> Result<ReceiveWindow> {
+        if start_chunk >= self.chunk_count {
+            return Err(Error::Protocol(
+                "receive window starts after the final chunk".into(),
+            ));
+        }
+        Ok(ReceiveWindow {
+            start_chunk,
+            chunk_count: (self.chunk_count - start_chunk)
+                .min(u64::from(self.metadata.max_inflight_chunks)) as u32,
+        })
+    }
+
+    fn chunk_len(&self, chunk: u64) -> Result<usize> {
+        if chunk >= self.chunk_count {
+            return Err(Error::Protocol("chunk index exceeds Piece length".into()));
+        }
+        let offset = chunk
+            .checked_mul(self.metadata.chunk_size)
+            .ok_or_else(|| Error::Protocol("chunk offset overflow".into()))?;
+        usize::try_from(self.metadata.chunk_size.min(self.metadata.length - offset))
+            .map_err(|_| Error::Protocol("chunk length exceeds addressable memory".into()))
+    }
+
+    fn window_len(&self, window: ReceiveWindow) -> Result<usize> {
+        let remaining = self
+            .chunk_count
+            .checked_sub(window.start_chunk)
+            .ok_or_else(|| Error::Protocol("receive window starts past Piece end".into()))?;
+        window
+            .validate(window.start_chunk, remaining)
+            .map_err(control_error)?;
+        let mut length = 0usize;
+        for chunk in window.start_chunk..window.start_chunk + u64::from(window.chunk_count) {
+            length = length
+                .checked_add(self.chunk_len(chunk)?)
+                .ok_or_else(|| Error::Protocol("receive window length overflow".into()))?;
+        }
+        Ok(length)
+    }
+}
+
+struct ClientPiece {
+    shape: TransferShape,
+    next_chunk: u64,
+}
+
+/// Downloader-side peer session. `finish_piece` returns it to Idle so the
+/// same control connection and Jetty can carry the next Piece.
+pub(crate) struct UrmaClientSession<S> {
+    stream: S,
+    fabric: UrmaFabricHandle,
+    lane_id: Option<u16>,
+    max_message_size: u64,
+    max_receive_inflight: u32,
+    control_timeout: Duration,
+    piece: Option<ClientPiece>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
+    pub(crate) async fn connect(
+        mut stream: S,
+        fabric: UrmaFabricHandle,
+        lane_config: UrmaLaneConfig,
+        local_capability: UrmaCapability,
+        remote_capability: &UrmaCapability,
+        control_timeout: Duration,
+    ) -> Result<Self> {
+        local_capability
+            .compatible(remote_capability)
+            .map_err(Error::Protocol)?;
+        let max_message_size = local_capability
+            .max_message_size
+            .min(remote_capability.max_message_size);
+        let (lane_id, client_descriptor) = fabric.create_lane(lane_config).await?;
+        let handshake = async {
+            write_control(
+                &mut stream,
+                &Frame::Connect(LaneConnect {
+                    capability: local_capability,
+                    client_descriptor,
+                }),
+                control_timeout,
+                "send lane Connect",
+            )
+            .await?;
+            let connected =
+                match read_control(&mut stream, control_timeout, "receive lane Connected").await? {
+                    Frame::Connected(connected) => connected,
+                    frame => return Err(unexpected(frame, "lane connect")),
+                };
+            fabric.bind_lane(lane_id, connected.server_descriptor).await
+        }
+        .await;
+        if let Err(error) = handshake {
+            let _ = fabric.abort_lane(lane_id).await;
+            return Err(error);
+        }
+        Ok(Self {
+            stream,
+            fabric,
+            lane_id: Some(lane_id),
+            max_message_size,
+            max_receive_inflight: lane_config.recv_depth,
+            control_timeout,
+            piece: None,
+        })
+    }
+
+    pub(crate) async fn request_piece(
+        &mut self,
+        request: CommonPieceRequest,
+    ) -> Result<PieceMetadata> {
+        if self.piece.is_some() {
+            return Err(Error::Protocol("an URMA Piece is already active".into()));
+        }
+        if request.task_id.is_empty()
+            || request.chunk_size == 0
+            || request.chunk_size > self.max_message_size
+            || request.max_inflight_chunks == 0
+            || request.max_inflight_chunks > self.max_receive_inflight
+        {
+            return Err(Error::Protocol("invalid URMA Piece request".into()));
+        }
+        if let Err(error) = write_control(
+            &mut self.stream,
+            &Frame::Request(request.clone()),
+            self.control_timeout,
+            "send Piece Request",
+        )
+        .await
+        {
+            return self.abort(error).await;
+        }
+        let metadata = match read_control(
+            &mut self.stream,
+            self.control_timeout,
+            "receive Piece Ready",
+        )
+        .await
+        {
+            Ok(Frame::Ready(metadata)) => metadata,
+            Ok(frame) => return self.abort(unexpected(frame, "Piece request")).await,
+            Err(error) => return self.abort(error).await,
+        };
+        let shape = match TransferShape::negotiate(
+            &request,
+            metadata,
+            self.max_message_size,
+            self.max_receive_inflight,
+        ) {
+            Ok(shape) => shape,
+            Err(error) => return self.abort(error).await,
+        };
+        let metadata = shape.metadata.clone();
+        self.piece = Some(ClientPiece {
+            shape,
+            next_chunk: 0,
+        });
+        Ok(metadata)
+    }
+
+    pub(crate) async fn receive_next_window(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+        let lane_id = self.open_lane()?;
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+        let window = piece.shape.window(piece.next_chunk)?;
+        let expected_window_len = piece.shape.window_len(window)?;
+        let mut operations = Vec::with_capacity(window.chunk_count as usize);
+        for chunk in window.start_chunk..window.start_chunk + u64::from(window.chunk_count) {
+            match self.fabric.post_receive(lane_id, Some(chunk)).await {
+                Ok(operation) => operations.push((chunk, operation)),
+                Err(error) => return self.abort(error).await,
+            }
+        }
+        if let Err(error) = write_control(
+            &mut self.stream,
+            &Frame::RecvPosted(window),
+            self.control_timeout,
+            "send RecvPosted",
+        )
+        .await
+        {
+            return self.abort(error).await;
+        }
+
+        let mut bytes = Vec::with_capacity(expected_window_len);
+        for (chunk, operation) in operations {
+            let expected_len = self
+                .piece
+                .as_ref()
+                .expect("active Piece")
+                .shape
+                .chunk_len(chunk)?;
+            match operation.wait_timeout(timeout).await {
+                Ok(FabricCompletion::Received {
+                    lane_id: completed_lane,
+                    sequence: Some(completed_chunk),
+                    bytes: chunk_bytes,
+                }) if completed_lane == lane_id
+                    && completed_chunk == chunk
+                    && chunk_bytes.len() == expected_len =>
+                {
+                    bytes.extend_from_slice(&chunk_bytes);
+                }
+                Ok(completion) => {
+                    return self
+                        .abort(Error::Protocol(format!(
+                            "invalid URMA receive completion for chunk {chunk}: {completion:?}"
+                        )))
+                        .await;
+                }
+                Err(error) => return self.abort(error).await,
+            }
+        }
+        self.piece.as_mut().expect("active Piece").next_chunk += u64::from(window.chunk_count);
+        debug_assert_eq!(bytes.len(), expected_window_len);
+        Ok(bytes)
+    }
+
+    pub(crate) fn piece_complete(&self) -> bool {
+        self.piece
+            .as_ref()
+            .is_some_and(|piece| piece.next_chunk == piece.shape.chunk_count)
+    }
+
+    pub(crate) async fn finish_piece(&mut self) -> Result<()> {
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+        if piece.next_chunk != piece.shape.chunk_count {
+            return Err(Error::Protocol("URMA Piece is not fully received".into()));
+        }
+        match read_control(&mut self.stream, self.control_timeout, "receive Piece Done").await {
+            Ok(Frame::Done) => {
+                self.piece = None;
+                Ok(())
+            }
+            Ok(frame) => self.abort(unexpected(frame, "Piece finish")).await,
+            Err(error) => self.abort(error).await,
+        }
+    }
+
+    pub(crate) async fn close(mut self) -> Result<()> {
+        if self.piece.is_some() {
+            return self
+                .abort(Error::Protocol(
+                    "cannot close with an active URMA Piece".into(),
+                ))
+                .await;
+        }
+        let lane_id = self.lane_id.take().expect("open peer lane");
+        self.fabric.close_lane(lane_id).await
+    }
+
+    fn open_lane(&self) -> Result<u16> {
+        self.lane_id
+            .ok_or_else(|| Error::Protocol("URMA client session is closed".into()))
+    }
+
+    async fn abort<T>(&mut self, error: Error) -> Result<T> {
+        if let Some(lane_id) = self.lane_id.take() {
+            let _ = self.fabric.abort_lane(lane_id).await;
+        }
+        Err(error)
+    }
+}
+
+impl<S> Drop for UrmaClientSession<S> {
+    fn drop(&mut self) {
+        if let Some(lane_id) = self.lane_id.take() {
+            let _ = self.fabric.try_abort_lane(lane_id);
+        }
+    }
+}
+
+struct ServerPiece {
+    request: CommonPieceRequest,
+    shape: Option<TransferShape>,
+    next_chunk: u64,
+}
+
+/// Uploader-side peer session. Storage reads `receive_request`, supplies
+/// metadata via `ready`, then feeds one bounded window at a time.
+pub(crate) struct UrmaServerSession<S> {
+    stream: S,
+    fabric: UrmaFabricHandle,
+    lane_id: Option<u16>,
+    max_message_size: u64,
+    max_send_inflight: u32,
+    control_timeout: Duration,
+    piece: Option<ServerPiece>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
+    pub(crate) async fn accept(
+        mut stream: S,
+        fabric: UrmaFabricHandle,
+        lane_config: UrmaLaneConfig,
+        local_capability: &UrmaCapability,
+        control_timeout: Duration,
+    ) -> Result<Self> {
+        let connect =
+            match read_control(&mut stream, control_timeout, "receive lane Connect").await? {
+                Frame::Connect(connect) => connect,
+                frame => return Err(unexpected(frame, "lane accept")),
+            };
+        if let Err(reason) = local_capability.compatible(&connect.capability) {
+            let _ = write_error(
+                &mut stream,
+                ERROR_CODE_INCOMPATIBLE,
+                &reason,
+                control_timeout,
+            )
+            .await;
+            return Err(Error::Protocol(reason));
+        }
+        let max_message_size = local_capability
+            .max_message_size
+            .min(connect.capability.max_message_size);
+        let (lane_id, server_descriptor) = fabric.create_lane(lane_config).await?;
+        let handshake = async {
+            fabric.bind_lane(lane_id, connect.client_descriptor).await?;
+            write_control(
+                &mut stream,
+                &Frame::Connected(LaneConnected { server_descriptor }),
+                control_timeout,
+                "send lane Connected",
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = handshake {
+            let _ = fabric.abort_lane(lane_id).await;
+            return Err(error);
+        }
+        Ok(Self {
+            stream,
+            fabric,
+            lane_id: Some(lane_id),
+            max_message_size,
+            max_send_inflight: lane_config.send_depth,
+            control_timeout,
+            piece: None,
+        })
+    }
+
+    pub(crate) async fn receive_request(&mut self) -> Result<CommonPieceRequest> {
+        if self.piece.is_some() {
+            return Err(Error::Protocol("an URMA Piece is already active".into()));
+        }
+        let request = match read_control(
+            &mut self.stream,
+            self.control_timeout,
+            "receive Piece Request",
+        )
+        .await
+        {
+            Ok(Frame::Request(request)) => request,
+            Ok(frame) => return self.abort(unexpected(frame, "Piece request")).await,
+            Err(error) => return self.abort(error).await,
+        };
+        if request.task_id.is_empty()
+            || request.chunk_size == 0
+            || request.chunk_size > self.max_message_size
+            || request.max_inflight_chunks == 0
+        {
+            let error = Error::Protocol("invalid URMA Piece request".into());
+            let _ = write_error(
+                &mut self.stream,
+                ERROR_CODE_INTERNAL,
+                &error.to_string(),
+                self.control_timeout,
+            )
+            .await;
+            return self.abort(error).await;
+        }
+        self.piece = Some(ServerPiece {
+            request: request.clone(),
+            shape: None,
+            next_chunk: 0,
+        });
+        Ok(request)
+    }
+
+    pub(crate) async fn ready(&mut self, metadata: PieceMetadata) -> Result<()> {
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no pending URMA Piece".into()))?;
+        if piece.shape.is_some() {
+            return Err(Error::Protocol("URMA Piece is already ready".into()));
+        }
+        let shape = match TransferShape::negotiate(
+            &piece.request,
+            metadata.clone(),
+            self.max_message_size,
+            self.max_send_inflight,
+        ) {
+            Ok(shape) => shape,
+            Err(error) => return self.abort_peer(error).await,
+        };
+        if let Err(error) = write_control(
+            &mut self.stream,
+            &Frame::Ready(metadata),
+            self.control_timeout,
+            "send Piece Ready",
+        )
+        .await
+        {
+            return self.abort(error).await;
+        }
+        self.piece.as_mut().expect("pending Piece").shape = Some(shape);
+        Ok(())
+    }
+
+    pub(crate) fn next_window_len(&self) -> Result<usize> {
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+        let shape = piece
+            .shape
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
+        shape.window_len(shape.window(piece.next_chunk)?)
+    }
+
+    pub(crate) async fn send_next_window(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
+        let lane_id = self.open_lane()?;
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+        let shape = piece
+            .shape
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
+        let expected = shape.window(piece.next_chunk)?;
+        let window = match read_control(
+            &mut self.stream,
+            self.control_timeout,
+            "receive RecvPosted",
+        )
+        .await
+        {
+            Ok(Frame::RecvPosted(window)) => window,
+            Ok(frame) => return self.abort_peer(unexpected(frame, "receive credit")).await,
+            Err(error) => return self.abort(error).await,
+        };
+        if window != expected {
+            return self
+                .abort_peer(Error::Protocol(format!(
+                    "invalid URMA receive window: expected {expected:?}, got {window:?}"
+                )))
+                .await;
+        }
+        let expected_len = shape.window_len(window)?;
+        if bytes.len() != expected_len {
+            return self
+                .abort_peer(Error::Protocol(format!(
+                    "URMA send window length mismatch: expected {expected_len}, got {}",
+                    bytes.len()
+                )))
+                .await;
+        }
+        if let Err(error) = self
+            .fabric
+            .grant_send_credit(lane_id, window.chunk_count)
+            .await
+        {
+            return self.abort_peer(error).await;
+        }
+
+        let mut operations: Vec<UrmaOpHandle> = Vec::with_capacity(window.chunk_count as usize);
+        let mut offset = 0usize;
+        for chunk in window.start_chunk..window.start_chunk + u64::from(window.chunk_count) {
+            let length = self
+                .piece
+                .as_ref()
+                .and_then(|piece| piece.shape.as_ref())
+                .expect("ready Piece")
+                .chunk_len(chunk)?;
+            match self
+                .fabric
+                .send(
+                    lane_id,
+                    bytes[offset..offset + length].to_vec(),
+                    Some(chunk),
+                )
+                .await
+            {
+                Ok(operation) => operations.push(operation),
+                Err(error) => return self.abort_peer(error).await,
+            }
+            offset += length;
+        }
+        for (index, operation) in operations.into_iter().enumerate() {
+            let chunk = window.start_chunk + index as u64;
+            match operation.wait_timeout(timeout).await {
+                Ok(FabricCompletion::Sent {
+                    lane_id: completed_lane,
+                    sequence: Some(completed_chunk),
+                }) if completed_lane == lane_id && completed_chunk == chunk => {}
+                Ok(completion) => {
+                    return self
+                        .abort_peer(Error::Protocol(format!(
+                            "invalid URMA send completion for chunk {chunk}: {completion:?}"
+                        )))
+                        .await;
+                }
+                Err(error) => return self.abort_peer(error).await,
+            }
+        }
+        self.piece.as_mut().expect("active Piece").next_chunk += u64::from(window.chunk_count);
+        Ok(())
+    }
+
+    pub(crate) async fn finish_piece(&mut self) -> Result<()> {
+        let piece = self
+            .piece
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+        let shape = piece
+            .shape
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
+        if piece.next_chunk != shape.chunk_count {
+            return self
+                .abort_peer(Error::Protocol("URMA Piece is not fully sent".into()))
+                .await;
+        }
+        if let Err(error) = write_control(
+            &mut self.stream,
+            &Frame::Done,
+            self.control_timeout,
+            "send Piece Done",
+        )
+        .await
+        {
+            return self.abort(error).await;
+        }
+        self.piece = None;
+        Ok(())
+    }
+
+    /// Rejects the pending Piece with a typed rendezvous error and retires the
+    /// lane. Phase A treats any Piece rejection as terminal for the sequential
+    /// peer session, matching the existing conservative error policy.
+    pub(crate) async fn reject_piece(&mut self, code: u32, message: &str) -> Result<()> {
+        if self.piece.is_none() {
+            return Err(Error::Protocol("no pending URMA Piece to reject".into()));
+        }
+        let write_result = write_error(&mut self.stream, code, message, self.control_timeout).await;
+        self.piece = None;
+        let abort_result = match self.lane_id.take() {
+            Some(lane_id) => self.fabric.abort_lane(lane_id).await,
+            None => Ok(()),
+        };
+        write_result.and(abort_result)
+    }
+
+    pub(crate) async fn close(mut self) -> Result<()> {
+        if self.piece.is_some() {
+            return self
+                .abort(Error::Protocol(
+                    "cannot close with an active URMA Piece".into(),
+                ))
+                .await;
+        }
+        let lane_id = self.lane_id.take().expect("open peer lane");
+        self.fabric.close_lane(lane_id).await
+    }
+
+    fn open_lane(&self) -> Result<u16> {
+        self.lane_id
+            .ok_or_else(|| Error::Protocol("URMA server session is closed".into()))
+    }
+
+    async fn abort<T>(&mut self, error: Error) -> Result<T> {
+        if let Some(lane_id) = self.lane_id.take() {
+            let _ = self.fabric.abort_lane(lane_id).await;
+        }
+        Err(error)
+    }
+
+    async fn abort_peer<T>(&mut self, error: Error) -> Result<T> {
+        let _ = write_error(
+            &mut self.stream,
+            ERROR_CODE_INTERNAL,
+            &error.to_string(),
+            self.control_timeout,
+        )
+        .await;
+        self.abort(error).await
+    }
+}
+
+impl<S> Drop for UrmaServerSession<S> {
+    fn drop(&mut self) {
+        if let Some(lane_id) = self.lane_id.take() {
+            let _ = self.fabric.try_abort_lane(lane_id);
+        }
+    }
+}
+
+async fn write_error<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    code: u32,
+    message: &str,
+    timeout: Duration,
+) -> Result<()> {
+    write_control(
+        stream,
+        &Frame::Error(RendezvousError {
+            code,
+            message: message.to_string(),
+        }),
+        timeout,
+        "send Error",
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rendezvous::PieceKind;
+
+    fn request() -> CommonPieceRequest {
+        CommonPieceRequest {
+            kind: PieceKind::Piece,
+            task_id: "task".into(),
+            piece_number: 1,
+            chunk_size: 4,
+            max_inflight_chunks: 2,
+        }
+    }
+
+    #[test]
+    fn transfer_shape_bounds_windows_and_tail_chunk() {
+        let shape = TransferShape::negotiate(
+            &request(),
+            PieceMetadata {
+                offset: 0,
+                length: 10,
+                digest: "crc32:1".into(),
+                chunk_size: 4,
+                max_inflight_chunks: 2,
+            },
+            4,
+            2,
+        )
+        .unwrap();
+        assert_eq!(shape.chunk_count, 3);
+        assert_eq!(
+            shape.window(0).unwrap(),
+            ReceiveWindow {
+                start_chunk: 0,
+                chunk_count: 2
+            }
+        );
+        assert_eq!(shape.window_len(shape.window(0).unwrap()).unwrap(), 8);
+        assert_eq!(shape.window_len(shape.window(2).unwrap()).unwrap(), 2);
+    }
+
+    #[test]
+    fn transfer_shape_rejects_metadata_that_exceeds_negotiation() {
+        let metadata = PieceMetadata {
+            offset: 0,
+            length: 10,
+            digest: "crc32:1".into(),
+            chunk_size: 5,
+            max_inflight_chunks: 2,
+        };
+        assert!(TransferShape::negotiate(&request(), metadata, 4, 2).is_err());
+    }
+
+    #[test]
+    fn window_past_piece_end_is_rejected_without_underflow() {
+        let shape = TransferShape::negotiate(
+            &request(),
+            PieceMetadata {
+                offset: 0,
+                length: 4,
+                digest: "crc32:1".into(),
+                chunk_size: 4,
+                max_inflight_chunks: 1,
+            },
+            4,
+            1,
+        )
+        .unwrap();
+        assert!(shape
+            .window_len(ReceiveWindow {
+                start_chunk: 2,
+                chunk_count: 1,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn transfer_shape_rejects_inflight_above_local_lane_depth() {
+        let metadata = PieceMetadata {
+            offset: 0,
+            length: 8,
+            digest: "crc32:1".into(),
+            chunk_size: 4,
+            max_inflight_chunks: 2,
+        };
+        assert!(TransferShape::negotiate(&request(), metadata, 4, 1).is_err());
+    }
+
+    #[test]
+    fn peer_error_code_is_preserved_for_adapter_policy() {
+        let error = unexpected(
+            Frame::Error(RendezvousError {
+                code: crate::rendezvous::ERROR_CODE_NOT_FOUND,
+                message: "missing Piece".into(),
+            }),
+            "Piece request",
+        );
+        assert_eq!(
+            error,
+            Error::PeerRejected {
+                code: crate::rendezvous::ERROR_CODE_NOT_FOUND,
+                message: "missing Piece".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_control_read_has_a_typed_timeout() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        assert_eq!(
+            read_control(&mut reader, Duration::ZERO, "test read").await,
+            Err(Error::ControlTimeout {
+                operation: "test read"
+            })
+        );
+    }
+}

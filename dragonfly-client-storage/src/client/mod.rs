@@ -18,6 +18,8 @@ pub mod quic;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod tcp;
+#[cfg(feature = "urma")]
+pub mod urma;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;

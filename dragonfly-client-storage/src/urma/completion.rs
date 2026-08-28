@@ -5,6 +5,7 @@ use super::{
     native_error, Error, Result,
 };
 use std::{collections::HashMap, time::Instant};
+use tokio::sync::oneshot;
 
 const MAX_POLL_BATCH: usize = 16;
 
@@ -35,18 +36,13 @@ pub(crate) enum LaneCompletion {
     },
 }
 
-impl LaneCompletion {
-    pub(crate) fn lane_id(&self) -> u16 {
-        match self {
-            Self::Sent { lane_id, .. } | Self::Received { lane_id, .. } => *lane_id,
-        }
-    }
-}
+pub(crate) type OperationCompletionTx = oneshot::Sender<Result<LaneCompletion>>;
 
 struct OutstandingWr {
     user_ctx: u64,
     handle: ffi::WrHandle,
     sequence: Option<u64>,
+    completion: Option<OperationCompletionTx>,
 }
 
 /// The single completion consumer for the process-shared JFCs. A JFC must not
@@ -85,6 +81,7 @@ impl CompletionRouter {
         user_ctx: u64,
         handle: ffi::WrHandle,
         sequence: Option<u64>,
+        completion: OperationCompletionTx,
     ) -> Result<()> {
         let token = WrToken::decode(user_ctx)?;
         let slot = token.slot.index();
@@ -98,6 +95,7 @@ impl CompletionRouter {
             user_ctx,
             handle,
             sequence,
+            completion: Some(completion),
         });
         self.outstanding_total += 1;
         *self.outstanding_by_lane.entry(token.lane_id).or_default() += 1;
@@ -123,19 +121,19 @@ impl CompletionRouter {
         send_jfc: &ffi::JfcHandle,
         recv_jfc: &ffi::JfcHandle,
         pool: &mut UrmaBufferPool,
-    ) -> Result<Vec<LaneCompletion>> {
+    ) -> Result<usize> {
         self.stats.poll_calls += 1;
-        let mut completions = Vec::new();
+        let mut completed = 0;
         let mut first_error = None;
         if self.outstanding_send != 0 {
             match self.poll_jfc(send_jfc, false, pool) {
-                Ok(batch) => completions.extend(batch),
+                Ok(count) => completed += count,
                 Err(error) => first_error = Some(error),
             }
         }
         if self.outstanding_recv != 0 {
             match self.poll_jfc(recv_jfc, true, pool) {
-                Ok(batch) => completions.extend(batch),
+                Ok(count) => completed += count,
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -143,11 +141,11 @@ impl CompletionRouter {
         if let Some(error) = first_error {
             return Err(error);
         }
-        if completions.is_empty() {
+        if completed == 0 {
             self.stats.empty_polls += 1;
             std::hint::spin_loop();
         }
-        Ok(completions)
+        Ok(completed)
     }
 
     fn poll_jfc(
@@ -155,7 +153,7 @@ impl CompletionRouter {
         jfc: &ffi::JfcHandle,
         recv_queue: bool,
         pool: &mut UrmaBufferPool,
-    ) -> Result<Vec<LaneCompletion>> {
+    ) -> Result<usize> {
         let mut records = [ffi::CompletionRecord::default(); MAX_POLL_BATCH];
         let count = jfc
             .poll_into(&mut records[..self.batch])
@@ -170,7 +168,7 @@ impl CompletionRouter {
         record: ffi::CompletionRecord,
         recv_queue: bool,
         pool: &mut UrmaBufferPool,
-    ) -> Result<LaneCompletion> {
+    ) -> Result<()> {
         if !record.user_ctx_valid {
             self.stats.cqe_error += 1;
             return Err(Error::Completion {
@@ -182,60 +180,70 @@ impl CompletionRouter {
             });
         }
         let token = WrToken::decode(record.user_ctx)?;
-        let expected_recv = token.operation == OperationType::Recv;
-        if expected_recv != recv_queue || record.is_recv != recv_queue || !record.is_jetty {
-            self.stats.cqe_error += 1;
-            return Err(Error::Protocol("CQE queue/operation flags disagree".into()));
-        }
-        let outstanding = self.take_outstanding(record.user_ctx)?;
+        let mut outstanding = self.take_outstanding(record.user_ctx)?;
         outstanding.handle.complete();
+        let expected_recv = token.operation == OperationType::Recv;
+        let result =
+            if expected_recv != recv_queue || record.is_recv != recv_queue || !record.is_jetty {
+                self.stats.cqe_error += 1;
+                self.decrement_operation(token.operation);
+                pool.complete_error(token.slot, token.operation)
+                    .and_then(|()| pool.release(token.slot))
+                    .and(Err(Error::Protocol(
+                        "CQE queue/operation flags disagree".into(),
+                    )))
+            } else if record.status != 0 {
+                self.stats.cqe_error += 1;
+                self.decrement_operation(token.operation);
+                pool.complete_error(token.slot, token.operation)
+                    .and_then(|()| pool.release(token.slot))
+                    .and(Err(Error::Completion {
+                        status: record.status,
+                        opcode: record.opcode,
+                        user_ctx: record.user_ctx,
+                        sequence: outstanding.sequence,
+                        post_call: None,
+                    }))
+            } else {
+                (|| match token.operation {
+                    OperationType::Send => {
+                        self.outstanding_send -= 1;
+                        self.stats.send_cqe += 1;
+                        pool.complete_send(token.slot)?;
+                        pool.release(token.slot)?;
+                        Ok(LaneCompletion::Sent {
+                            lane_id: token.lane_id,
+                            sequence: outstanding.sequence,
+                        })
+                    }
+                    OperationType::Recv => {
+                        self.outstanding_recv -= 1;
+                        self.stats.recv_cqe += 1;
+                        if record.opcode != 0 {
+                            self.stats.cqe_error += 1;
+                            pool.complete_error(token.slot, token.operation)?;
+                            pool.release(token.slot)?;
+                            return Err(Error::Protocol(format!(
+                                "unexpected receive CQE opcode {}",
+                                record.opcode
+                            )));
+                        }
+                        let chunk = pool.complete_recv(token.slot, record.completion_len)?;
+                        pool.release(token.slot)?;
+                        Ok(LaneCompletion::Received {
+                            lane_id: token.lane_id,
+                            sequence: outstanding.sequence,
+                            chunk,
+                        })
+                    }
+                })()
+            };
 
-        if record.status != 0 {
-            self.stats.cqe_error += 1;
-            self.decrement_operation(token.operation);
-            pool.complete_error(token.slot, token.operation)?;
-            pool.release(token.slot)?;
-            return Err(Error::Completion {
-                status: record.status,
-                opcode: record.opcode,
-                user_ctx: record.user_ctx,
-                sequence: outstanding.sequence,
-                post_call: None,
-            });
+        let owner_error = result.as_ref().err().cloned();
+        if let Some(completion) = outstanding.completion.take() {
+            let _ = completion.send(result);
         }
-
-        match token.operation {
-            OperationType::Send => {
-                self.outstanding_send -= 1;
-                self.stats.send_cqe += 1;
-                pool.complete_send(token.slot)?;
-                pool.release(token.slot)?;
-                Ok(LaneCompletion::Sent {
-                    lane_id: token.lane_id,
-                    sequence: outstanding.sequence,
-                })
-            }
-            OperationType::Recv => {
-                self.outstanding_recv -= 1;
-                self.stats.recv_cqe += 1;
-                if record.opcode != 0 {
-                    self.stats.cqe_error += 1;
-                    pool.complete_error(token.slot, token.operation)?;
-                    pool.release(token.slot)?;
-                    return Err(Error::Protocol(format!(
-                        "unexpected receive CQE opcode {}",
-                        record.opcode
-                    )));
-                }
-                let chunk = pool.complete_recv(token.slot, record.completion_len)?;
-                pool.release(token.slot)?;
-                Ok(LaneCompletion::Received {
-                    lane_id: token.lane_id,
-                    sequence: outstanding.sequence,
-                    chunk,
-                })
-            }
-        }
+        owner_error.map_or(Ok(()), Err)
     }
 
     fn take_outstanding(&mut self, user_ctx: u64) -> Result<OutstandingWr> {
@@ -280,6 +288,17 @@ impl CompletionRouter {
             .unwrap_or_default()
     }
 
+    /// Wakes every logical waiter after a fatal progress failure without
+    /// releasing native WR or buffer ownership. Later CQEs still retire those
+    /// resources through the normal route path.
+    pub(crate) fn fail_pending(&mut self, error: &Error) {
+        for outstanding in self.outstanding.iter_mut().flatten() {
+            if let Some(completion) = outstanding.completion.take() {
+                let _ = completion.send(Err(error.clone()));
+            }
+        }
+    }
+
     pub(crate) fn stats(&self) -> CompletionStats {
         self.stats
     }
@@ -287,15 +306,15 @@ impl CompletionRouter {
 
 /// A provider poll consumes the complete batch. Route every record even when
 /// one record fails, otherwise later WR ownership and buffer slots are lost.
-fn drain_batch<T, U, E>(
+fn drain_batch<T, E>(
     records: impl IntoIterator<Item = T>,
-    mut route: impl FnMut(T) -> std::result::Result<U, E>,
-) -> std::result::Result<Vec<U>, E> {
-    let mut routed = Vec::new();
+    mut route: impl FnMut(T) -> std::result::Result<(), E>,
+) -> std::result::Result<usize, E> {
+    let mut routed = 0;
     let mut first_error = None;
     for record in records {
         match route(record) {
-            Ok(completion) => routed.push(completion),
+            Ok(()) => routed += 1,
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
@@ -336,7 +355,7 @@ mod tests {
             } else if record == 2 {
                 Err("later failure")
             } else {
-                Ok(record)
+                Ok(())
             }
         });
 

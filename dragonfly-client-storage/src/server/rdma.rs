@@ -18,9 +18,9 @@ use crate::client::rdma::MAX_CHUNKS;
 use crate::content::MappedPiece;
 use crate::rdma::fabric::Fabric;
 use crate::rdma::rendezvous::{
-    read_frame, write_frame, CapabilityRegistry, Frame, PieceKind, PieceReady, PieceRequest,
-    RdmaAdvertisement, RendezvousError, WireCapability, ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE,
-    ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
+    read_frame, write_frame, CapabilityRegistry, CommonPieceMetadata, Frame, PieceKind, PieceReady,
+    PieceRequest, RdmaAdvertisement, RendezvousError, WireCapability, ERROR_CODE_BUSY,
+    ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
 use crate::Storage;
 use dragonfly_client_config::dfdaemon::{Config, RdmaProvider};
@@ -544,12 +544,14 @@ impl RDMAServerHandler {
         write_frame(
             writer,
             &Frame::Ready(PieceReady {
-                offset: piece.offset,
-                length: piece.length,
-                digest: piece.digest.clone(),
+                common: CommonPieceMetadata {
+                    offset: piece.offset,
+                    length: piece.length,
+                    digest: piece.digest.clone(),
+                    chunk_size,
+                    max_inflight_chunks,
+                },
                 server_endpoint: self.fabric.local_endpoint().to_vec(),
-                chunk_size,
-                max_inflight_chunks,
             }),
         )
         .await?;
@@ -560,10 +562,11 @@ impl RDMAServerHandler {
             let window_count =
                 (chunk_count - start_chunk).min(u64::from(max_inflight_chunks)) as u32;
             match time::timeout(self.transfer_timeout, read_frame(reader)).await? {
-                Ok(Frame::RecvPosted {
-                    start_chunk: posted_start,
-                    chunk_count: posted_count,
-                }) if posted_start == start_chunk && posted_count == window_count => {}
+                Ok(Frame::RecvPosted(window))
+                    if window
+                        .validate(start_chunk, u64::from(window_count))
+                        .is_ok()
+                        && window.chunk_count == window_count => {}
                 Ok(frame) => {
                     let message =
                         format!("invalid rdma receive window at chunk {start_chunk}: {frame:?}");

@@ -16,8 +16,8 @@
 
 use crate::rdma::fabric::{Fabric, OpHandle, PooledBuf, TAG_RANGE_SIZE};
 use crate::rdma::rendezvous::{
-    read_frame, write_frame, Frame, PieceKind, PieceReady, PieceRequest, RdmaAdvertisement,
-    WireCapability, ERROR_CODE_INCOMPATIBLE,
+    read_frame, write_frame, CommonPieceRequest, Frame, PieceKind, PieceReady, PieceRequest,
+    RdmaAdvertisement, ReceiveWindow, WireCapability, ERROR_CODE_INCOMPATIBLE,
 };
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -335,14 +335,16 @@ impl RDMAClient {
         write_frame(
             &mut writer,
             &Frame::Request(PieceRequest {
-                kind,
-                task_id: task_id.to_string(),
-                piece_number: number,
+                common: CommonPieceRequest {
+                    kind,
+                    task_id: task_id.to_string(),
+                    piece_number: number,
+                    chunk_size,
+                    max_inflight_chunks,
+                },
                 capability: self.capability.clone(),
                 client_endpoint: self.fabric.local_endpoint().to_vec(),
                 tag,
-                chunk_size,
-                max_inflight_chunks,
             }),
         )
         .await?;
@@ -537,10 +539,10 @@ async fn receive_stream(
 
             write_frame(
                 &mut writer,
-                &Frame::RecvPosted {
+                &Frame::RecvPosted(ReceiveWindow {
                     start_chunk: posted_chunk,
                     chunk_count: window_count,
-                },
+                }),
             )
             .await?;
 

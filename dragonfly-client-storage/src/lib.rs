@@ -49,11 +49,13 @@ pub mod content;
 pub mod io;
 pub mod metadata;
 pub mod rdma;
+
+mod rendezvous;
 pub mod server;
 pub mod storage_engine;
 
 #[cfg(feature = "urma")]
-pub(crate) mod urma;
+pub mod urma;
 
 /// The fallback interval for re-checking the piece metadata while waiting for an
 /// in-flight piece completion notification, guarding against missed notifications

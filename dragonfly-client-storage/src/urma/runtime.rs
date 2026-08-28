@@ -1,7 +1,7 @@
 use super::{buffer::BufferPoolConfig, Error, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeConfig {
+pub struct RuntimeConfig {
     pub(crate) device_name: String,
     pub(crate) eid_index: u32,
     pub(crate) send_jfc_depth: u32,
@@ -10,7 +10,7 @@ pub(crate) struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub(crate) fn new(device_name: impl Into<String>, eid_index: u32) -> Self {
+    pub fn new(device_name: impl Into<String>, eid_index: u32) -> Self {
         Self {
             device_name: device_name.into(),
             eid_index,
@@ -19,6 +19,12 @@ impl RuntimeConfig {
             buffer_pool: BufferPoolConfig::default(),
         }
     }
+}
+
+fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> {
+    let slot_size = u64::try_from(slot_size)
+        .map_err(|_| Error::InvalidConfiguration("slot_size does not fit u64".into()))?;
+    Ok(device_max.min(slot_size))
 }
 
 /// Rust-owned capability subset copied from `urma_device_attr_t`.
@@ -42,7 +48,7 @@ mod native {
     use super::*;
     use crate::urma::{
         buffer::UrmaBufferPool,
-        completion::{deadline_after, deadline_expired, CompletionRouter, LaneCompletion},
+        completion::{deadline_after, deadline_expired, CompletionRouter, OperationCompletionTx},
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, UrmaJetty, UrmaLane},
         native_error,
@@ -104,6 +110,7 @@ mod native {
     /// Process-level owner of the complete native resource tree.
     pub(crate) struct UrmaRuntime {
         capability: UrmaDeviceCapability,
+        max_payload_size: u64,
         buffer_pool: Option<UrmaBufferPool>,
         recv_jfc: Option<UrmaJfc>,
         send_jfc: Option<UrmaJfc>,
@@ -153,6 +160,8 @@ mod native {
             if let Err(primary) = validate_config(&config, &capability) {
                 return Err(rollback_startup(primary, None, None, None, Some(native)));
             }
+            let max_payload_size =
+                effective_max_message_size(capability.max_msg_size, config.buffer_pool.slot_size)?;
 
             let send_jfc = match UrmaJfc::create(&mut native, JfcKind::Send, config.send_jfc_depth)
             {
@@ -192,6 +201,7 @@ mod native {
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
             Ok(Self {
                 capability,
+                max_payload_size,
                 buffer_pool: Some(buffer_pool),
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
@@ -251,25 +261,11 @@ mod native {
             lane.mark_ready()
         }
 
-        pub(crate) fn post_receive(&mut self, lane_id: u16, sequence: Option<u64>) -> Result<()> {
-            let (lanes, pool, completions) = (
-                &mut self.lanes,
-                self.buffer_pool
-                    .as_mut()
-                    .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?,
-                &mut self.completions,
-            );
-            lanes
-                .get_mut(&lane_id)
-                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .post_receive(pool, completions, sequence)
-        }
-
-        pub(crate) fn send(
+        pub(crate) fn post_receive(
             &mut self,
             lane_id: u16,
-            bytes: &[u8],
             sequence: Option<u64>,
+            completion: OperationCompletionTx,
         ) -> Result<()> {
             let (lanes, pool, completions) = (
                 &mut self.lanes,
@@ -281,10 +277,34 @@ mod native {
             lanes
                 .get_mut(&lane_id)
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .send(pool, completions, bytes, sequence)
+                .post_receive(pool, completions, sequence, completion)
         }
 
-        pub(crate) fn poll_once(&mut self) -> Result<Vec<LaneCompletion>> {
+        pub(crate) fn grant_send_credit(&mut self, lane_id: u16, count: u32) -> Result<()> {
+            self.lane_mut(lane_id)?.grant_send_credit(count)
+        }
+
+        pub(crate) fn send(
+            &mut self,
+            lane_id: u16,
+            bytes: &[u8],
+            sequence: Option<u64>,
+            completion: OperationCompletionTx,
+        ) -> Result<()> {
+            let (lanes, pool, completions) = (
+                &mut self.lanes,
+                self.buffer_pool
+                    .as_mut()
+                    .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?,
+                &mut self.completions,
+            );
+            lanes
+                .get_mut(&lane_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
+                .send(pool, completions, bytes, sequence, completion)
+        }
+
+        pub(crate) fn poll_once(&mut self) -> Result<usize> {
             let send_jfc = self
                 .send_jfc
                 .as_ref()
@@ -297,19 +317,29 @@ mod native {
                 .buffer_pool
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?;
-            let completions =
-                self.completions
-                    .poll_once(send_jfc.handle(), recv_jfc.handle(), pool)?;
-            for completion in &completions {
-                if let Some(lane) = self.lanes.get_mut(&completion.lane_id()) {
-                    lane.observe_completion(completion);
-                }
+            let progress = self
+                .completions
+                .poll_once(send_jfc.handle(), recv_jfc.handle(), pool);
+            if let Err(error) = &progress {
+                self.completions.fail_pending(error);
             }
-            Ok(completions)
+            let reap = self.reap_drained_lanes();
+            match (progress, reap) {
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                (Ok(count), Ok(())) => Ok(count),
+            }
         }
 
         pub(crate) fn outstanding(&self) -> usize {
             self.completions.outstanding()
+        }
+
+        pub(crate) fn transport_type(&self) -> u32 {
+            u32::try_from(self.capability.transport_type).unwrap_or(0)
+        }
+
+        pub(crate) fn max_message_size(&self) -> u64 {
+            self.max_payload_size
         }
 
         pub(crate) fn close_lane(&mut self, lane_id: u16) -> Result<()> {
@@ -317,6 +347,29 @@ mod native {
             let lane = self.lane_mut(lane_id)?;
             lane.close(outstanding)?;
             self.lanes.remove(&lane_id);
+            Ok(())
+        }
+
+        pub(crate) fn abort_lane(&mut self, lane_id: u16) -> Result<()> {
+            self.lane_mut(lane_id)?.begin_draining()?;
+            if self.completions.outstanding_for_lane(lane_id) == 0 {
+                self.close_lane(lane_id)?;
+            }
+            Ok(())
+        }
+
+        fn reap_drained_lanes(&mut self) -> Result<()> {
+            let drained = self
+                .lanes
+                .iter()
+                .filter_map(|(&lane_id, lane)| {
+                    (lane.is_draining() && self.completions.outstanding_for_lane(lane_id) == 0)
+                        .then_some(lane_id)
+                })
+                .collect::<Vec<_>>();
+            for lane_id in drained {
+                self.close_lane(lane_id)?;
+            }
             Ok(())
         }
 
@@ -538,5 +591,13 @@ mod tests {
         assert_eq!(config.send_jfc_depth, 4096);
         assert_eq!(config.recv_jfc_depth, 4096);
         assert_eq!(config.buffer_pool, BufferPoolConfig::default());
+    }
+
+    #[test]
+    fn advertised_message_size_is_capped_by_registered_slot() {
+        assert_eq!(
+            effective_max_message_size(4 * 1024 * 1024, 64 * 1024).unwrap(),
+            64 * 1024
+        );
     }
 }
