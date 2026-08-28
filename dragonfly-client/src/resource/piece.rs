@@ -81,6 +81,11 @@ pub struct Piece {
     #[cfg(feature = "rdma")]
     rdma_downloader: Option<Arc<piece_downloader::rdma::RDMADownloader>>,
 
+    /// URMA stays behind the transport-neutral Downloader contract. Piece orchestration must not
+    /// depend on Fabric, lane, registered slot, or completion types.
+    #[cfg(feature = "urma")]
+    urma_downloader: Option<Arc<dyn piece_downloader::Downloader>>,
+
     /// The backend factory.
     backend_factory: Arc<BackendFactory>,
 
@@ -117,6 +122,16 @@ impl Piece {
         if config.download.protocol == "rdma" {
             warn!("download protocol is rdma but this build lacks the rdma feature, using tcp");
         }
+        #[cfg(feature = "urma")]
+        let urma_downloader = if config.download.protocol == "urma" {
+            Some(piece_downloader::DownloaderFactory::new("urma", config.clone())?.build())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "urma"))]
+        if config.download.protocol == "urma" {
+            warn!("download protocol is urma but this build lacks the urma feature, using tcp");
+        }
 
         Ok(Self {
             config: config.clone(),
@@ -126,6 +141,8 @@ impl Piece {
             quic_downloader: piece_downloader::DownloaderFactory::new("quic", config)?.build(),
             #[cfg(feature = "rdma")]
             rdma_downloader,
+            #[cfg(feature = "urma")]
+            urma_downloader,
             backend_factory,
             download_bandwidth_limiter,
             prefetch_bandwidth_limiter,
@@ -442,6 +459,21 @@ impl Piece {
             }
         }
 
+        let urma_tcp_addr = if self.config.download.protocol == "urma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "urma")]
+        let mut streamed_urma = false;
+        #[cfg(not(feature = "urma"))]
+        let streamed_urma = false;
+
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -468,7 +500,37 @@ impl Piece {
                     )
                     .await?
             }
+            #[cfg(feature = "urma")]
+            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+                let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
+                let urma_downloader = self.urma_downloader.as_ref().unwrap();
+                match urma_downloader
+                    .download_piece(&addr, number, host_id, task_id)
+                    .await
+                {
+                    Ok(downloaded) => {
+                        streamed_urma = true;
+                        downloaded
+                    }
+                    Err(err) => {
+                        warn!("urma download failed, fall back to tcp downloader: {err}");
+                        self.tcp_downloader
+                            .download_piece(&addr, number, host_id, task_id)
+                            .await?
+                    }
+                }
+            }
             ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
+                    .download_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
+            ("urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
@@ -500,7 +562,7 @@ impl Piece {
         };
 
         // Record the finish of downloading piece.
-        let piece = self
+        let finished = self
             .storage
             .download_piece_from_parent_finished(
                 piece_id,
@@ -512,10 +574,37 @@ impl Piece {
                 &mut stream,
                 self.config.storage.write_piece_timeout,
             )
-            .await
-            .inspect_err(|err| {
-                error!("download piece finished: {}", err);
-            })?;
+            .await;
+        let piece = match finished {
+            Ok(piece) => piece,
+            Err(err) => {
+                let Some(addr) = urma_tcp_addr.filter(|_| streamed_urma) else {
+                    error!("download piece finished: {err}");
+                    return Err(err);
+                };
+                warn!("streaming urma piece failed while writing, restarting over tcp: {err}");
+                self.storage.download_piece_failed(piece_id)?;
+                self.storage
+                    .download_piece_started(piece_id, number)
+                    .await?;
+                let (mut stream, offset, digest) = self
+                    .tcp_downloader
+                    .download_piece(&addr, number, host_id, task_id)
+                    .await?;
+                self.storage
+                    .download_piece_from_parent_finished(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent.id.as_str(),
+                        &mut stream,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await?
+            }
+        };
 
         collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
 
@@ -854,11 +943,24 @@ impl Piece {
         } else {
             None
         };
-        // Only an rdma build can stream a piece, so only it can need the TCP restart below.
+        let urma_tcp_addr = if self.config.download.protocol == "urma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "rdma")]
         let mut streamed_rdma = false;
         #[cfg(not(feature = "rdma"))]
         let streamed_rdma = false;
+        #[cfg(feature = "urma")]
+        let mut streamed_urma = false;
+        #[cfg(not(feature = "urma"))]
+        let streamed_urma = false;
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -919,7 +1021,37 @@ impl Piece {
                     }
                 }
             }
+            #[cfg(feature = "urma")]
+            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+                let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
+                let urma_downloader = self.urma_downloader.as_ref().unwrap();
+                match urma_downloader
+                    .download_persistent_piece(&addr, number, host_id, task_id)
+                    .await
+                {
+                    Ok(downloaded) => {
+                        streamed_urma = true;
+                        downloaded
+                    }
+                    Err(err) => {
+                        warn!("urma download failed, fall back to tcp downloader: {err}");
+                        self.tcp_downloader
+                            .download_persistent_piece(&addr, number, host_id, task_id)
+                            .await?
+                    }
+                }
+            }
             ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
+                    .download_persistent_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
+            ("urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_persistent_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
@@ -971,13 +1103,16 @@ impl Piece {
                 Ok(piece)
             }
             Err(err) => {
-                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
+                let Some(addr) = rdma_tcp_addr
+                    .filter(|_| streamed_rdma)
+                    .or_else(|| urma_tcp_addr.filter(|_| streamed_urma))
+                else {
                     error!("download persistent piece finished: {}", err);
                     return Err(err);
                 };
                 warn!(
-                    "streaming rdma persistent piece failed while writing, restarting over tcp: {}",
-                    err
+                    "streaming {} persistent piece failed while writing, restarting over tcp: {}",
+                    self.config.download.protocol, err,
                 );
                 self.storage.download_persistent_piece_failed(piece_id)?;
                 self.storage
@@ -1284,11 +1419,24 @@ impl Piece {
         } else {
             None
         };
-        // Only an rdma build can stream a piece, so only it can need the TCP restart below.
+        let urma_tcp_addr = if self.config.download.protocol == "urma" {
+            match (parent.download_ip.as_deref(), parent.download_tcp_port) {
+                (Some(ip), Some(port)) => {
+                    Some(format_socket_addr(IpAddr::from_str(ip)?, port as u16))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "rdma")]
         let mut streamed_rdma = false;
         #[cfg(not(feature = "rdma"))]
         let streamed_rdma = false;
+        #[cfg(feature = "urma")]
+        let mut streamed_urma = false;
+        #[cfg(not(feature = "urma"))]
+        let streamed_urma = false;
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
@@ -1349,7 +1497,37 @@ impl Piece {
                     }
                 }
             }
+            #[cfg(feature = "urma")]
+            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+                let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
+                let urma_downloader = self.urma_downloader.as_ref().unwrap();
+                match urma_downloader
+                    .download_persistent_cache_piece(&addr, number, host_id, task_id)
+                    .await
+                {
+                    Ok(downloaded) => {
+                        streamed_urma = true;
+                        downloaded
+                    }
+                    Err(err) => {
+                        warn!("urma download failed, fall back to tcp downloader: {err}");
+                        self.tcp_downloader
+                            .download_persistent_cache_piece(&addr, number, host_id, task_id)
+                            .await?
+                    }
+                }
+            }
             ("rdma", Some(ip), Some(port), _) => {
+                self.tcp_downloader
+                    .download_persistent_cache_piece(
+                        &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
+                        number,
+                        host_id,
+                        task_id,
+                    )
+                    .await?
+            }
+            ("urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_persistent_cache_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
@@ -1401,13 +1579,17 @@ impl Piece {
                 Ok(piece)
             }
             Err(err) => {
-                let Some(addr) = rdma_tcp_addr.filter(|_| streamed_rdma) else {
+                let Some(addr) = rdma_tcp_addr
+                    .filter(|_| streamed_rdma)
+                    .or_else(|| urma_tcp_addr.filter(|_| streamed_urma))
+                else {
                     error!("download persistent cache piece finished: {}", err);
                     return Err(err);
                 };
                 warn!(
-                    "streaming rdma persistent cache piece failed while writing, restarting over tcp: {}",
-                    err
+                    "streaming {} persistent cache piece failed while writing, restarting over tcp: {}",
+                    self.config.download.protocol,
+                    err,
                 );
                 self.storage
                     .download_persistent_cache_piece_failed(piece_id)?;
@@ -1441,7 +1623,286 @@ impl Piece {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "urma")]
+    use futures::StreamExt as _;
+    #[cfg(feature = "urma")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    #[cfg(feature = "urma")]
+    #[derive(Clone, Copy)]
+    enum InjectedFailure {
+        BeforeStream,
+        Stream,
+        Digest,
+        StorageTimeout,
+    }
+
+    #[cfg(feature = "urma")]
+    #[derive(Clone, Copy)]
+    enum TestPieceKind {
+        Normal,
+        Persistent,
+        PersistentCache,
+    }
+
+    #[cfg(feature = "urma")]
+    struct FakeDownloader {
+        failure: Option<InjectedFailure>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "urma")]
+    impl FakeDownloader {
+        fn response(
+            &self,
+        ) -> Result<(
+            dragonfly_client_storage::client::PieceContentStream,
+            u64,
+            String,
+        )> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (stream, digest): (_, &str) = match self.failure {
+                Some(InjectedFailure::BeforeStream) => return Err(Error::InvalidParameter),
+                Some(InjectedFailure::Stream) => (
+                    Box::pin(futures::stream::iter(vec![
+                        Ok(bytes::Bytes::from_static(b"bad-")),
+                        Err(std::io::Error::other("injected stream failure")),
+                    ])) as dragonfly_client_storage::client::PieceContentStream,
+                    "",
+                ),
+                Some(InjectedFailure::Digest) => (
+                    Box::pin(futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+                        b"bad-content!",
+                    ))])),
+                    "crc32:00000000",
+                ),
+                Some(InjectedFailure::StorageTimeout) => (
+                    Box::pin(
+                        futures::stream::iter(vec![Ok(bytes::Bytes::from_static(b"bad-"))])
+                            .chain(futures::stream::pending()),
+                    ),
+                    "",
+                ),
+                None => (
+                    Box::pin(futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+                        b"good-content",
+                    ))])),
+                    "",
+                ),
+            };
+            Ok((stream, 0, digest.to_string()))
+        }
+    }
+
+    #[cfg(feature = "urma")]
+    #[async_trait::async_trait]
+    impl piece_downloader::Downloader for FakeDownloader {
+        async fn download_piece(
+            &self,
+            _addr: &str,
+            _number: u32,
+            _host_id: &str,
+            _task_id: &str,
+        ) -> Result<(
+            dragonfly_client_storage::client::PieceContentStream,
+            u64,
+            String,
+        )> {
+            self.response()
+        }
+
+        async fn download_persistent_piece(
+            &self,
+            _addr: &str,
+            _number: u32,
+            _host_id: &str,
+            _task_id: &str,
+        ) -> Result<(
+            dragonfly_client_storage::client::PieceContentStream,
+            u64,
+            String,
+        )> {
+            self.response()
+        }
+
+        async fn download_persistent_cache_piece(
+            &self,
+            _addr: &str,
+            _number: u32,
+            _host_id: &str,
+            _task_id: &str,
+        ) -> Result<(
+            dragonfly_client_storage::client::PieceContentStream,
+            u64,
+            String,
+        )> {
+            self.response()
+        }
+    }
+
+    #[cfg(feature = "urma")]
+    async fn new_urma_fallback_piece(
+        storage_dir: &std::path::Path,
+        failure: InjectedFailure,
+    ) -> (Piece, Arc<Storage>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let mut config = Config::default();
+        config.download.protocol = "urma".to_string();
+        config.storage.write_piece_timeout = std::time::Duration::from_millis(100);
+        let config = Arc::new(config);
+        let storage = Arc::new(
+            Storage::new(config.clone(), storage_dir, storage_dir.to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let backend_factory = Arc::new(BackendFactory::new(config.clone(), None).unwrap());
+        let mut piece = Piece::new(
+            config,
+            storage.clone(),
+            backend_factory,
+            Arc::new(RateLimiter::builder().build()),
+            Arc::new(RateLimiter::builder().build()),
+            Arc::new(RateLimiter::builder().build()),
+        )
+        .unwrap();
+
+        let urma_calls = Arc::new(AtomicUsize::new(0));
+        let tcp_calls = Arc::new(AtomicUsize::new(0));
+        piece.urma_downloader = Some(Arc::new(FakeDownloader {
+            failure: Some(failure),
+            calls: urma_calls.clone(),
+        }));
+        piece.tcp_downloader = Arc::new(FakeDownloader {
+            failure: None,
+            calls: tcp_calls.clone(),
+        });
+
+        (piece, storage, urma_calls, tcp_calls)
+    }
+
+    #[cfg(feature = "urma")]
+    fn parent() -> piece_collector::CollectedParent {
+        piece_collector::CollectedParent {
+            id: "parent".to_string(),
+            download_ip: Some("127.0.0.1".to_string()),
+            download_tcp_port: Some(65000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "urma")]
+    async fn assert_urma_fallback(kind: TestPieceKind, failure: InjectedFailure) {
+        const TASK_ID: &str = "a1add1f66b0d0b8083f14479d6e181ec9e2b34cf07d4a1a2ee2fcf51d3a3f14a";
+        const CONTENT: &[u8] = b"good-content";
+        let dir = tempdir().unwrap();
+        let (piece, storage, urma_calls, tcp_calls) =
+            new_urma_fallback_piece(dir.path(), failure).await;
+
+        let actual = match kind {
+            TestPieceKind::Normal => {
+                storage
+                    .download_task_started(
+                        TASK_ID,
+                        CONTENT.len() as u64,
+                        CONTENT.len() as u64,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let piece_id = piece.id(TASK_ID, 0);
+                let downloaded = piece
+                    .download_from_parent(
+                        &piece_id,
+                        "host",
+                        TASK_ID,
+                        0,
+                        CONTENT.len() as u64,
+                        parent(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert!(downloaded.is_finished());
+                let mut reader = storage
+                    .upload_piece(&piece_id, TASK_ID, None)
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.unwrap();
+                actual
+            }
+            TestPieceKind::Persistent => {
+                storage
+                    .download_persistent_task_started(
+                        TASK_ID,
+                        std::time::Duration::from_secs(60),
+                        true,
+                        CONTENT.len() as u64,
+                        CONTENT.len() as u64,
+                        Utc::now().naive_utc(),
+                    )
+                    .await
+                    .unwrap();
+                let piece_id = piece.persistent_id(TASK_ID, 0);
+                let downloaded = piece
+                    .download_persistent_from_parent(
+                        &piece_id,
+                        "host",
+                        TASK_ID,
+                        0,
+                        CONTENT.len() as u64,
+                        parent(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(downloaded.is_finished());
+                let mut reader = storage
+                    .upload_persistent_piece(&piece_id, TASK_ID, None)
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.unwrap();
+                actual
+            }
+            TestPieceKind::PersistentCache => {
+                storage
+                    .download_persistent_cache_task_started(
+                        TASK_ID,
+                        std::time::Duration::from_secs(60),
+                        true,
+                        CONTENT.len() as u64,
+                        CONTENT.len() as u64,
+                        Utc::now().naive_utc(),
+                    )
+                    .await
+                    .unwrap();
+                let piece_id = piece.persistent_cache_id(TASK_ID, 0);
+                let downloaded = piece
+                    .download_persistent_cache_from_parent(
+                        &piece_id,
+                        "host",
+                        TASK_ID,
+                        0,
+                        CONTENT.len() as u64,
+                        parent(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(downloaded.is_finished());
+                let mut reader = storage
+                    .upload_persistent_cache_piece(&piece_id, TASK_ID, None)
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.unwrap();
+                actual
+            }
+        };
+
+        assert_eq!(urma_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tcp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(actual, CONTENT);
+    }
 
     #[tokio::test]
     async fn test_calculate_interested() {
@@ -1540,6 +2001,21 @@ mod tests {
             let last_piece = pieces.last().unwrap();
             assert_eq!(last_piece.offset, expected_last_piece_offset);
             assert_eq!(last_piece.length, expected_last_piece_length);
+        }
+    }
+
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn test_urma_fallback_matrix() {
+        for (kind, failure) in [
+            (TestPieceKind::Normal, InjectedFailure::BeforeStream),
+            (TestPieceKind::Normal, InjectedFailure::Stream),
+            (TestPieceKind::Normal, InjectedFailure::Digest),
+            (TestPieceKind::Normal, InjectedFailure::StorageTimeout),
+            (TestPieceKind::Persistent, InjectedFailure::Stream),
+            (TestPieceKind::PersistentCache, InjectedFailure::Stream),
+        ] {
+            assert_urma_fallback(kind, failure).await;
         }
     }
 }
