@@ -569,14 +569,28 @@ impl UrmaServerHandler {
                 max_inflight_chunks,
                 first_window_len,
             )?;
+            let next_window_chunks = next_lengths.len();
             match time::timeout(
                 self.transfer_timeout,
                 self.fabric.acquire_tx_window_chunks(next_lengths),
             )
             .await
             {
-                Ok(Ok(lease)) => Some(lease),
-                Ok(Err(UrmaError::BufferUnavailable { .. })) | Err(_) => None,
+                Ok(Ok(lease)) => {
+                    debug!(
+                        tx_ring_depth = 2,
+                        window_chunks = next_window_chunks,
+                        "URMA TX double ring enabled"
+                    );
+                    Some(lease)
+                }
+                Ok(Err(UrmaError::BufferUnavailable { .. })) | Err(_) => {
+                    debug!(
+                        tx_ring_depth = 1,
+                        "URMA TX second lease unavailable; falling back to single ring"
+                    );
+                    None
+                }
                 Ok(Err(error)) => {
                     let _ = session
                         .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
