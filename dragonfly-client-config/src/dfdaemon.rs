@@ -1283,6 +1283,12 @@ pub struct UrmaServer {
         with = "humantime_serde"
     )]
     pub transfer_timeout: Duration,
+
+    /// Prefer a finished content-file mmap as the source used to fill
+    /// registered URMA TX windows. Cache-resident pieces and mapping failures
+    /// transparently fall back to the existing upload reader.
+    #[serde(default)]
+    pub mmap_content: bool,
 }
 
 /// URMA_MIN_TRANSFER_TIMEOUT is the shortest URMA operation timeout that is not self-defeating.
@@ -1319,6 +1325,7 @@ impl Default for UrmaServer {
             max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
+            mmap_content: false,
         }
     }
 }
@@ -2599,6 +2606,7 @@ key: /etc/ssl/private/client.pem
         assert_eq!(urma.max_inflight_chunks, 512);
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
+        assert!(!urma.mmap_content);
     }
 
     #[test]

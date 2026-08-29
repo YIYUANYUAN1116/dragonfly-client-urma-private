@@ -55,8 +55,8 @@ mod native {
     use crate::urma::{
         buffer::UrmaBufferPool,
         completion::{
-            deadline_after, deadline_expired, CompletionRouter, OperationCompletionTx,
-            RegisteredRxCompletionTx,
+            deadline_after, deadline_expired, CompletionRouter, RegisteredRxCompletionTx,
+            RegisteredTxCompletionTx,
         },
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, UrmaJetty, UrmaLane},
@@ -302,12 +302,12 @@ mod native {
             self.lane_mut(lane_id)?.grant_send_credit(count)
         }
 
-        pub(crate) fn send(
+        pub(crate) fn send_registered_window(
             &mut self,
             lane_id: u16,
-            bytes: &[u8],
-            sequence: Option<u64>,
-            completion: OperationCompletionTx,
+            lease: TxWindowLease,
+            sequences: Vec<u64>,
+            completion: RegisteredTxCompletionTx,
         ) -> Result<()> {
             let (lanes, pool, completions) = (
                 &mut self.lanes,
@@ -319,7 +319,7 @@ mod native {
             lanes
                 .get_mut(&lane_id)
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .send(pool, completions, bytes, sequence, completion)
+                .send_registered_window(pool, completions, lease, sequences, completion)
         }
 
         pub(crate) fn poll_once(&mut self) -> Result<usize> {
@@ -364,6 +364,16 @@ mod native {
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
                 .acquire_tx_window(length)
+        }
+
+        pub(crate) fn acquire_tx_window_chunks(
+            &mut self,
+            chunk_lengths: &[usize],
+        ) -> Result<TxWindowLease> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .acquire_tx_window_chunks(chunk_lengths)
         }
 
         pub(crate) fn recycle_tx_window(&mut self, lease: TxWindowLease) -> Result<usize> {

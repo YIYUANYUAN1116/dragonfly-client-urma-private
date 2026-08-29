@@ -16,7 +16,7 @@ pub mod rendezvous;
 pub(crate) mod runtime;
 pub(crate) mod session;
 
-pub(crate) use buffer::RegisteredRxWindowLease;
+pub(crate) use buffer::{RegisteredRxWindowLease, TxWindowLease};
 pub(crate) use error::native_error;
 pub use error::{Error, Result};
 

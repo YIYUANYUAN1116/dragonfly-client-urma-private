@@ -258,19 +258,6 @@ impl SegmentHandle {
         }
     }
 
-    pub(crate) fn write(&self, offset: u64, data: &[u8]) -> Result<(), FfiError> {
-        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
-        let length = u32::try_from(data.len())
-            .map_err(|_| FfiError::Contract("write length exceeds u32"))?;
-        if length == 0 {
-            return Err(FfiError::Contract("zero-length Segment write"));
-        }
-        // SAFETY: data remains valid for the synchronous copy into the Segment.
-        status_result(unsafe {
-            sys::dfurma_segment_write(raw.as_ptr(), offset, data.as_ptr(), length)
-        })
-    }
-
     /// Returns the ordinary CPU-visible allocation registered by the shim.
     /// The pointer remains valid until this Segment is successfully closed.
     pub(crate) fn data(&self) -> Result<(NonNull<u8>, usize), FfiError> {

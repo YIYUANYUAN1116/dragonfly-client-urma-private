@@ -5,10 +5,8 @@
 //! stay in the future `client::urma` / `server::urma` adapters.
 
 use super::{
-    buffer::RegisteredRxWindowLease,
-    fabric::{
-        FabricCompletion, UrmaFabricHandle, UrmaLaneConfig, UrmaOpHandle, UrmaRegisteredRxOpHandle,
-    },
+    buffer::{RegisteredRxWindowLease, TxWindowLease},
+    fabric::{UrmaFabricHandle, UrmaLaneConfig, UrmaRegisteredRxOpHandle},
     rendezvous::{
         read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
         PieceMetadata, ReceiveWindow, RendezvousError, UrmaCapability,
@@ -636,19 +634,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         Ok(())
     }
 
-    pub(crate) fn next_window_len(&self) -> Result<usize> {
-        let piece = self
-            .piece
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
-        let shape = piece
-            .shape
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
-        shape.window_len(shape.window(piece.next_chunk)?)
-    }
-
-    pub(crate) async fn send_next_window(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
+    /// Sends one already-filled registered window without copying payload
+    /// bytes through an owned Vec or back into TX slots.
+    pub(crate) async fn send_next_registered_window(
+        &mut self,
+        lease: TxWindowLease,
+        timeout: Duration,
+    ) -> Result<TxWindowLease> {
         let lane_id = self.open_lane()?;
         let piece = self
             .piece
@@ -678,11 +670,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
                 .await;
         }
         let expected_len = shape.window_len(window)?;
-        if bytes.len() != expected_len {
+        if lease.len() != expected_len || lease.chunk_count() != window.chunk_count as usize {
             return self
                 .abort_peer(Error::Protocol(format!(
-                    "URMA send window length mismatch: expected {expected_len}, got {}",
-                    bytes.len()
+                    "URMA registered TX window mismatch: expected {expected_len} bytes/{} chunks, got {} bytes/{} chunks",
+                    window.chunk_count,
+                    lease.len(),
+                    lease.chunk_count()
                 )))
                 .await;
         }
@@ -693,49 +687,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         {
             return self.abort_peer(error).await;
         }
-
-        let mut operations: Vec<UrmaOpHandle> = Vec::with_capacity(window.chunk_count as usize);
-        let mut offset = 0usize;
-        for chunk in window.start_chunk..window.start_chunk + u64::from(window.chunk_count) {
-            let length = self
-                .piece
-                .as_ref()
-                .and_then(|piece| piece.shape.as_ref())
-                .expect("ready Piece")
-                .chunk_len(chunk)?;
-            match self
-                .fabric
-                .send(
-                    lane_id,
-                    bytes[offset..offset + length].to_vec(),
-                    Some(chunk),
-                )
-                .await
-            {
-                Ok(operation) => operations.push(operation),
-                Err(error) => return self.abort_peer(error).await,
-            }
-            offset += length;
-        }
-        for (index, operation) in operations.into_iter().enumerate() {
-            let chunk = window.start_chunk + index as u64;
-            match operation.wait_timeout(timeout).await {
-                Ok(FabricCompletion::Sent {
-                    lane_id: completed_lane,
-                    sequence: Some(completed_chunk),
-                }) if completed_lane == lane_id && completed_chunk == chunk => {}
-                Ok(completion) => {
-                    return self
-                        .abort_peer(Error::Protocol(format!(
-                            "invalid URMA send completion for chunk {chunk}: {completion:?}"
-                        )))
-                        .await;
-                }
-                Err(error) => return self.abort_peer(error).await,
-            }
+        let sequences = (window.start_chunk..window.start_chunk + u64::from(window.chunk_count))
+            .collect::<Vec<_>>();
+        let operation = match self
+            .fabric
+            .send_registered_window(lane_id, lease, sequences.clone())
+            .await
+        {
+            Ok(operation) => operation,
+            Err(error) => return self.abort_peer(error).await,
+        };
+        let completed = match operation.wait_timeout(timeout).await {
+            Ok(completed) => completed,
+            Err(error) => return self.abort_peer(error).await,
+        };
+        if completed.lane_id != lane_id || completed.sequences != sequences {
+            return self
+                .abort_peer(Error::Protocol(
+                    "invalid URMA registered TX window completion".into(),
+                ))
+                .await;
         }
         self.piece.as_mut().expect("active Piece").next_chunk += u64::from(window.chunk_count);
-        Ok(())
+        Ok(completed.lease)
     }
 
     pub(crate) async fn finish_piece(&mut self) -> Result<()> {

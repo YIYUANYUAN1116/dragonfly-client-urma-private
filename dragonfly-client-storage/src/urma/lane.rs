@@ -1,6 +1,9 @@
 use super::{
-    buffer::{SlotId, SlotKind, UrmaBufferPool},
-    completion::{CompletionRouter, OperationCompletionTx, RegisteredRxCompletionTx},
+    buffer::{SlotId, SlotKind, TxWindowLease, UrmaBufferPool},
+    completion::{
+        CompletionRouter, RegisteredRxCompletionTx, RegisteredTxCompletionTx,
+        RegisteredTxWindowState,
+    },
     ffi, native_error,
     runtime::UrmaDeviceCapability,
     Error, Result,
@@ -87,11 +90,12 @@ impl LaneCredits {
         Ok(())
     }
 
-    fn require_remote_receive(&self) -> Result<()> {
-        if self.remote_receives_available == 0 {
-            return Err(Error::Protocol(
-                "SEND is forbidden until the peer grants RecvPosted credit".into(),
-            ));
+    fn require_remote_receives(&self, count: usize) -> Result<()> {
+        if self.remote_receives_available < count {
+            return Err(Error::Protocol(format!(
+                "SEND window requires {count} receive credits, only {} available",
+                self.remote_receives_available
+            )));
         }
         Ok(())
     }
@@ -493,47 +497,50 @@ impl UrmaLane {
         Ok(())
     }
 
-    pub(crate) fn send(
+    pub(crate) fn send_registered_window(
         &mut self,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
-        bytes: &[u8],
-        sequence: Option<u64>,
-        completion: OperationCompletionTx,
+        lease: TxWindowLease,
+        sequences: Vec<u64>,
+        completion: RegisteredTxCompletionTx,
     ) -> Result<()> {
         self.require(LaneState::Ready)?;
-        self.credits.require_remote_receive()?;
-        let slot = pool
-            .allocate(SlotKind::Tx)
-            .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
-        let (offset, length) = match pool.write_tx(slot, bytes) {
-            Ok(layout) => layout,
-            Err(error) => {
-                pool.release(slot)?;
+        if sequences.len() != lease.chunk_count() || sequences.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "registered TX window requires one sequence per chunk".into(),
+            ));
+        }
+        self.credits.require_remote_receives(sequences.len())?;
+        let layouts = pool.tx_lease_layouts(&lease)?;
+        let state = RegisteredTxWindowState::new(self.id, sequences.clone(), lease, completion);
+
+        for ((slot, offset, length), sequence) in layouts.into_iter().zip(sequences) {
+            let posted = (|| {
+                let user_ctx = self.token(OperationType::Send, slot).encode()?;
+                pool.mark_tx_lease_posted(slot)?;
+                let wr =
+                    match self
+                        .jetty
+                        .post_send(pool.segment_handle()?, offset, length, user_ctx)
+                    {
+                        Ok(wr) => wr,
+                        Err(error) => {
+                            pool.rollback_tx_lease_post(slot)?;
+                            return Err(error);
+                        }
+                    };
+                completions.track_registered_tx(user_ctx, wr, sequence, state.clone())?;
+                self.credits.consume_remote_receive();
+                Ok(())
+            })();
+            if let Err(error) = posted {
+                state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
-        };
-        let user_ctx = match self.token(OperationType::Send, slot).encode() {
-            Ok(user_ctx) => user_ctx,
-            Err(error) => {
-                pool.release(slot)?;
-                return Err(error);
-            }
-        };
-        pool.mark_posted(slot, SlotKind::Tx)?;
-        let wr = match self
-            .jetty
-            .post_send(pool.segment_handle()?, offset, length, user_ctx)
-        {
-            Ok(wr) => wr,
-            Err(error) => {
-                pool.rollback_post(slot, SlotKind::Tx)?;
-                pool.release(slot)?;
-                return Err(error);
-            }
-        };
-        self.credits.consume_remote_receive();
-        completions.track(user_ctx, wr, sequence, completion)
+        }
+        state.finish_posting(None);
+        Ok(())
     }
 
     pub(crate) fn begin_draining(&mut self) -> Result<()> {
@@ -641,12 +648,12 @@ mod tests {
     #[test]
     fn send_requires_remote_recv_posted_credit() {
         let mut credits = LaneCredits::default();
-        assert!(credits.require_remote_receive().is_err());
+        assert!(credits.require_remote_receives(1).is_err());
         assert!(credits.grant_remote_receives(0).is_err());
 
         credits.grant_remote_receives(1).unwrap();
-        assert!(credits.require_remote_receive().is_ok());
+        assert!(credits.require_remote_receives(1).is_ok());
         credits.consume_remote_receive();
-        assert!(credits.require_remote_receive().is_err());
+        assert!(credits.require_remote_receives(1).is_err());
     }
 }

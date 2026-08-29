@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use crate::content::MappedPiece;
 use crate::rendezvous::{
     PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
@@ -25,6 +26,7 @@ use crate::urma::rendezvous::{
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::UrmaServerSession;
 use crate::urma::Error as UrmaError;
+use crate::urma::TxWindowLease;
 use crate::Storage;
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -61,6 +63,62 @@ fn negotiate_transfer(
         return Err(ClientError::InvalidParameter);
     }
     Ok((chunk_size, max_inflight_chunks))
+}
+
+fn tx_window_chunk_lengths(
+    piece_length: u64,
+    chunk_size: u64,
+    max_inflight_chunks: u32,
+    piece_offset: u64,
+) -> ClientResult<Vec<usize>> {
+    if piece_offset >= piece_length {
+        return Err(ClientError::InvalidParameter);
+    }
+    let remaining = piece_length - piece_offset;
+    let count = remaining
+        .div_ceil(chunk_size)
+        .min(u64::from(max_inflight_chunks));
+    (0..count)
+        .map(|index| {
+            usize::try_from(chunk_size.min(remaining - index * chunk_size))
+                .map_err(|_| ClientError::InvalidParameter)
+        })
+        .collect()
+}
+
+enum PieceSource {
+    Mapped(MappedPiece),
+    Reader(Box<dyn AsyncRead + Send + Unpin>),
+}
+
+impl PieceSource {
+    async fn fill(&mut self, piece_offset: usize, lease: &mut TxWindowLease) -> ClientResult<()> {
+        let mut offset = piece_offset;
+        for index in 0..lease.part_count() {
+            let dst = lease.part_mut(index).map_err(client_error)?;
+            match self {
+                Self::Mapped(mapped) => {
+                    let end = offset
+                        .checked_add(dst.len())
+                        .ok_or(ClientError::InvalidParameter)?;
+                    let src = mapped.as_slice().get(offset..end).ok_or_else(|| {
+                        ClientError::Unknown(format!(
+                            "URMA mmap piece underflow at offset {offset} length {}",
+                            dst.len()
+                        ))
+                    })?;
+                    dst.copy_from_slice(src);
+                }
+                Self::Reader(reader) => {
+                    reader.read_exact(dst).await?;
+                }
+            }
+            offset = offset
+                .checked_add(dst.len())
+                .ok_or(ClientError::InvalidParameter)?;
+        }
+        Ok(())
+    }
 }
 
 /// Optional dfdaemon URMA rendezvous server. Native setup or listener failure disables only this
@@ -137,9 +195,13 @@ impl UrmaServer {
             fabric_tag: fabric_tag.to_string(),
             max_message_size: fabric.max_message_size(),
         };
-        let mut lane_config = UrmaLaneConfig::default();
-        lane_config.send_depth = urma_config.max_inflight_chunks;
-        lane_config.recv_depth = urma_config.max_inflight_chunks;
+        let lane_config = UrmaLaneConfig {
+            send_depth: urma_config
+                .max_inflight_chunks
+                .min(fabric.max_tx_window_chunks()),
+            recv_depth: urma_config.max_inflight_chunks,
+            ..Default::default()
+        };
         let handler = Arc::new(UrmaServerHandler::new(
             self.storage.clone(),
             self.upload_bandwidth_limiter.clone(),
@@ -149,6 +211,7 @@ impl UrmaServer {
             urma_config.transfer_timeout,
             urma_config.transfer_timeout,
             self.config.download.piece_timeout,
+            urma_config.mmap_content,
         ));
         let admission = Arc::new(Semaphore::new(
             urma_config.max_concurrent_transfers as usize,
@@ -273,6 +336,7 @@ struct UrmaServerHandler {
     session_idle_timeout: Duration,
     transfer_timeout: Duration,
     piece_timeout: Duration,
+    mmap_content: bool,
 }
 
 impl UrmaServerHandler {
@@ -286,6 +350,7 @@ impl UrmaServerHandler {
         control_timeout: Duration,
         transfer_timeout: Duration,
         piece_timeout: Duration,
+        mmap_content: bool,
     ) -> Self {
         Self {
             storage,
@@ -297,6 +362,7 @@ impl UrmaServerHandler {
             session_idle_timeout: server_session_idle_timeout(control_timeout),
             transfer_timeout,
             piece_timeout,
+            mmap_content,
         }
     }
 
@@ -424,14 +490,79 @@ impl UrmaServerHandler {
         };
 
         self.upload_bandwidth_limiter.acquire(piece_length).await;
-        let mut reader = match self.open_piece_reader(request, piece_id).await {
-            Ok(reader) => reader,
+        let mut source = match self.open_piece_source(request, piece_id).await {
+            Ok(source) => source,
             Err(error) => {
                 let _ = session
                     .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
                     .await;
                 return Err(error);
             }
+        };
+
+        let first_lengths =
+            tx_window_chunk_lengths(piece.length, chunk_size, max_inflight_chunks, 0)?;
+        let acquired = time::timeout(
+            self.transfer_timeout,
+            self.fabric.acquire_tx_window_chunks(first_lengths),
+        )
+        .await;
+        let mut current = match acquired {
+            Ok(Ok(lease)) => lease,
+            Ok(Err(error)) => {
+                let code = if matches!(error, UrmaError::BufferUnavailable { .. }) {
+                    ERROR_CODE_BUSY
+                } else {
+                    ERROR_CODE_TOO_LARGE
+                };
+                let _ = session.reject_piece(code, &error.to_string()).await;
+                return Err(client_error(error));
+            }
+            Err(_) => {
+                let message = format!(
+                    "URMA TX registration unavailable after {:?}",
+                    self.transfer_timeout
+                );
+                let _ = session.reject_piece(ERROR_CODE_BUSY, &message).await;
+                return Err(ClientError::Unknown(message));
+            }
+        };
+        if let Err(error) = source.fill(0, &mut current).await {
+            let _ = session
+                .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
+                .await;
+            let _ = self.fabric.recycle_tx_window(current).await;
+            return Err(error);
+        }
+
+        // A second exclusive lease is optional. Fixed pool pressure degrades
+        // this transfer to a one-window pipeline without changing allocator
+        // structure or blocking every admitted peer behind the ring.
+        let first_window_len = current.len() as u64;
+        let mut spare = if first_window_len < piece.length {
+            let next_lengths = tx_window_chunk_lengths(
+                piece.length,
+                chunk_size,
+                max_inflight_chunks,
+                first_window_len,
+            )?;
+            match time::timeout(
+                self.transfer_timeout,
+                self.fabric.acquire_tx_window_chunks(next_lengths),
+            )
+            .await
+            {
+                Ok(Ok(lease)) => Some(lease),
+                Ok(Err(UrmaError::BufferUnavailable { .. })) | Err(_) => None,
+                Ok(Err(error)) => {
+                    let _ = session
+                        .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
+                        .await;
+                    return Err(client_error(error));
+                }
+            }
+        } else {
+            None
         };
         session
             .ready(PieceMetadata {
@@ -444,26 +575,67 @@ impl UrmaServerHandler {
             .await
             .map_err(client_error)?;
 
-        // Reuse one bounded owned window. Session splits it into registered TX
-        // slots and waits for all SEND completions before this buffer is filled
-        // again, so RangeReader and native buffer lifetimes never overlap.
-        let mut window = Vec::new();
         let mut sent = 0u64;
         while sent < piece.length {
-            let window_len = session.next_window_len().map_err(client_error)?;
-            window.resize(window_len, 0);
-            if let Err(error) = reader.read_exact(&mut window).await {
-                let _ = session
-                    .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
-                    .await;
-                return Err(error.into());
+            let window_len = current.len() as u64;
+            let next_offset = sent
+                .checked_add(window_len)
+                .ok_or(ClientError::InvalidParameter)?;
+            if next_offset < piece.length {
+                let next_lengths = tx_window_chunk_lengths(
+                    piece.length,
+                    chunk_size,
+                    max_inflight_chunks,
+                    next_offset,
+                )?;
+                if let Some(mut next) = spare.take() {
+                    next.reshape(&next_lengths).map_err(client_error)?;
+                    let send = session.send_next_registered_window(current, self.transfer_timeout);
+                    let next_offset =
+                        usize::try_from(next_offset).map_err(|_| ClientError::InvalidParameter)?;
+                    let fill = source.fill(next_offset, &mut next);
+                    let (send_result, fill_result) = tokio::join!(send, fill);
+                    let returned = send_result.map_err(client_error)?;
+                    if let Err(error) = fill_result {
+                        let _ = session
+                            .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
+                            .await;
+                        let _ = self.fabric.recycle_tx_window(returned).await;
+                        let _ = self.fabric.recycle_tx_window(next).await;
+                        return Err(error);
+                    }
+                    current = next;
+                    spare = Some(returned);
+                } else {
+                    let mut returned = session
+                        .send_next_registered_window(current, self.transfer_timeout)
+                        .await
+                        .map_err(client_error)?;
+                    returned.reshape(&next_lengths).map_err(client_error)?;
+                    if let Err(error) = source
+                        .fill(
+                            usize::try_from(next_offset)
+                                .map_err(|_| ClientError::InvalidParameter)?,
+                            &mut returned,
+                        )
+                        .await
+                    {
+                        let _ = session
+                            .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
+                            .await;
+                        let _ = self.fabric.recycle_tx_window(returned).await;
+                        return Err(error);
+                    }
+                    current = returned;
+                }
+            } else {
+                current = session
+                    .send_next_registered_window(current, self.transfer_timeout)
+                    .await
+                    .map_err(client_error)?;
             }
-            session
-                .send_next_window(&window, self.transfer_timeout)
-                .await
-                .map_err(client_error)?;
             sent = sent
-                .checked_add(window_len as u64)
+                .checked_add(window_len)
                 .ok_or(ClientError::InvalidParameter)?;
         }
         if sent != piece.length {
@@ -471,6 +643,16 @@ impl UrmaServerHandler {
                 "urma upload length mismatch: expected {}, sent {sent}",
                 piece.length
             )));
+        }
+        self.fabric
+            .recycle_tx_window(current)
+            .await
+            .map_err(client_error)?;
+        if let Some(spare) = spare {
+            self.fabric
+                .recycle_tx_window(spare)
+                .await
+                .map_err(client_error)?;
         }
         session.finish_piece().await.map_err(client_error)?;
         debug!(
@@ -492,12 +674,27 @@ impl UrmaServerHandler {
         }
     }
 
-    async fn open_piece_reader(
+    async fn open_piece_source(
         &self,
         request: &CommonPieceRequest,
         piece_id: &str,
-    ) -> ClientResult<Box<dyn AsyncRead + Send + Unpin>> {
-        match request.kind {
+    ) -> ClientResult<PieceSource> {
+        if self.mmap_content {
+            match self
+                .storage
+                .map_upload_piece(piece_id, &request.task_id, request.kind)
+                .await
+            {
+                Ok(mapped) => {
+                    debug!(piece_id, "URMA upload using mmap content");
+                    return Ok(PieceSource::Mapped(mapped));
+                }
+                Err(error) => {
+                    warn!(piece_id, %error, "URMA mmap unavailable; falling back to reader");
+                }
+            }
+        }
+        let reader = match request.kind {
             PieceKind::Piece => self
                 .storage
                 .upload_piece(piece_id, &request.task_id, None)
@@ -513,13 +710,15 @@ impl UrmaServerHandler {
                 .upload_persistent_cache_piece(piece_id, &request.task_id, None)
                 .await
                 .map(|reader| Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>),
-        }
+        }?;
+        Ok(PieceSource::Reader(reader))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn request(chunk_size: u64, max_inflight_chunks: u32) -> CommonPieceRequest {
         CommonPieceRequest {
@@ -545,5 +744,28 @@ mod tests {
         assert!(negotiate_transfer(&request(64 * 1024, 0), 64 * 1024, 8).is_err());
         assert!(negotiate_transfer(&request(64 * 1024, 1), 0, 8).is_err());
         assert!(negotiate_transfer(&request(64 * 1024, 1), 64 * 1024, 0).is_err());
+    }
+
+    #[test]
+    fn tx_window_lengths_keep_chunks_in_distinct_slots_and_trim_tail() {
+        assert_eq!(tx_window_chunk_lengths(13, 4, 2, 0).unwrap(), vec![4, 4]);
+        assert_eq!(tx_window_chunk_lengths(13, 4, 2, 8).unwrap(), vec![4, 1]);
+        assert!(tx_window_chunk_lengths(13, 4, 2, 13).is_err());
+    }
+
+    #[tokio::test]
+    async fn reader_source_fills_registered_chunk_spans_directly() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let write = tokio::spawn(async move {
+            writer.write_all(b"direct!").await.unwrap();
+        });
+        let mut source = PieceSource::Reader(Box::new(reader));
+        let mut lease = TxWindowLease::from_test_lengths(vec![4, 3]);
+
+        source.fill(0, &mut lease).await.unwrap();
+        write.await.unwrap();
+
+        assert_eq!(lease.part_mut(0).unwrap(), b"dire");
+        assert_eq!(lease.part_mut(1).unwrap(), b"ct!");
     }
 }

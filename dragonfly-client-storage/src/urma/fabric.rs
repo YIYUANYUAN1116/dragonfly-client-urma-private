@@ -9,7 +9,8 @@
 use super::{
     buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
     completion::{
-        LaneCompletion, OperationCompletionTx, RegisteredRxCompletion, RegisteredRxCompletionTx,
+        RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
+        RegisteredTxCompletionTx,
     },
     lane::{JettyConfig, JettyDescriptor},
     runtime::{RuntimeConfig, UrmaRuntime},
@@ -80,13 +81,6 @@ impl From<UrmaLaneConfig> for JettyConfig {
             token: config.token,
         }
     }
-}
-
-/// Completion DTO crossing from the native owner thread to async Dragonfly
-/// code. It contains no UMDK handle or registered-memory borrow.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum FabricCompletion {
-    Sent { lane_id: u16, sequence: Option<u64> },
 }
 
 /// Observable process-level fabric state.
@@ -209,23 +203,20 @@ pub struct UrmaFabricHandle {
     inner: Arc<FabricInner>,
 }
 
-/// One posted URMA operation. Dropping this handle abandons only the async
-/// wait; the owner thread keeps the native WR and registered slot alive until
-/// its CQE is reaped.
-pub(crate) struct UrmaOpHandle {
-    sequence: Option<u64>,
-    completion: oneshot::Receiver<Result<LaneCompletion>>,
-    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
-}
-
 pub(crate) struct UrmaRegisteredRxOpHandle {
     sequence: u64,
     completion: oneshot::Receiver<Result<RegisteredRxCompletion>>,
     abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
 }
 
-impl UrmaRegisteredRxOpHandle {
-    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredRxCompletion> {
+pub(crate) struct UrmaRegisteredTxOpHandle {
+    sequence: u64,
+    completion: oneshot::Receiver<Result<RegisteredTxCompletion>>,
+    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
+}
+
+impl UrmaRegisteredTxOpHandle {
+    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredTxCompletion> {
         match tokio::time::timeout(timeout, self.completion).await {
             Ok(result) => result.map_err(|_| fabric_stopped())?,
             Err(_) => {
@@ -240,26 +231,16 @@ impl UrmaRegisteredRxOpHandle {
     }
 }
 
-impl UrmaOpHandle {
-    pub(crate) async fn wait(self) -> Result<FabricCompletion> {
-        self.completion
-            .await
-            .map_err(|_| fabric_stopped())?
-            .map(Into::into)
-    }
-
-    /// Times out the logical wait and marks its lane ERROR without pretending
-    /// that liburma cancelled this individual WR. Native ownership remains in
-    /// CompletionRouter until a CQE or shutdown flush retires it.
-    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<FabricCompletion> {
+impl UrmaRegisteredRxOpHandle {
+    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredRxCompletion> {
         match tokio::time::timeout(timeout, self.completion).await {
-            Ok(result) => result.map_err(|_| fabric_stopped())?.map(Into::into),
+            Ok(result) => result.map_err(|_| fabric_stopped())?,
             Err(_) => {
                 if let Some((command_tx, lane_id)) = self.abort {
                     abort_lane(command_tx, lane_id).await?;
                 }
                 Err(Error::OperationTimeout {
-                    sequence: self.sequence,
+                    sequence: Some(self.sequence),
                 })
             }
         }
@@ -282,6 +263,13 @@ impl UrmaFabricHandle {
     /// smaller of the device capability and one registered buffer slot.
     pub fn max_message_size(&self) -> u64 {
         self.inner.max_message_size
+    }
+
+    /// Maximum logical SEND window that leaves room for a second registered
+    /// lease in the fixed TX pool. A one-slot pool still supports ring=1.
+    pub(crate) fn max_tx_window_chunks(&self) -> u32 {
+        let slots = self.inner.runtime_config.buffer_pool.tx_slot_count;
+        u32::try_from((slots / 2).max(1)).unwrap_or(u32::MAX)
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -356,6 +344,17 @@ impl UrmaFabricHandle {
             .await
     }
 
+    pub(crate) async fn acquire_tx_window_chunks(
+        &self,
+        chunk_lengths: Vec<usize>,
+    ) -> Result<TxWindowLease> {
+        self.submit(|reply| FabricCommand::AcquireTxWindowChunks {
+            chunk_lengths,
+            reply,
+        })
+        .await
+    }
+
     #[allow(dead_code)] // B1 ownership API, consumed by B4.
     pub(crate) async fn recycle_tx_window(&self, lease: TxWindowLease) -> Result<usize> {
         self.submit_urgent(|reply| FabricCommand::RecycleTxWindow { lease, reply })
@@ -368,20 +367,30 @@ impl UrmaFabricHandle {
             .await
     }
 
-    pub(crate) async fn send(
+    pub(crate) async fn send_registered_window(
         &self,
         lane_id: u16,
-        bytes: Vec<u8>,
-        sequence: Option<u64>,
-    ) -> Result<UrmaOpHandle> {
-        self.submit_operation(lane_id, sequence, |completion, reply| FabricCommand::Send {
+        lease: TxWindowLease,
+        sequences: Vec<u64>,
+    ) -> Result<UrmaRegisteredTxOpHandle> {
+        let sequence = sequences.first().copied().ok_or_else(|| {
+            Error::InvalidConfiguration("registered TX sequence window is empty".into())
+        })?;
+        let command_tx = self.command_sender()?;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit(|reply| FabricCommand::SendRegisteredWindow {
             lane_id,
-            bytes,
-            sequence,
-            completion,
+            lease,
+            sequences,
+            completion: completion_tx,
             reply,
         })
-        .await
+        .await?;
+        Ok(UrmaRegisteredTxOpHandle {
+            sequence,
+            completion: completion_rx,
+            abort: Some((command_tx, lane_id)),
+        })
     }
 
     pub(crate) async fn close_lane(&self, lane_id: u16) -> Result<()> {
@@ -447,23 +456,6 @@ impl UrmaFabricHandle {
             .unwrap()
             .clone()
             .ok_or_else(fabric_stopped)
-    }
-
-    async fn submit_operation(
-        &self,
-        lane_id: u16,
-        sequence: Option<u64>,
-        make_command: impl FnOnce(OperationCompletionTx, oneshot::Sender<Result<()>>) -> FabricCommand,
-    ) -> Result<UrmaOpHandle> {
-        let (completion_tx, completion_rx) = oneshot::channel();
-        self.submit(|reply| make_command(completion_tx, reply))
-            .await?;
-        let command_tx = self.command_sender()?;
-        Ok(UrmaOpHandle {
-            sequence,
-            completion: completion_rx,
-            abort: Some((command_tx, lane_id)),
-        })
     }
 
     /// Shuts the native resource tree down and joins the owner thread.
@@ -546,6 +538,10 @@ enum FabricCommand {
         length: usize,
         reply: oneshot::Sender<Result<TxWindowLease>>,
     },
+    AcquireTxWindowChunks {
+        chunk_lengths: Vec<usize>,
+        reply: oneshot::Sender<Result<TxWindowLease>>,
+    },
     #[allow(dead_code)] // B1 foundation, selected by B4.
     RecycleTxWindow {
         lease: TxWindowLease,
@@ -556,11 +552,11 @@ enum FabricCommand {
         lease: RegisteredRxWindowLease,
         reply: oneshot::Sender<Result<usize>>,
     },
-    Send {
+    SendRegisteredWindow {
         lane_id: u16,
-        bytes: Vec<u8>,
-        sequence: Option<u64>,
-        completion: OperationCompletionTx,
+        lease: TxWindowLease,
+        sequences: Vec<u64>,
+        completion: RegisteredTxCompletionTx,
         reply: oneshot::Sender<Result<()>>,
     },
     CloseLane {
@@ -749,6 +745,15 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
+        FabricCommand::AcquireTxWindowChunks {
+            chunk_lengths,
+            reply,
+        } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.acquire_tx_window_chunks(&chunk_lengths));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
         FabricCommand::RecycleTxWindow { lease, reply } => {
             let _ = reply.send(runtime.recycle_tx_window(lease));
             OwnerControl::Continue
@@ -757,15 +762,16 @@ fn handle_command(
             let _ = reply.send(runtime.recycle_rx_window(lease));
             OwnerControl::Continue
         }
-        FabricCommand::Send {
+        FabricCommand::SendRegisteredWindow {
             lane_id,
-            bytes,
-            sequence,
+            lease,
+            sequences,
             completion,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned)
-                .and_then(|()| runtime.send(lane_id, &bytes, sequence, completion));
+            let result = reject_if_poisoned(poisoned).and_then(|()| {
+                runtime.send_registered_window(lane_id, lease, sequences, completion)
+            });
             let _ = reply.send(result);
             OwnerControl::Continue
         }
@@ -825,14 +831,6 @@ async fn abort_lane(
         }))
         .map_err(|_| fabric_stopped())?;
     reply_rx.await.map_err(|_| fabric_stopped())?
-}
-
-impl From<LaneCompletion> for FabricCompletion {
-    fn from(completion: LaneCompletion) -> Self {
-        match completion {
-            LaneCompletion::Sent { lane_id, sequence } => Self::Sent { lane_id, sequence },
-        }
-    }
 }
 
 fn finish_owner(
@@ -920,45 +918,6 @@ mod tests {
     fn handle_is_safe_to_move_between_tokio_tasks() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<UrmaFabricHandle>();
-        assert_send_sync::<UrmaOpHandle>();
-    }
-
-    #[tokio::test]
-    async fn operation_handle_receives_its_own_completion() {
-        let (tx, rx) = oneshot::channel();
-        let handle = UrmaOpHandle {
-            sequence: Some(9),
-            completion: rx,
-            abort: None,
-        };
-        tx.send(Ok(LaneCompletion::Sent {
-            lane_id: 7,
-            sequence: Some(9),
-        }))
-        .unwrap();
-
-        assert_eq!(
-            handle.wait().await.unwrap(),
-            FabricCompletion::Sent {
-                lane_id: 7,
-                sequence: Some(9)
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn operation_timeout_abandons_only_the_waiter() {
-        let (_tx, rx) = oneshot::channel();
-        let handle = UrmaOpHandle {
-            sequence: Some(11),
-            completion: rx,
-            abort: None,
-        };
-
-        assert_eq!(
-            handle.wait_timeout(Duration::ZERO).await,
-            Err(Error::OperationTimeout { sequence: Some(11) })
-        );
     }
 
     #[test]
@@ -976,21 +935,6 @@ mod tests {
         assert_eq!(native.max_send_sge, 3);
         assert_eq!(native.max_recv_sge, 4);
         assert_eq!(native.token, 5);
-    }
-
-    #[test]
-    fn sent_completion_crosses_the_thread_boundary_without_native_state() {
-        let completion = FabricCompletion::from(LaneCompletion::Sent {
-            lane_id: 7,
-            sequence: Some(9),
-        });
-        assert_eq!(
-            completion,
-            FabricCompletion::Sent {
-                lane_id: 7,
-                sequence: Some(9)
-            }
-        );
     }
 
     #[test]

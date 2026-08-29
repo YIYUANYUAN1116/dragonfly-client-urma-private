@@ -374,6 +374,16 @@ impl RegisteredRxWindowLease {
             _test_backing: backing,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_lengths(lengths: Vec<usize>) -> Self {
+        let slots = (0..lengths.len())
+            .map(|index| SlotId::new(index, 1).unwrap())
+            .collect();
+        let mut leases = LeaseBook::new();
+        let recycle = leases.issue(LeaseKind::Tx, slots).unwrap();
+        Self::from_test_parts(lengths, recycle, Arc::new(|_| {}))
+    }
 }
 
 /// Exclusive ownership of registered TX backing before any SEND is posted.
@@ -381,7 +391,8 @@ impl RegisteredRxWindowLease {
 /// fill the logical window directly without an intermediate Vec.
 #[allow(dead_code)] // B1 foundation; filled and posted by B4.
 pub(crate) struct TxWindowLease {
-    data: NonNull<u8>,
+    spans: Vec<RegisteredSpan>,
+    layouts: Vec<TxLeaseLayout>,
     length: usize,
     core: LeaseCore,
     #[cfg(test)]
@@ -394,14 +405,104 @@ unsafe impl Send for TxWindowLease {}
 
 #[allow(dead_code)] // B1 foundation; filled and posted by B4.
 impl TxWindowLease {
+    pub(crate) fn part_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub(crate) fn part_mut(&mut self, index: usize) -> Result<&mut [u8]> {
+        let span = self
+            .spans
+            .get_mut(index)
+            .ok_or_else(|| Error::Protocol("TX lease part index is out of range".into()))?;
+        // SAFETY: the indexed span belongs to this exclusive lease and the
+        // mutable lease borrow prevents another part borrow at the same time.
+        Ok(unsafe { std::slice::from_raw_parts_mut(span.data.as_ptr(), span.length) })
+    }
+
+    #[cfg(test)]
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: exclusive lease ownership guarantees unique CPU access.
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.length) }
+        assert_eq!(self.spans.len(), 1);
+        // SAFETY: the single-span test helper has exclusive lease ownership.
+        unsafe { std::slice::from_raw_parts_mut(self.spans[0].data.as_ptr(), self.spans[0].length) }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.length
     }
+
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.layouts.len()
+    }
+
+    /// Narrows a reusable full-size window for a final short window. B4 never
+    /// grows a lease or changes its slot identities off the owner thread.
+    pub(crate) fn reshape(&mut self, chunk_lengths: &[usize]) -> Result<()> {
+        if chunk_lengths.is_empty() || chunk_lengths.len() > self.layouts.len() {
+            return Err(Error::InvalidConfiguration(
+                "TX lease reshape exceeds its slot count".into(),
+            ));
+        }
+        let mut total = 0usize;
+        for (index, length) in chunk_lengths.iter().copied().enumerate() {
+            if length == 0 || length > self.spans[index].length {
+                return Err(Error::InvalidConfiguration(
+                    "TX lease reshape exceeds its original span".into(),
+                ));
+            }
+            self.spans[index].length = length;
+            self.layouts[index].length = u32::try_from(length)
+                .map_err(|_| Error::InvalidConfiguration("TX chunk exceeds u32".into()))?;
+            total = total
+                .checked_add(length)
+                .ok_or_else(|| Error::InvalidConfiguration("TX window length overflow".into()))?;
+        }
+        self.spans.truncate(chunk_lengths.len());
+        self.layouts.truncate(chunk_lengths.len());
+        self.length = total;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        lengths: Vec<usize>,
+        recycle: LeaseRecycle,
+        notifier: LeaseRecycleNotifier,
+    ) -> Self {
+        let total = lengths.iter().sum();
+        let mut backing = vec![0u8; total].into_boxed_slice();
+        let base = backing.as_mut_ptr();
+        let mut offset = 0usize;
+        let mut spans = Vec::with_capacity(lengths.len());
+        let mut layouts = Vec::with_capacity(lengths.len());
+        for (index, length) in lengths.into_iter().enumerate() {
+            // SAFETY: offsets are accumulated from the exact backing length.
+            let data = unsafe { NonNull::new_unchecked(base.add(offset)) };
+            spans.push(RegisteredSpan { data, length });
+            layouts.push(TxLeaseLayout {
+                slot: SlotId::new(index, 1).unwrap(),
+                offset: offset as u64,
+                length: length as u32,
+            });
+            offset += length;
+        }
+        Self {
+            spans,
+            layouts,
+            length: total,
+            core: LeaseCore {
+                recycle: Some(recycle),
+                notifier,
+            },
+            _test_backing: backing,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TxLeaseLayout {
+    slot: SlotId,
+    offset: u64,
+    length: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -586,29 +687,6 @@ mod native {
                 .ok_or_else(|| Error::InvalidConfiguration("registered Segment is closed".into()))
         }
 
-        pub(crate) fn write_tx(&mut self, id: SlotId, data: &[u8]) -> Result<(u64, u32)> {
-            let (offset, capacity, kind, state) = self.slot_fields(id)?;
-            if kind != SlotKind::Tx || state != SlotState::Allocated {
-                return Err(Error::InvalidConfiguration(
-                    "TX write requires an allocated TX slot".into(),
-                ));
-            }
-            if data.is_empty() || data.len() > capacity {
-                return Err(Error::InvalidConfiguration(format!(
-                    "TX message length {} is outside 1..={capacity}",
-                    data.len()
-                )));
-            }
-            let offset = u64::try_from(offset)
-                .map_err(|_| Error::InvalidConfiguration("slot offset exceeds u64".into()))?;
-            self.segment_handle()?
-                .write(offset, data)
-                .map_err(|error| native_error("write_tx_slot", error))?;
-            let length = u32::try_from(data.len())
-                .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
-            Ok((offset, length))
-        }
-
         pub(crate) fn recv_post_layout(&self, id: SlotId) -> Result<(u64, u32)> {
             let (offset, capacity, kind, state) = self.slot_fields(id)?;
             if kind != SlotKind::Rx || state != SlotState::Allocated {
@@ -652,8 +730,38 @@ mod native {
             )
         }
 
-        pub(crate) fn complete_send(&mut self, id: SlotId) -> Result<()> {
-            self.transition(id, SlotState::SendPosted, SlotState::SendCompleted)
+        pub(crate) fn tx_lease_layouts(
+            &self,
+            lease: &TxWindowLease,
+        ) -> Result<Vec<(SlotId, u64, u32)>> {
+            if lease.layouts.is_empty() {
+                return Err(Error::Protocol("TX lease has no layouts".into()));
+            }
+            for layout in &lease.layouts {
+                let (_, _, kind, state) = self.slot_fields(layout.slot)?;
+                if kind != SlotKind::Tx || state != SlotState::LeasedTx {
+                    return Err(Error::Protocol(
+                        "TX lease layout does not reference a leased TX slot".into(),
+                    ));
+                }
+            }
+            Ok(lease
+                .layouts
+                .iter()
+                .map(|layout| (layout.slot, layout.offset, layout.length))
+                .collect())
+        }
+
+        pub(crate) fn mark_tx_lease_posted(&mut self, id: SlotId) -> Result<()> {
+            self.transition(id, SlotState::LeasedTx, SlotState::SendPosted)
+        }
+
+        pub(crate) fn rollback_tx_lease_post(&mut self, id: SlotId) -> Result<()> {
+            self.transition(id, SlotState::SendPosted, SlotState::LeasedTx)
+        }
+
+        pub(crate) fn complete_tx_lease_send(&mut self, id: SlotId) -> Result<()> {
+            self.transition(id, SlotState::SendPosted, SlotState::LeasedTx)
         }
 
         pub(crate) fn complete_error(
@@ -778,9 +886,20 @@ mod native {
         }
 
         pub(crate) fn acquire_tx_window(&mut self, length: usize) -> Result<TxWindowLease> {
-            if length == 0 {
+            self.acquire_tx_window_chunks(&[length])
+        }
+
+        /// Leases one TX slot per message. Payload spans are logically packed
+        /// even when a negotiated chunk is smaller than the fixed slot size;
+        /// provider offsets still point at distinct slots so all SENDs may be
+        /// outstanding concurrently.
+        pub(crate) fn acquire_tx_window_chunks(
+            &mut self,
+            chunk_lengths: &[usize],
+        ) -> Result<TxWindowLease> {
+            if chunk_lengths.is_empty() || chunk_lengths.contains(&0) {
                 return Err(Error::InvalidConfiguration(
-                    "TX window lease length must be non-zero".into(),
+                    "TX window lease requires non-empty chunks".into(),
                 ));
             }
             let slot_capacity = self
@@ -789,10 +908,31 @@ mod native {
                 .find(|slot| slot.kind == SlotKind::Tx)
                 .map(|slot| slot.len)
                 .ok_or_else(|| Error::InvalidConfiguration("TX pool is empty".into()))?;
-            let slot_count = length
-                .checked_add(slot_capacity - 1)
-                .ok_or_else(|| Error::InvalidConfiguration("TX window length overflow".into()))?
-                / slot_capacity;
+            if let Some(length) = chunk_lengths.iter().find(|length| **length > slot_capacity) {
+                return Err(Error::InvalidConfiguration(format!(
+                    "TX chunk length {length} exceeds slot capacity {slot_capacity}"
+                )));
+            }
+            let encoded_lengths = chunk_lengths
+                .iter()
+                .map(|length| {
+                    u32::try_from(*length).map_err(|_| {
+                        Error::InvalidConfiguration("TX chunk length exceeds u32".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let slot_count = chunk_lengths.len();
+            let length = chunk_lengths.iter().try_fold(0usize, |total, length| {
+                total
+                    .checked_add(*length)
+                    .ok_or_else(|| Error::InvalidConfiguration("TX window length overflow".into()))
+            })?;
+            let available = self
+                .slots
+                .iter()
+                .take_while(|slot| slot.kind == SlotKind::Tx)
+                .filter(|slot| slot.state == SlotState::Free)
+                .count();
             let start = self
                 .slots
                 .iter()
@@ -801,23 +941,18 @@ mod native {
                 .collect::<Vec<_>>()
                 .windows(slot_count)
                 .position(|states| states.iter().all(|state| *state == SlotState::Free))
-                .ok_or_else(|| {
-                    Error::InvalidConfiguration("no contiguous TX window available".into())
+                .ok_or(Error::BufferUnavailable {
+                    kind: "TX",
+                    requested: slot_count,
+                    available,
                 })?;
-            let offset = self.slots[start].offset;
             let (base, registered_len) = self
                 .segment_handle()?
                 .data()
                 .map_err(|error| native_error("borrow_tx_window", error))?;
-            let end = offset
-                .checked_add(length)
-                .ok_or_else(|| Error::InvalidConfiguration("TX window offset overflow".into()))?;
-            if end > registered_len {
-                return Err(Error::InvalidConfiguration(
-                    "TX window exceeds registered Segment".into(),
-                ));
-            }
             let mut slots = Vec::with_capacity(slot_count);
+            let mut spans = Vec::with_capacity(slot_count);
+            let mut layouts = Vec::with_capacity(slot_count);
             for index in start..start + slot_count {
                 self.free_tx.retain(|free| *free != index);
                 let slot = self
@@ -829,10 +964,31 @@ mod native {
                     slot.generation = 1;
                 }
                 slot.state = SlotState::LeasedTx;
-                slots.push(SlotId::new(index, slot.generation)?);
+                let id = SlotId::new(index, slot.generation)?;
+                let chunk_length = chunk_lengths[slots.len()];
+                let end = slot.offset.checked_add(chunk_length).ok_or_else(|| {
+                    Error::InvalidConfiguration("TX window offset overflow".into())
+                })?;
+                if end > registered_len {
+                    return Err(Error::InvalidConfiguration(
+                        "TX window exceeds registered Segment".into(),
+                    ));
+                }
+                // SAFETY: this slot span was bounds checked against the live Segment.
+                let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(slot.offset)) };
+                spans.push(RegisteredSpan {
+                    data,
+                    length: chunk_length,
+                });
+                layouts.push(TxLeaseLayout {
+                    slot: id,
+                    offset: u64::try_from(slot.offset).map_err(|_| {
+                        Error::InvalidConfiguration("TX slot offset exceeds u64".into())
+                    })?,
+                    length: encoded_lengths[slots.len()],
+                });
+                slots.push(id);
             }
-            // SAFETY: offset..end was checked and all covered slots are exclusively leased.
-            let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
             let recycle = match self.leases.issue(LeaseKind::Tx, slots.clone()) {
                 Ok(recycle) => recycle,
                 Err(error) => {
@@ -844,7 +1000,8 @@ mod native {
                 }
             };
             Ok(TxWindowLease {
-                data,
+                spans,
+                layouts,
                 length,
                 core: LeaseCore {
                     recycle: Some(recycle),
@@ -1148,7 +1305,15 @@ mod tests {
         let mut backing = vec![0u8; 7].into_boxed_slice();
         let data = NonNull::new(backing.as_mut_ptr()).unwrap();
         let mut lease = TxWindowLease {
-            data,
+            spans: vec![RegisteredSpan {
+                data,
+                length: backing.len(),
+            }],
+            layouts: vec![TxLeaseLayout {
+                slot: SlotId::new(0, 1).unwrap(),
+                offset: 0,
+                length: backing.len() as u32,
+            }],
             length: backing.len(),
             core: LeaseCore {
                 recycle: Some(recycle),
@@ -1161,6 +1326,50 @@ mod tests {
         assert_eq!(&*lease._test_backing, b"direct!");
         drop(lease);
         assert_eq!(*returned.lock().unwrap(), Some(recycle));
+    }
+
+    #[test]
+    fn tx_lease_reshape_preserves_distinct_chunk_spans_and_trims_tail() {
+        let slots = (0..3)
+            .map(|index| SlotId::new(index, 1).unwrap())
+            .collect::<Vec<_>>();
+        let mut leases = LeaseBook::new();
+        let recycle = leases.issue(LeaseKind::Tx, slots.clone()).unwrap();
+        let notifier: LeaseRecycleNotifier = Arc::new(|_| {});
+        let mut backing = vec![0u8; 12].into_boxed_slice();
+        let base = backing.as_mut_ptr();
+        let mut lease = TxWindowLease {
+            spans: (0..3)
+                .map(|index| RegisteredSpan {
+                    // SAFETY: every four-byte span is within `backing`.
+                    data: unsafe { NonNull::new_unchecked(base.add(index * 4)) },
+                    length: 4,
+                })
+                .collect(),
+            layouts: slots
+                .into_iter()
+                .enumerate()
+                .map(|(index, slot)| TxLeaseLayout {
+                    slot,
+                    offset: (index * 4) as u64,
+                    length: 4,
+                })
+                .collect(),
+            length: 12,
+            core: LeaseCore {
+                recycle: Some(recycle),
+                notifier,
+            },
+            _test_backing: backing,
+        };
+
+        lease.reshape(&[4, 1]).unwrap();
+        assert_eq!(lease.len(), 5);
+        assert_eq!(lease.chunk_count(), 2);
+        lease.part_mut(0).unwrap().copy_from_slice(b"full");
+        lease.part_mut(1).unwrap().copy_from_slice(b"!");
+        assert_eq!(&lease._test_backing[..5], b"full!");
+        assert!(lease.reshape(&[4, 2, 4]).is_err());
     }
 
     #[test]
