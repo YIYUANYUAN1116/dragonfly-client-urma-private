@@ -38,13 +38,13 @@ use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time;
-use tracing::{debug, error, info, instrument, warn, Span};
+use tracing::{debug, error, info, info_span, instrument, warn, Span};
 
 use dragonfly_client_util::shutdown;
 
@@ -368,7 +368,7 @@ impl UrmaServerHandler {
 
     /// Accepts one peer lane and serves sequential Piece requests until the
     /// peer disconnects or a conservative Phase A error retires the session.
-    #[instrument(skip_all, fields(remote_address, task_id, piece_id))]
+    #[instrument(skip_all, fields(remote_address))]
     async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
         Span::current().record("remote_address", remote_address.as_str());
         let mut session = UrmaServerSession::accept(
@@ -398,8 +398,13 @@ impl UrmaServerHandler {
             let piece_id = self
                 .storage
                 .piece_id(&request.task_id, request.piece_number);
-            Span::current().record("task_id", request.task_id.as_str());
-            Span::current().record("piece_id", piece_id.as_str());
+            // Per-Piece span with fields fixed at creation. Recording
+            // task_id/piece_id repeatedly on the connection span made fmt
+            // subscribers print every recorded value, so logs accumulated
+            // one (task_id, piece_id) pair per served Piece.
+            let piece_span =
+                info_span!("urma_piece", task_id = %request.task_id, piece_id = %piece_id);
+            let _piece_guard = piece_span.enter();
 
             collect_upload_piece_started_metrics();
             info!(
@@ -500,6 +505,22 @@ impl UrmaServerHandler {
             }
         };
 
+        // TX ring observability. tx_ring_depth reports the effective ring
+        // depth (2 only when at least one send overlapped a concurrent fill);
+        // a single-window Piece trivially reports depth 1 without exercising
+        // the ring. tx_second_lease_fallback marks a multi-window Piece that
+        // ran with no spare lease (degraded ring=1 pipeline).
+        let tx_source = if matches!(source, PieceSource::Mapped(_)) {
+            "mmap"
+        } else {
+            "reader"
+        };
+        let mut tx_windows = 0u64;
+        let mut tx_overlap_windows = 0u64;
+        let mut tx_second_lease_fallback = false;
+        let mut tx_fill_ns = 0u64;
+        let mut tx_send_wait_ns = 0u64;
+
         let first_lengths =
             tx_window_chunk_lengths(piece.length, chunk_size, max_inflight_chunks, 0)?;
         let acquired = time::timeout(
@@ -527,6 +548,7 @@ impl UrmaServerHandler {
                 return Err(ClientError::Unknown(message));
             }
         };
+        let fill_start = Instant::now();
         if let Err(error) = source.fill(0, &mut current).await {
             let _ = session
                 .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
@@ -534,6 +556,7 @@ impl UrmaServerHandler {
             let _ = self.fabric.recycle_tx_window(current).await;
             return Err(error);
         }
+        tx_fill_ns += fill_start.elapsed().as_nanos() as u64;
 
         // A second exclusive lease is optional. Fixed pool pressure degrades
         // this transfer to a one-window pipeline without changing allocator
@@ -577,6 +600,7 @@ impl UrmaServerHandler {
 
         let mut sent = 0u64;
         while sent < piece.length {
+            tx_windows += 1;
             let window_len = current.len() as u64;
             let next_offset = sent
                 .checked_add(window_len)
@@ -590,11 +614,25 @@ impl UrmaServerHandler {
                 )?;
                 if let Some(mut next) = spare.take() {
                     next.reshape(&next_lengths).map_err(client_error)?;
-                    let send = session.send_next_registered_window(current, self.transfer_timeout);
+                    let send = async {
+                        let start = Instant::now();
+                        let result = session
+                            .send_next_registered_window(current, self.transfer_timeout)
+                            .await;
+                        (start.elapsed().as_nanos() as u64, result)
+                    };
                     let next_offset =
                         usize::try_from(next_offset).map_err(|_| ClientError::InvalidParameter)?;
-                    let fill = source.fill(next_offset, &mut next);
-                    let (send_result, fill_result) = tokio::join!(send, fill);
+                    let fill = async {
+                        let start = Instant::now();
+                        let result = source.fill(next_offset, &mut next).await;
+                        (start.elapsed().as_nanos() as u64, result)
+                    };
+                    let ((send_ns, send_result), (fill_ns, fill_result)) =
+                        tokio::join!(send, fill);
+                    tx_send_wait_ns += send_ns;
+                    tx_fill_ns += fill_ns;
+                    tx_overlap_windows += 1;
                     let returned = send_result.map_err(client_error)?;
                     if let Err(error) = fill_result {
                         let _ = session
@@ -607,11 +645,15 @@ impl UrmaServerHandler {
                     current = next;
                     spare = Some(returned);
                 } else {
+                    tx_second_lease_fallback = true;
+                    let send_start = Instant::now();
                     let mut returned = session
                         .send_next_registered_window(current, self.transfer_timeout)
                         .await
                         .map_err(client_error)?;
+                    tx_send_wait_ns += send_start.elapsed().as_nanos() as u64;
                     returned.reshape(&next_lengths).map_err(client_error)?;
+                    let fill_start = Instant::now();
                     if let Err(error) = source
                         .fill(
                             usize::try_from(next_offset)
@@ -626,13 +668,16 @@ impl UrmaServerHandler {
                         let _ = self.fabric.recycle_tx_window(returned).await;
                         return Err(error);
                     }
+                    tx_fill_ns += fill_start.elapsed().as_nanos() as u64;
                     current = returned;
                 }
             } else {
+                let send_start = Instant::now();
                 current = session
                     .send_next_registered_window(current, self.transfer_timeout)
                     .await
                     .map_err(client_error)?;
+                tx_send_wait_ns += send_start.elapsed().as_nanos() as u64;
             }
             sent = sent
                 .checked_add(window_len)
@@ -655,9 +700,18 @@ impl UrmaServerHandler {
                 .map_err(client_error)?;
         }
         session.finish_piece().await.map_err(client_error)?;
+        let tx_ring_depth = if tx_overlap_windows > 0 { 2 } else { 1 };
         debug!(
             lane_id = session.lane_id().unwrap_or_default(),
-            piece_id, "finished uploading piece content over urma"
+            piece_id,
+            tx_source,
+            tx_windows,
+            tx_ring_depth,
+            tx_overlap_windows,
+            tx_second_lease_fallback,
+            tx_fill_ns,
+            tx_send_wait_ns,
+            "finished uploading piece content over urma"
         );
         Ok(piece.length)
     }
