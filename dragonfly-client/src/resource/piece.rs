@@ -52,6 +52,14 @@ pub const MIN_PIECE_LENGTH: u64 = 4 * 1024 * 1024;
 /// The maximum piece length.
 pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
 
+#[cfg(feature = "urma")]
+#[derive(Clone, Copy, Debug)]
+enum UrmaPieceKind {
+    Piece,
+    PersistentPiece,
+    PersistentCachePiece,
+}
+
 /// Sets the optimization strategy of piece length.
 pub enum PieceLengthStrategy {
     /// OptimizeByFileLength optimizes the piece length by the file length.
@@ -81,10 +89,15 @@ pub struct Piece {
     #[cfg(feature = "rdma")]
     rdma_downloader: Option<Arc<piece_downloader::rdma::RDMADownloader>>,
 
-    /// URMA stays behind the transport-neutral Downloader contract. Piece orchestration must not
-    /// depend on Fabric, lane, registered slot, or completion types.
+    /// Generic URMA compatibility downloader, also used by transport-neutral
+    /// callers and fault-injection tests.
     #[cfg(feature = "urma")]
     urma_downloader: Option<Arc<dyn piece_downloader::Downloader>>,
+
+    /// Concrete URMA downloader used only to expose registered windows to the
+    /// B3 Storage path. Fabric, lane, slot, and CQ types remain hidden.
+    #[cfg(feature = "urma")]
+    urma_direct_downloader: Option<Arc<piece_downloader::urma::URMADownloader>>,
 
     /// The backend factory.
     backend_factory: Arc<BackendFactory>,
@@ -123,10 +136,12 @@ impl Piece {
             warn!("download protocol is rdma but this build lacks the rdma feature, using tcp");
         }
         #[cfg(feature = "urma")]
-        let urma_downloader = if config.download.protocol == "urma" {
-            Some(piece_downloader::DownloaderFactory::new("urma", config.clone())?.build())
+        let (urma_downloader, urma_direct_downloader) = if config.download.protocol == "urma" {
+            let downloader = Arc::new(piece_downloader::urma::URMADownloader::new(config.clone()));
+            let compatibility: Arc<dyn piece_downloader::Downloader> = downloader.clone();
+            (Some(compatibility), Some(downloader))
         } else {
-            None
+            (None, None)
         };
         #[cfg(not(feature = "urma"))]
         if config.download.protocol == "urma" {
@@ -143,6 +158,8 @@ impl Piece {
             rdma_downloader,
             #[cfg(feature = "urma")]
             urma_downloader,
+            #[cfg(feature = "urma")]
+            urma_direct_downloader,
             backend_factory,
             download_bandwidth_limiter,
             prefetch_bandwidth_limiter,
@@ -459,6 +476,37 @@ impl Piece {
             }
         }
 
+        // B3 keeps URMA receive windows registered through Storage completion.
+        #[cfg(feature = "urma")]
+        if let ("urma", Some(ip), Some(port)) = (
+            self.config.download.protocol.as_str(),
+            parent.download_ip.as_deref(),
+            parent.download_tcp_port,
+        ) {
+            let tcp_addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+            match self
+                .download_piece_from_parent_over_urma(
+                    UrmaPieceKind::Piece,
+                    piece_id,
+                    task_id,
+                    number,
+                    length,
+                    parent.id.as_str(),
+                    &tcp_addr,
+                )
+                .await
+            {
+                Ok(piece) => {
+                    collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                    scopeguard::ScopeGuard::into_inner(guard);
+                    return Ok(piece);
+                }
+                Err(error) => {
+                    warn!("urma download failed, fall back to tcp downloader: {error}")
+                }
+            }
+        }
+
         let urma_tcp_addr = if self.config.download.protocol == "urma" {
             match (parent.download_ip.as_deref(), parent.download_tcp_port) {
                 (Some(ip), Some(port)) => {
@@ -501,7 +549,9 @@ impl Piece {
                     .await?
             }
             #[cfg(feature = "urma")]
-            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+            ("urma", Some(ip), Some(download_tcp_port), _)
+                if self.urma_downloader.is_some() && self.urma_direct_downloader.is_none() =>
+            {
                 let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
                 let urma_downloader = self.urma_downloader.as_ref().unwrap();
                 match urma_downloader
@@ -659,6 +709,118 @@ impl Piece {
                     .download_piece_started(piece_id, number)
                     .await?;
                 Err(err)
+            }
+        }
+    }
+
+    /// Downloads one of Dragonfly's three Piece kinds through the B3 URMA
+    /// registered-window path. A Storage-side failure resets the corresponding
+    /// partial Piece before the caller retries the whole Piece over TCP.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    async fn download_piece_from_parent_over_urma(
+        &self,
+        kind: UrmaPieceKind,
+        piece_id: &str,
+        task_id: &str,
+        number: u32,
+        length: u64,
+        parent_id: &str,
+        tcp_addr: &str,
+    ) -> Result<metadata::Piece> {
+        let Some(downloader) = self.urma_direct_downloader.as_ref() else {
+            return Err(Error::Unknown("urma downloader is disabled".to_string()));
+        };
+
+        let (mut reader, offset, digest) = match kind {
+            UrmaPieceKind::Piece => {
+                downloader
+                    .download_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+            UrmaPieceKind::PersistentPiece => {
+                downloader
+                    .download_persistent_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+            UrmaPieceKind::PersistentCachePiece => {
+                downloader
+                    .download_persistent_cache_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+        };
+
+        let finished = match kind {
+            UrmaPieceKind::Piece => {
+                self.storage
+                    .download_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+            UrmaPieceKind::PersistentPiece => {
+                self.storage
+                    .download_persistent_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+            UrmaPieceKind::PersistentCachePiece => {
+                self.storage
+                    .download_persistent_cache_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+        };
+
+        match finished {
+            Ok(piece) => Ok(piece),
+            Err(error) => {
+                match kind {
+                    UrmaPieceKind::Piece => {
+                        self.storage.download_piece_failed(piece_id)?;
+                        self.storage
+                            .download_piece_started(piece_id, number)
+                            .await?;
+                    }
+                    UrmaPieceKind::PersistentPiece => {
+                        self.storage.download_persistent_piece_failed(piece_id)?;
+                        self.storage
+                            .download_persistent_piece_started(piece_id, number)
+                            .await?;
+                    }
+                    UrmaPieceKind::PersistentCachePiece => {
+                        self.storage
+                            .download_persistent_cache_piece_failed(piece_id)?;
+                        self.storage
+                            .download_persistent_cache_piece_started(piece_id, number)
+                            .await?;
+                    }
+                }
+                Err(error)
             }
         }
     }
@@ -933,6 +1095,36 @@ impl Piece {
             };
         });
 
+        #[cfg(feature = "urma")]
+        if let ("urma", Some(ip), Some(port)) = (
+            self.config.download.protocol.as_str(),
+            parent.download_ip.as_deref(),
+            parent.download_tcp_port,
+        ) {
+            let tcp_addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+            match self
+                .download_piece_from_parent_over_urma(
+                    UrmaPieceKind::PersistentPiece,
+                    piece_id,
+                    task_id,
+                    number,
+                    length,
+                    parent.id.as_str(),
+                    &tcp_addr,
+                )
+                .await
+            {
+                Ok(piece) => {
+                    collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                    scopeguard::ScopeGuard::into_inner(guard);
+                    return Ok(piece);
+                }
+                Err(error) => {
+                    warn!("urma download failed, fall back to tcp downloader: {error}")
+                }
+            }
+        }
+
         let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
             match (parent.download_ip.as_deref(), parent.download_tcp_port) {
                 (Some(ip), Some(port)) => {
@@ -1022,7 +1214,9 @@ impl Piece {
                 }
             }
             #[cfg(feature = "urma")]
-            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+            ("urma", Some(ip), Some(download_tcp_port), _)
+                if self.urma_downloader.is_some() && self.urma_direct_downloader.is_none() =>
+            {
                 let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
                 let urma_downloader = self.urma_downloader.as_ref().unwrap();
                 match urma_downloader
@@ -1409,6 +1603,36 @@ impl Piece {
             };
         });
 
+        #[cfg(feature = "urma")]
+        if let ("urma", Some(ip), Some(port)) = (
+            self.config.download.protocol.as_str(),
+            parent.download_ip.as_deref(),
+            parent.download_tcp_port,
+        ) {
+            let tcp_addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+            match self
+                .download_piece_from_parent_over_urma(
+                    UrmaPieceKind::PersistentCachePiece,
+                    piece_id,
+                    task_id,
+                    number,
+                    length,
+                    parent.id.as_str(),
+                    &tcp_addr,
+                )
+                .await
+            {
+                Ok(piece) => {
+                    collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                    scopeguard::ScopeGuard::into_inner(guard);
+                    return Ok(piece);
+                }
+                Err(error) => {
+                    warn!("urma download failed, fall back to tcp downloader: {error}")
+                }
+            }
+        }
+
         let rdma_tcp_addr = if self.config.download.protocol == "rdma" {
             match (parent.download_ip.as_deref(), parent.download_tcp_port) {
                 (Some(ip), Some(port)) => {
@@ -1498,7 +1722,9 @@ impl Piece {
                 }
             }
             #[cfg(feature = "urma")]
-            ("urma", Some(ip), Some(download_tcp_port), _) if self.urma_downloader.is_some() => {
+            ("urma", Some(ip), Some(download_tcp_port), _)
+                if self.urma_downloader.is_some() && self.urma_direct_downloader.is_none() =>
+            {
                 let addr = format_socket_addr(IpAddr::from_str(&ip)?, download_tcp_port as u16);
                 let urma_downloader = self.urma_downloader.as_ref().unwrap();
                 match urma_downloader
@@ -1772,6 +1998,7 @@ mod tests {
             failure: Some(failure),
             calls: urma_calls.clone(),
         }));
+        piece.urma_direct_downloader = None;
         piece.tcp_downloader = Arc::new(FakeDownloader {
             failure: None,
             calls: tcp_calls.clone(),

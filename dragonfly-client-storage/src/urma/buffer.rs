@@ -350,6 +350,30 @@ impl RegisteredRxWindowLease {
             _test_backing: backing,
         }
     }
+
+    /// Builds an ownerless completed lease for higher-level consumer tests.
+    /// Production leases always carry recycle cores issued by LeaseBook.
+    #[cfg(test)]
+    pub(crate) fn from_test_untracked_parts(parts: Vec<Vec<u8>>) -> Self {
+        let backing = parts
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        let spans = backing
+            .iter()
+            .map(|part| RegisteredSpan {
+                data: NonNull::new(part.as_ptr().cast_mut()).expect("test part is non-empty"),
+                length: part.len(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            length: backing.iter().map(|part| part.len()).sum(),
+            spans,
+            cores: Vec::new(),
+            pipeline_permit: None,
+            _test_backing: backing,
+        }
+    }
 }
 
 /// Exclusive ownership of registered TX backing before any SEND is posted.

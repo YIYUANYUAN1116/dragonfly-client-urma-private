@@ -914,7 +914,7 @@ pub mod rdma {
 #[cfg(feature = "urma")]
 pub mod urma {
     use super::*;
-    use dragonfly_client_storage::client::urma::{discover, UrmaClient};
+    use dragonfly_client_storage::client::urma::{discover, UrmaClient, UrmaStreamReader};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
     use dragonfly_client_storage::urma::PEER_SESSION_IDLE_TIMEOUT;
@@ -1302,6 +1302,70 @@ pub mod urma {
                 },
             );
             Ok(ClientHandle { generation, client })
+        }
+
+        async fn handle_stream_result(
+            &self,
+            addr: &str,
+            handle: ClientHandle,
+            result: dragonfly_client_core::Result<(UrmaStreamReader, u64, String)>,
+        ) -> Result<(UrmaStreamReader, u64, String)> {
+            match result {
+                Ok(downloaded) => Ok(downloaded),
+                Err(err) => {
+                    let fabric_failed = handle.client.fabric_failed();
+                    if fabric_failed {
+                        self.retire_failed_fabric().await;
+                    }
+                    let retired = self.retire_client(addr, handle.generation).await;
+                    if retired || fabric_failed {
+                        self.record_failure(addr, classify_failure(&err));
+                    }
+                    Err(err)
+                }
+            }
+        }
+
+        /// Returns a normal Piece as registered RX windows for the B3 Storage path.
+        pub async fn download_piece_stream(
+            &self,
+            addr: &str,
+            number: u32,
+            task_id: &str,
+        ) -> Result<(UrmaStreamReader, u64, String)> {
+            let handle = self.client(addr).await?;
+            let result = handle.client.download_piece_stream(number, task_id).await;
+            self.handle_stream_result(addr, handle, result).await
+        }
+
+        /// Returns a persistent Piece as registered RX windows.
+        pub async fn download_persistent_piece_stream(
+            &self,
+            addr: &str,
+            number: u32,
+            task_id: &str,
+        ) -> Result<(UrmaStreamReader, u64, String)> {
+            let handle = self.client(addr).await?;
+            let result = handle
+                .client
+                .download_persistent_piece_stream(number, task_id)
+                .await;
+            self.handle_stream_result(addr, handle, result).await
+        }
+
+        /// Returns a persistent-cache Piece as registered RX windows.
+        pub async fn download_persistent_cache_piece_stream(
+            &self,
+            addr: &str,
+            number: u32,
+            task_id: &str,
+        ) -> Result<(UrmaStreamReader, u64, String)> {
+            let handle = self.client(addr).await?;
+            let result = handle
+                .client
+                .download_persistent_cache_piece_stream(number, task_id)
+                .await;
+            self.handle_stream_result(addr, handle, result).await
         }
     }
 

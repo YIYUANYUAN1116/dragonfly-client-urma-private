@@ -921,6 +921,87 @@ impl Storage {
         Ok(piece)
     }
 
+    /// Writes a normal Piece directly from registered URMA receive windows.
+    /// Only the wait for each window is timed out; submitted blocking writes
+    /// are always joined before an error can trigger TCP fallback.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let response = self
+            .content
+            .write_piece_from_urma_stream(piece_id, task_id, offset, length, reader, timeout)
+            .await?;
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        Ok(piece)
+    }
+
+    /// Writes a persistent Piece directly from registered URMA windows.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_persistent_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let response = self
+            .content
+            .write_persistent_piece_from_urma_stream(
+                piece_id, task_id, offset, length, reader, timeout,
+            )
+            .await?;
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        Ok(piece)
+    }
+
+    /// Writes a persistent-cache Piece directly from registered URMA windows.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_persistent_cache_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let response = self
+            .content
+            .write_persistent_cache_piece_from_urma_stream(
+                piece_id, task_id, offset, length, reader, timeout,
+            )
+            .await?;
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        Ok(piece)
+    }
+
     fn finish_parent_piece(
         &self,
         piece_id: &str,

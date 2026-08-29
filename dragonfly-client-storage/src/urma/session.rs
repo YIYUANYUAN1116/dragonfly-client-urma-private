@@ -415,21 +415,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         Ok(lease)
     }
 
-    /// Compatibility wrapper retained until B3 switches Storage to consume
-    /// registered windows directly. It performs one aggregate copy instead of
-    /// Phase A's per-chunk copy plus aggregate copy.
-    pub(crate) async fn receive_next_window(&mut self, timeout: Duration) -> Result<Vec<u8>> {
-        let lease = self.receive_next_window_registered(timeout).await?;
-        let mut bytes = Vec::with_capacity(lease.len());
-        for part in lease.parts() {
-            bytes.extend_from_slice(part);
-        }
-        if let Err(error) = self.fabric.recycle_rx_window(lease).await {
-            return self.abort(error).await;
-        }
-        Ok(bytes)
-    }
-
     pub(crate) fn piece_complete(&self) -> bool {
         self.piece
             .as_ref()

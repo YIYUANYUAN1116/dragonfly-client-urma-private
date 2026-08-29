@@ -22,6 +22,7 @@ use crate::urma::rendezvous::{
 };
 use crate::urma::session::UrmaClientSession;
 use crate::urma::Error as UrmaError;
+use crate::urma::RegisteredRxWindowLease;
 use bytes::Bytes;
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -29,7 +30,9 @@ use futures::channel::mpsc;
 use futures::SinkExt;
 use futures::StreamExt;
 use socket2::{SockRef, TcpKeepalive};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,6 +93,144 @@ mod tests {
 }
 
 type SessionSlot = Arc<tokio::sync::Mutex<Option<UrmaClientSession<TcpStream>>>>;
+
+type WindowRecycleFuture = Pin<Box<dyn Future<Output = Result<usize, UrmaError>> + Send + 'static>>;
+type WindowRecycler =
+    Arc<dyn Fn(RegisteredRxWindowLease) -> WindowRecycleFuture + Send + Sync + 'static>;
+
+/// UrmaStreamReader exposes completed receive windows without copying their
+/// registered backing. The Session transfer task owns the lane and produces
+/// leases; Storage owns each delivered lease until its write and digest finish.
+pub struct UrmaStreamReader {
+    receiver: mpsc::Receiver<io::Result<RegisteredRxWindowLease>>,
+    recycler: WindowRecycler,
+}
+
+impl std::fmt::Debug for UrmaStreamReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("UrmaStreamReader").finish()
+    }
+}
+
+impl UrmaStreamReader {
+    fn new(
+        receiver: mpsc::Receiver<io::Result<RegisteredRxWindowLease>>,
+        fabric: UrmaFabricHandle,
+    ) -> Self {
+        let recycler: WindowRecycler = Arc::new(move |lease| {
+            let fabric = fabric.clone();
+            Box::pin(async move { fabric.recycle_rx_window(lease).await })
+        });
+        Self { receiver, recycler }
+    }
+
+    /// Returns the next completed logical receive window. `None` is returned
+    /// only after the transfer task has validated Done and closed the channel.
+    pub async fn next_window(&mut self) -> io::Result<Option<UrmaReceivedWindow>> {
+        match self.receiver.next().await {
+            Some(Ok(lease)) => Ok(Some(UrmaReceivedWindow {
+                lease: Some(lease),
+                recycler: self.recycler.clone(),
+            })),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    /// Adapts the registered-window reader to Dragonfly's transport-neutral
+    /// stream contract. This is the compatibility path for generic Downloader
+    /// users; the production Piece path consumes [`Self::next_window`]
+    /// directly and performs no staging copy.
+    pub fn into_content_stream(self) -> PieceContentStream {
+        futures::stream::try_unfold(self, |mut reader| async move {
+            let Some(window) = reader.next_window().await? else {
+                return Ok(None);
+            };
+            let mut bytes = Vec::with_capacity(window.len());
+            for part in window.parts() {
+                bytes.extend_from_slice(part);
+            }
+            window.recycle().await?;
+            Ok(Some((Bytes::from(bytes), reader)))
+        })
+        .boxed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_windows(
+        windows: Vec<Vec<Vec<u8>>>,
+    ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let (mut sender, receiver) = mpsc::channel(windows.len().max(1));
+        for parts in windows {
+            sender
+                .try_send(Ok(RegisteredRxWindowLease::from_test_untracked_parts(
+                    parts,
+                )))
+                .expect("test window channel capacity");
+        }
+        drop(sender);
+
+        let recycled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recycler: WindowRecycler = {
+            let recycled = recycled.clone();
+            Arc::new(move |lease| {
+                let recycled = recycled.clone();
+                Box::pin(async move {
+                    let length = lease.len();
+                    drop(lease);
+                    recycled.fetch_add(1, Ordering::AcqRel);
+                    Ok(length)
+                })
+            })
+        };
+        (Self { receiver, recycler }, recycled)
+    }
+}
+
+/// One immutable logical URMA receive window. It can contain multiple
+/// registered spans, including a short tail span. Explicit recycle waits for
+/// the owner thread to validate and release every covered slot.
+pub struct UrmaReceivedWindow {
+    lease: Option<RegisteredRxWindowLease>,
+    recycler: WindowRecycler,
+}
+
+impl UrmaReceivedWindow {
+    pub fn len(&self) -> usize {
+        self.lease.as_ref().map_or(0, RegisteredRxWindowLease::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn parts(&self) -> impl Iterator<Item = &[u8]> {
+        self.lease
+            .as_ref()
+            .expect("URMA receive window was already recycled")
+            .parts()
+    }
+
+    pub async fn recycle(mut self) -> io::Result<()> {
+        let lease = self
+            .lease
+            .take()
+            .expect("URMA receive window was already recycled");
+        (self.recycler)(lease)
+            .await
+            .map(|_| ())
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+impl std::fmt::Debug for UrmaReceivedWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UrmaReceivedWindow")
+            .field("length", &self.len())
+            .finish()
+    }
+}
 
 /// discover asks the parent's already-advertised TCP piece endpoint for its live
 /// URMA capability and rendezvous port. Non-URMA peers simply fail this optional
@@ -255,9 +396,7 @@ impl UrmaClient {
         }
     }
 
-    /// Downloads a piece from the parent, returning the piece content stream,
-    /// offset, and digest exactly like the TCP and QUIC clients so digest
-    /// verification upstream is byte-identical.
+    /// Downloads a piece through the transport-neutral compatibility stream.
     #[instrument(skip_all, fields(parent_addr))]
     pub async fn download_piece(
         &self,
@@ -265,6 +404,23 @@ impl UrmaClient {
         task_id: &str,
     ) -> ClientResult<(PieceContentStream, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
+        let (reader, offset, digest) = time::timeout(
+            self.config.download.piece_timeout,
+            self.handle_download(PieceKind::Piece, number, task_id),
+        )
+        .await
+        .inspect_err(|err| {
+            error!("urma download timeout from {}: {}", self.addr, err);
+        })??;
+        Ok((reader.into_content_stream(), offset, digest))
+    }
+
+    /// Downloads a normal Piece while preserving registered RX window leases.
+    pub async fn download_piece_stream(
+        &self,
+        number: u32,
+        task_id: &str,
+    ) -> ClientResult<(UrmaStreamReader, u64, String)> {
         time::timeout(
             self.config.download.piece_timeout,
             self.handle_download(PieceKind::Piece, number, task_id),
@@ -283,6 +439,23 @@ impl UrmaClient {
         task_id: &str,
     ) -> ClientResult<(PieceContentStream, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
+        let (reader, offset, digest) = time::timeout(
+            self.config.download.piece_timeout,
+            self.handle_download(PieceKind::PersistentPiece, number, task_id),
+        )
+        .await
+        .inspect_err(|err| {
+            error!("urma download timeout from {}: {}", self.addr, err);
+        })??;
+        Ok((reader.into_content_stream(), offset, digest))
+    }
+
+    /// Downloads a persistent Piece while preserving registered RX leases.
+    pub async fn download_persistent_piece_stream(
+        &self,
+        number: u32,
+        task_id: &str,
+    ) -> ClientResult<(UrmaStreamReader, u64, String)> {
         time::timeout(
             self.config.download.piece_timeout,
             self.handle_download(PieceKind::PersistentPiece, number, task_id),
@@ -301,6 +474,23 @@ impl UrmaClient {
         task_id: &str,
     ) -> ClientResult<(PieceContentStream, u64, String)> {
         Span::current().record("parent_addr", self.addr.as_str());
+        let (reader, offset, digest) = time::timeout(
+            self.config.download.piece_timeout,
+            self.handle_download(PieceKind::PersistentCachePiece, number, task_id),
+        )
+        .await
+        .inspect_err(|err| {
+            error!("urma download timeout from {}: {}", self.addr, err);
+        })??;
+        Ok((reader.into_content_stream(), offset, digest))
+    }
+
+    /// Downloads a persistent-cache Piece while preserving registered RX leases.
+    pub async fn download_persistent_cache_piece_stream(
+        &self,
+        number: u32,
+        task_id: &str,
+    ) -> ClientResult<(UrmaStreamReader, u64, String)> {
         time::timeout(
             self.config.download.piece_timeout,
             self.handle_download(PieceKind::PersistentCachePiece, number, task_id),
@@ -322,7 +512,7 @@ impl UrmaClient {
         kind: PieceKind,
         number: u32,
         task_id: &str,
-    ) -> ClientResult<(PieceContentStream, u64, String)> {
+    ) -> ClientResult<(UrmaStreamReader, u64, String)> {
         // The owned guard is moved into the transfer task. This serializes
         // Piece requests on the persistent lane without exposing Session above
         // the storage adapter.
@@ -388,7 +578,8 @@ impl UrmaClient {
         );
 
         let (mut window_tx, window_rx) =
-            mpsc::channel::<io::Result<Bytes>>(WINDOW_CHANNEL_CAPACITY);
+            mpsc::channel::<io::Result<RegisteredRxWindowLease>>(WINDOW_CHANNEL_CAPACITY);
+        let reader = UrmaStreamReader::new(window_rx, self.fabric.clone());
         let transfer_timeout = self.transfer_timeout;
         let piece_timeout = self.config.download.piece_timeout;
         let transfer_state = self.transfer_state.clone();
@@ -398,15 +589,15 @@ impl UrmaClient {
             let mut transfer = Box::pin(async {
                 let mut completed_windows = 0u64;
                 loop {
-                    let window = session.receive_next_window(transfer_timeout).await?;
+                    let window = session
+                        .receive_next_window_registered(transfer_timeout)
+                        .await?;
                     completed_windows += 1;
                     if fail_after_recv_windows == Some(completed_windows) {
                         // Publish a non-final completed window first so Storage contains a real
                         // partial Piece when the normal error/fallback path resets it. The final
                         // window stays behind the existing Done gate.
-                        if !session.piece_complete()
-                            && window_tx.send(Ok(Bytes::from(window))).await.is_err()
-                        {
+                        if !session.piece_complete() && window_tx.send(Ok(window)).await.is_err() {
                             transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
                             return Ok(());
                         }
@@ -428,10 +619,10 @@ impl UrmaClient {
                         *session_slot = Some(session);
                         drop(session_slot);
                         transfer_state.store(TRANSFER_SUCCEEDED, Ordering::Release);
-                        let _ = window_tx.send(Ok(Bytes::from(window))).await;
+                        let _ = window_tx.send(Ok(window)).await;
                         return Ok::<(), UrmaError>(());
                     }
-                    if window_tx.send(Ok(Bytes::from(window))).await.is_err() {
+                    if window_tx.send(Ok(window)).await.is_err() {
                         // This is local cancellation, not evidence that the
                         // parent is unhealthy. Dropping Session aborts the lane.
                         transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
@@ -458,6 +649,6 @@ impl UrmaClient {
             // the lifecycle command path. The empty slot forces reconnect.
         });
 
-        Ok((window_rx.boxed(), result_offset, result_digest))
+        Ok((reader, result_offset, result_digest))
     }
 }
