@@ -1,4 +1,10 @@
-use super::{buffer::BufferPoolConfig, Error, Result};
+use super::{
+    buffer::{
+        BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
+        TxWindowLease,
+    },
+    Error, Result,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeConfig {
@@ -124,7 +130,10 @@ mod native {
     }
 
     impl UrmaRuntime {
-        pub(crate) fn start(config: RuntimeConfig) -> Result<Self> {
+        pub(crate) fn start(
+            config: RuntimeConfig,
+            recycle_notifier: LeaseRecycleNotifier,
+        ) -> Result<Self> {
             if ACTIVE
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
@@ -132,7 +141,7 @@ mod native {
                 return Err(Error::AlreadyInitialized);
             }
 
-            match Self::start_inner(config) {
+            match Self::start_inner(config, recycle_notifier) {
                 Ok(runtime) => Ok(runtime),
                 Err(error) => {
                     if !matches!(&error, Error::StartupRollback { .. }) {
@@ -143,7 +152,10 @@ mod native {
             }
         }
 
-        fn start_inner(config: RuntimeConfig) -> Result<Self> {
+        fn start_inner(
+            config: RuntimeConfig,
+            recycle_notifier: LeaseRecycleNotifier,
+        ) -> Result<Self> {
             let device = CString::new(config.device_name.as_str()).map_err(|_| {
                 Error::InvalidConfiguration("device name contains an interior NUL byte".into())
             })?;
@@ -183,8 +195,11 @@ mod native {
                         ));
                     }
                 };
-            let buffer_pool = match UrmaBufferPool::create(&mut native, config.buffer_pool.clone())
-            {
+            let buffer_pool = match UrmaBufferPool::create(
+                &mut native,
+                config.buffer_pool.clone(),
+                recycle_notifier,
+            ) {
                 Ok(pool) => pool,
                 Err(primary) => {
                     return Err(rollback_startup(
@@ -332,6 +347,37 @@ mod native {
 
         pub(crate) fn outstanding(&self) -> usize {
             self.completions.outstanding()
+        }
+
+        pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .recycle_dropped_lease(recycle)
+        }
+
+        pub(crate) fn acquire_tx_window(&mut self, length: usize) -> Result<TxWindowLease> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .acquire_tx_window(length)
+        }
+
+        pub(crate) fn recycle_tx_window(&mut self, lease: TxWindowLease) -> Result<usize> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .recycle_tx_lease(lease)
+        }
+
+        pub(crate) fn recycle_rx_window(
+            &mut self,
+            lease: RegisteredRxWindowLease,
+        ) -> Result<usize> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .recycle_rx_lease(lease)
         }
 
         pub(crate) fn transport_type(&self) -> u32 {

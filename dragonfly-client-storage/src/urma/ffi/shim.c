@@ -351,6 +351,18 @@ int dfurma_segment_read(const dfurma_segment_t *segment, uint64_t offset,
     return 0;
 }
 
+int dfurma_segment_data(dfurma_segment_t *segment, uint8_t **data,
+                          uint64_t *length)
+{
+    if (segment == NULL || segment->segment == NULL ||
+        segment->memory == NULL || data == NULL || length == NULL) {
+        return -EINVAL;
+    }
+    *data = (uint8_t *)segment->memory;
+    *length = segment->length;
+    return 0;
+}
+
 int dfurma_jetty_create(dfurma_runtime_t *runtime,
                           dfurma_jfc_t *send_jfc,
                           dfurma_jfc_t *recv_jfc,

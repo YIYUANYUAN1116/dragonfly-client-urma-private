@@ -28,7 +28,7 @@ impl TryFrom<u8> for OperationType {
 }
 
 /// Pointer-free user_ctx encoding:
-/// `[lane:16][generation:8][operation:8][slot:32]`.
+/// `[lane:16][generation:8][operation:8][slot-generation:16|slot-index:16]`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WrToken {
     pub(crate) lane_id: u16,
@@ -44,12 +44,10 @@ impl WrToken {
                 "lane id and generation must be non-zero".into(),
             ));
         }
-        let slot = u32::try_from(self.slot.index())
-            .map_err(|_| Error::InvalidConfiguration("slot id exceeds 32 bits".into()))?;
         Ok((u64::from(self.lane_id) << 48)
             | (u64::from(self.generation) << 40)
             | (u64::from(self.operation as u8) << 32)
-            | u64::from(slot))
+            | u64::from(self.slot.encode()))
     }
 
     pub(crate) fn decode(value: u64) -> Result<Self> {
@@ -63,7 +61,7 @@ impl WrToken {
             lane_id,
             generation,
             operation,
-            slot: SlotId::from_index((value & 0xffff_ffff) as usize),
+            slot: SlotId::decode((value & 0xffff_ffff) as u32)?,
         })
     }
 }
@@ -609,7 +607,7 @@ mod tests {
             lane_id: 9,
             generation: 2,
             operation: OperationType::Recv,
-            slot: SlotId::from_index(1234),
+            slot: SlotId::new(1234, 7).unwrap(),
         };
         assert_eq!(WrToken::decode(token.encode().unwrap()), Ok(token));
     }

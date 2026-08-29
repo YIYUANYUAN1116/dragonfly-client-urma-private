@@ -7,6 +7,7 @@
 //! UMDK handle.
 
 use super::{
+    buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
     completion::{LaneCompletion, OperationCompletionTx},
     lane::{JettyConfig, JettyDescriptor},
     runtime::{RuntimeConfig, UrmaRuntime},
@@ -165,9 +166,18 @@ impl UrmaFabric {
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
 
         let runtime_config = config.clone();
+        let recycle_command_tx = command_tx.clone();
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
-            .spawn(move || run_owner(config, command_rx, readiness_tx, startup_tx))
+            .spawn(move || {
+                run_owner(
+                    config,
+                    command_rx,
+                    recycle_command_tx,
+                    readiness_tx,
+                    startup_tx,
+                )
+            })
             .map_err(|error| {
                 Error::InvalidConfiguration(format!("failed to spawn URMA owner thread: {error}"))
             })?;
@@ -308,6 +318,24 @@ impl UrmaFabricHandle {
         .await
     }
 
+    #[allow(dead_code)] // B1 ownership API, consumed by B4.
+    pub(crate) async fn acquire_tx_window(&self, length: usize) -> Result<TxWindowLease> {
+        self.submit(|reply| FabricCommand::AcquireTxWindow { length, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // B1 ownership API, consumed by B4.
+    pub(crate) async fn recycle_tx_window(&self, lease: TxWindowLease) -> Result<usize> {
+        self.submit_urgent(|reply| FabricCommand::RecycleTxWindow { lease, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // B1 ownership API, consumed by B2/B3.
+    pub(crate) async fn recycle_rx_window(&self, lease: RegisteredRxWindowLease) -> Result<usize> {
+        self.submit_urgent(|reply| FabricCommand::RecycleRxWindow { lease, reply })
+            .await
+    }
+
     pub(crate) async fn send(
         &self,
         lane_id: u16,
@@ -363,6 +391,19 @@ impl UrmaFabricHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         command_tx
             .send(CommandEnvelope::admitted(make_command(reply_tx), permit))
+            .map_err(|_| fabric_stopped())?;
+        reply_rx.await.map_err(|_| fabric_stopped())?
+    }
+
+    #[allow(dead_code)] // Called by the B1 lease APIs once B2/B4 select them.
+    async fn submit_urgent<T>(
+        &self,
+        make_command: impl FnOnce(oneshot::Sender<Result<T>>) -> FabricCommand,
+    ) -> Result<T> {
+        let command_tx = self.command_sender()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(CommandEnvelope::urgent(make_command(reply_tx)))
             .map_err(|_| fabric_stopped())?;
         reply_rx.await.map_err(|_| fabric_stopped())?
     }
@@ -468,6 +509,21 @@ enum FabricCommand {
         count: u32,
         reply: oneshot::Sender<Result<()>>,
     },
+    #[allow(dead_code)] // B1 foundation, selected by B4.
+    AcquireTxWindow {
+        length: usize,
+        reply: oneshot::Sender<Result<TxWindowLease>>,
+    },
+    #[allow(dead_code)] // B1 foundation, selected by B4.
+    RecycleTxWindow {
+        lease: TxWindowLease,
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    #[allow(dead_code)] // B1 foundation, selected by B2/B3.
+    RecycleRxWindow {
+        lease: RegisteredRxWindowLease,
+        reply: oneshot::Sender<Result<usize>>,
+    },
     Send {
         lane_id: u16,
         bytes: Vec<u8>,
@@ -482,6 +538,9 @@ enum FabricCommand {
     AbortLane {
         lane_id: u16,
         reply: oneshot::Sender<Result<()>>,
+    },
+    RecycleLease {
+        recycle: LeaseRecycle,
     },
     Shutdown {
         reply: Option<oneshot::Sender<Result<()>>>,
@@ -512,10 +571,16 @@ impl CommandEnvelope {
 fn run_owner(
     config: RuntimeConfig,
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
+    recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
     startup_tx: std_mpsc::SyncSender<Result<(u32, u64)>>,
 ) {
-    let runtime = match UrmaRuntime::start(config) {
+    let recycle_notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
+        let _ = recycle_command_tx.send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
+            recycle,
+        }));
+    });
+    let runtime = match UrmaRuntime::start(config, recycle_notifier) {
         Ok(runtime) => runtime,
         Err(error) => {
             readiness_tx.send_replace(FabricReadiness::Failed(error.to_string()));
@@ -645,6 +710,20 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
+        FabricCommand::AcquireTxWindow { length, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.acquire_tx_window(length));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::RecycleTxWindow { lease, reply } => {
+            let _ = reply.send(runtime.recycle_tx_window(lease));
+            OwnerControl::Continue
+        }
+        FabricCommand::RecycleRxWindow { lease, reply } => {
+            let _ = reply.send(runtime.recycle_rx_window(lease));
+            OwnerControl::Continue
+        }
         FabricCommand::Send {
             lane_id,
             bytes,
@@ -663,6 +742,12 @@ fn handle_command(
         }
         FabricCommand::AbortLane { lane_id, reply } => {
             let _ = reply.send(runtime.abort_lane(lane_id));
+            OwnerControl::Continue
+        }
+        FabricCommand::RecycleLease { recycle } => {
+            if let Err(error) = runtime.recycle_dropped_lease(recycle) {
+                tracing::error!(%error, "failed to recycle dropped URMA registered lease");
+            }
             OwnerControl::Continue
         }
         FabricCommand::Shutdown { reply } => OwnerControl::Shutdown(reply),
@@ -765,11 +850,38 @@ fn join_owner(join: &Mutex<Option<JoinHandle<()>>>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::urma::buffer::{LeaseBook, LeaseKind, SlotId};
 
     #[test]
     fn zero_command_capacity_is_rejected_before_spawning() {
         let result = UrmaFabric::start_with_capacity(RuntimeConfig::new("urma0", 0), 0);
         assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn dropped_registered_lease_uses_urgent_owner_command() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
+            command_tx
+                .send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
+                    recycle,
+                }))
+                .unwrap();
+        });
+        let mut leases = LeaseBook::new();
+        let recycle = leases
+            .issue(LeaseKind::Rx, vec![SlotId::new(7, 3).unwrap()])
+            .unwrap();
+        let lease =
+            RegisteredRxWindowLease::from_test_parts(vec![vec![1, 2, 3]], recycle, notifier);
+
+        drop(lease);
+        let envelope = command_rx.try_recv().unwrap();
+        assert!(envelope._permit.is_none());
+        assert!(matches!(
+            envelope.command,
+            FabricCommand::RecycleLease { recycle: actual } if actual == recycle
+        ));
     }
 
     #[test]

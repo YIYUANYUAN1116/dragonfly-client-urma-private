@@ -283,6 +283,20 @@ impl SegmentHandle {
         })?;
         Ok(out)
     }
+
+    /// Returns the ordinary CPU-visible allocation registered by the shim.
+    /// The pointer remains valid until this Segment is successfully closed.
+    pub(crate) fn data(&self) -> Result<(NonNull<u8>, usize), FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let mut data = std::ptr::null_mut();
+        let mut length = 0u64;
+        // SAFETY: `raw` is live and both outputs are valid writable pointers.
+        status_result(unsafe { sys::dfurma_segment_data(raw.as_ptr(), &mut data, &mut length) })?;
+        let data = NonNull::new(data).ok_or(FfiError::NullHandle)?;
+        let length = usize::try_from(length)
+            .map_err(|_| FfiError::Contract("Segment length exceeds usize"))?;
+        Ok((data, length))
+    }
 }
 
 impl Drop for SegmentHandle {

@@ -100,6 +100,9 @@ int dfurma_segment_write(dfurma_segment_t *segment, uint64_t offset,
                          const uint8_t *data, uint32_t length);
 int dfurma_segment_read(const dfurma_segment_t *segment, uint64_t offset,
                         uint8_t *out, uint32_t length);
+/* Returns the CPU-visible backing range owned by the live Segment wrapper. */
+int dfurma_segment_data(dfurma_segment_t *segment, uint8_t **data,
+                        uint64_t *length);
 
 /* Creates one RC duplex Jetty backed by an owned shared JFR. */
 int dfurma_jetty_create(dfurma_runtime_t *runtime,

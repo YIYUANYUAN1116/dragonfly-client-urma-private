@@ -1,4 +1,12 @@
 use super::{native_error, Error, Result};
+use std::{
+    collections::HashMap,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BufferPoolConfig {
@@ -40,6 +48,11 @@ impl BufferPoolConfig {
             .tx_slot_count
             .checked_add(self.rx_slot_count)
             .ok_or_else(|| Error::InvalidConfiguration("slot count overflow".into()))?;
+        if slots > usize::from(u16::MAX) + 1 {
+            return Err(Error::InvalidConfiguration(
+                "buffer pool cannot exceed 65536 slots".into(),
+            ));
+        }
         self.slot_size
             .checked_mul(slots)
             .ok_or_else(|| Error::InvalidConfiguration("buffer pool size overflow".into()))
@@ -60,18 +73,267 @@ pub(crate) enum SlotState {
     RecvCompleted,
     SendPosted,
     SendCompleted,
+    LeasedRx,
+    LeasedTx,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SlotId(usize);
+pub(crate) struct SlotId {
+    index: u16,
+    generation: u16,
+}
 
 impl SlotId {
     pub(crate) fn index(self) -> usize {
-        self.0
+        usize::from(self.index)
     }
 
-    pub(crate) fn from_index(index: usize) -> Self {
-        Self(index)
+    pub(crate) fn generation(self) -> u16 {
+        self.generation
+    }
+
+    pub(crate) fn encode(self) -> u32 {
+        (u32::from(self.generation) << 16) | u32::from(self.index)
+    }
+
+    pub(crate) fn decode(encoded: u32) -> Result<Self> {
+        let generation = (encoded >> 16) as u16;
+        if generation == 0 {
+            return Err(Error::Protocol(
+                "slot identity has a zero generation".into(),
+            ));
+        }
+        Ok(Self {
+            index: encoded as u16,
+            generation,
+        })
+    }
+
+    pub(crate) fn new(index: usize, generation: u16) -> Result<Self> {
+        if generation == 0 {
+            return Err(Error::InvalidConfiguration(
+                "slot generation must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            index: u16::try_from(index)
+                .map_err(|_| Error::InvalidConfiguration("slot index exceeds 16 bits".into()))?,
+            generation,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaseKind {
+    Rx,
+    Tx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct LeaseRecycle {
+    pool_id: u64,
+    lease_id: u64,
+}
+
+pub(crate) type LeaseRecycleNotifier = Arc<dyn Fn(LeaseRecycle) + Send + Sync>;
+
+#[derive(Debug)]
+struct LeaseRecord {
+    kind: LeaseKind,
+    slots: Vec<SlotId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LeaseBook {
+    pool_id: u64,
+    next_lease_id: u64,
+    active: HashMap<u64, LeaseRecord>,
+}
+
+impl LeaseBook {
+    pub(crate) fn new() -> Self {
+        static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            pool_id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            next_lease_id: 1,
+            active: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn issue(&mut self, kind: LeaseKind, slots: Vec<SlotId>) -> Result<LeaseRecycle> {
+        if slots.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "registered lease requires at least one slot".into(),
+            ));
+        }
+        let lease_id = self.next_lease_id;
+        self.next_lease_id = self
+            .next_lease_id
+            .checked_add(1)
+            .filter(|id| *id != 0)
+            .ok_or_else(|| Error::InvalidConfiguration("lease id space exhausted".into()))?;
+        self.active.insert(lease_id, LeaseRecord { kind, slots });
+        Ok(LeaseRecycle {
+            pool_id: self.pool_id,
+            lease_id,
+        })
+    }
+
+    fn record(&self, recycle: LeaseRecycle) -> Result<&LeaseRecord> {
+        if recycle.pool_id != self.pool_id {
+            return Err(Error::Protocol(
+                "registered lease belongs to another pool".into(),
+            ));
+        }
+        self.active
+            .get(&recycle.lease_id)
+            .ok_or_else(|| Error::Protocol("registered lease was already recycled".into()))
+    }
+
+    fn finish(&mut self, recycle: LeaseRecycle) -> Result<LeaseRecord> {
+        self.record(recycle)?;
+        Ok(self
+            .active
+            .remove(&recycle.lease_id)
+            .expect("lease presence checked above"))
+    }
+
+    fn active(&self) -> usize {
+        self.active.len()
+    }
+
+    fn ensure_empty(&self) -> Result<()> {
+        if self.active.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfiguration(format!(
+                "cannot close registered Segment with {} active leases",
+                self.active.len()
+            )))
+        }
+    }
+}
+
+struct LeaseCore {
+    recycle: Option<LeaseRecycle>,
+    notifier: LeaseRecycleNotifier,
+}
+
+impl LeaseCore {
+    fn recycle(&self) -> Result<LeaseRecycle> {
+        self.recycle
+            .as_ref()
+            .copied()
+            .ok_or_else(|| Error::Protocol("registered lease was already consumed".into()))
+    }
+
+    fn disarm(&mut self) {
+        self.recycle = None;
+    }
+}
+
+impl Drop for LeaseCore {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            (self.notifier)(recycle);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // B1 foundation; read by the B2 direct-RX consumer.
+struct RegisteredSpan {
+    data: NonNull<u8>,
+    length: usize,
+}
+
+/// Immutable ownership of a completed registered RX window. The native
+/// handles remain on the owner thread; this value only exposes validated CPU
+/// spans after all corresponding receive CQEs completed.
+#[allow(dead_code)] // B1 foundation; published by B2.
+pub(crate) struct RegisteredRxWindowLease {
+    spans: Vec<RegisteredSpan>,
+    length: usize,
+    core: LeaseCore,
+    #[cfg(test)]
+    _test_backing: Vec<Box<[u8]>>,
+}
+
+// SAFETY: the pool changes every covered slot to LeasedRx before construction.
+// No receive can be reposted until the owner consumes the recycle token, and
+// the only exposed access is shared and immutable.
+unsafe impl Send for RegisteredRxWindowLease {}
+// SAFETY: concurrent readers cannot mutate the leased registered spans.
+unsafe impl Sync for RegisteredRxWindowLease {}
+
+#[allow(dead_code)] // B1 foundation; published by B2.
+impl RegisteredRxWindowLease {
+    pub(crate) fn parts(&self) -> impl Iterator<Item = &[u8]> {
+        self.spans.iter().map(|span| {
+            // SAFETY: construction bounds-checks every span against the live
+            // Segment and pool close refuses while this lease is active.
+            unsafe { std::slice::from_raw_parts(span.data.as_ptr(), span.length) }
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        parts: Vec<Vec<u8>>,
+        recycle: LeaseRecycle,
+        notifier: LeaseRecycleNotifier,
+    ) -> Self {
+        let backing = parts
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        let spans = backing
+            .iter()
+            .map(|part| RegisteredSpan {
+                data: NonNull::new(part.as_ptr().cast_mut()).expect("test part is non-empty"),
+                length: part.len(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            length: backing.iter().map(|part| part.len()).sum(),
+            spans,
+            core: LeaseCore {
+                recycle: Some(recycle),
+                notifier,
+            },
+            _test_backing: backing,
+        }
+    }
+}
+
+/// Exclusive ownership of registered TX backing before any SEND is posted.
+/// B4 will consume this lease into operation ownership; until then callers may
+/// fill the logical window directly without an intermediate Vec.
+#[allow(dead_code)] // B1 foundation; filled and posted by B4.
+pub(crate) struct TxWindowLease {
+    data: NonNull<u8>,
+    length: usize,
+    core: LeaseCore,
+    #[cfg(test)]
+    _test_backing: Box<[u8]>,
+}
+
+// SAFETY: TxWindowLease is exclusive, is not Sync, and its slots cannot be
+// posted or allocated again until the owner consumes its recycle token.
+unsafe impl Send for TxWindowLease {}
+
+#[allow(dead_code)] // B1 foundation; filled and posted by B4.
+impl TxWindowLease {
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: exclusive lease ownership guarantees unique CPU access.
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.length) }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
     }
 }
 
@@ -100,6 +362,7 @@ struct BufferSlot {
     offset: usize,
     len: usize,
     state: SlotState,
+    generation: u16,
 }
 
 mod native {
@@ -137,6 +400,8 @@ mod native {
         slots: Vec<BufferSlot>,
         free_tx: Vec<usize>,
         free_rx: VecDeque<usize>,
+        leases: LeaseBook,
+        recycle_notifier: LeaseRecycleNotifier,
         accepting: bool,
     }
 
@@ -144,6 +409,7 @@ mod native {
         pub(crate) fn create(
             runtime: &mut ffi::NativeRuntime,
             config: BufferPoolConfig,
+            recycle_notifier: LeaseRecycleNotifier,
         ) -> Result<Self> {
             let total_len = config.total_len()?;
             let segment = UrmaRegisteredSegment::create(runtime, total_len, config.alignment)?;
@@ -158,6 +424,7 @@ mod native {
                     offset: slot_offset(&config, index)?,
                     len: config.slot_size,
                     state: SlotState::Free,
+                    generation: 0,
                 });
             }
             for index in 0..config.rx_slot_count {
@@ -171,6 +438,7 @@ mod native {
                     )?,
                     len: config.slot_size,
                     state: SlotState::Free,
+                    generation: 0,
                 });
             }
             let free_tx = (0..config.tx_slot_count).rev().collect();
@@ -180,6 +448,8 @@ mod native {
                 slots,
                 free_tx,
                 free_rx,
+                leases: LeaseBook::new(),
+                recycle_notifier,
                 accepting: true,
             })
         }
@@ -195,14 +465,22 @@ mod native {
             let slot = self.slots.get_mut(index)?;
             debug_assert_eq!(slot.kind, kind);
             debug_assert_eq!(slot.state, SlotState::Free);
+            slot.generation = slot.generation.wrapping_add(1);
+            if slot.generation == 0 {
+                slot.generation = 1;
+            }
             slot.state = SlotState::Allocated;
-            Some(SlotId(index))
+            SlotId::new(index, slot.generation).ok()
         }
 
         pub(crate) fn release(&mut self, id: SlotId) -> Result<()> {
-            let slot = self.slots.get_mut(id.0).ok_or_else(|| {
+            let index = id.index();
+            let slot = self.slots.get_mut(index).ok_or_else(|| {
                 Error::InvalidConfiguration("slot id is outside this buffer pool".into())
             })?;
+            if slot.generation != id.generation() {
+                return Err(Error::Protocol("stale slot generation".into()));
+            }
             if !matches!(
                 slot.state,
                 SlotState::Allocated | SlotState::RecvCompleted | SlotState::SendCompleted
@@ -213,8 +491,8 @@ mod native {
             }
             slot.state = SlotState::Free;
             match slot.kind {
-                SlotKind::Tx => self.free_tx.push(id.0),
-                SlotKind::Rx => self.free_rx.push_back(id.0),
+                SlotKind::Tx => self.free_tx.push(index),
+                SlotKind::Rx => self.free_rx.push_back(index),
             }
             Ok(())
         }
@@ -265,11 +543,7 @@ mod native {
         }
 
         pub(crate) fn mark_posted(&mut self, id: SlotId, kind: SlotKind) -> Result<()> {
-            let expected_kind = self
-                .slots
-                .get(id.0)
-                .ok_or_else(|| Error::Protocol("completion slot is outside buffer pool".into()))?
-                .kind;
+            let (_, _, expected_kind, _) = self.slot_fields(id)?;
             if expected_kind != kind {
                 return Err(Error::Protocol(
                     "WR operation does not match slot kind".into(),
@@ -338,22 +612,269 @@ mod native {
             Ok(ReceivedChunk { bytes })
         }
 
+        /// Marks one RX CQE complete without copying its registered bytes.
+        /// B2 will group these completions into a published window lease.
+        #[allow(dead_code)] // Selected by the B2 completion route.
+        pub(crate) fn complete_recv_leased(&mut self, id: SlotId, length: u32) -> Result<()> {
+            let (_, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Rx || state != SlotState::PostedRecv {
+                return Err(Error::Protocol(
+                    "RECV CQE does not match a posted RX slot".into(),
+                ));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+            if length == 0 || length > capacity {
+                return Err(Error::Protocol(format!(
+                    "RECV completion length {length} is outside 1..={capacity}"
+                )));
+            }
+            self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)
+        }
+
+        #[allow(dead_code)] // Selected by the B2 completion route.
+        pub(crate) fn lease_completed_rx_window(
+            &mut self,
+            completions: &[(SlotId, u32)],
+        ) -> Result<RegisteredRxWindowLease> {
+            if completions.is_empty() {
+                return Err(Error::InvalidConfiguration(
+                    "RX window lease requires at least one completion".into(),
+                ));
+            }
+            let (base, registered_len) = self
+                .segment_handle()?
+                .data()
+                .map_err(|error| native_error("borrow_rx_window", error))?;
+            let mut spans: Vec<RegisteredSpan> = Vec::with_capacity(completions.len());
+            let mut slots = Vec::with_capacity(completions.len());
+            let mut total = 0usize;
+            let mut previous_end = None;
+            for (position, &(slot, length)) in completions.iter().enumerate() {
+                let (offset, capacity, kind, state) = self.slot_fields(slot)?;
+                let length = usize::try_from(length)
+                    .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+                if kind != SlotKind::Rx || state != SlotState::RecvCompleted {
+                    return Err(Error::Protocol(
+                        "RX lease requires completed receive slots".into(),
+                    ));
+                }
+                if length == 0 || length > capacity {
+                    return Err(Error::Protocol("invalid RX lease chunk length".into()));
+                }
+                if position + 1 != completions.len() && length != capacity {
+                    return Err(Error::Protocol(
+                        "only the final RX lease chunk may be short".into(),
+                    ));
+                }
+                let end = offset
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Protocol("RX lease offset overflow".into()))?;
+                if end > registered_len {
+                    return Err(Error::Protocol(
+                        "RX lease span exceeds registered Segment".into(),
+                    ));
+                }
+                // SAFETY: offset..end was checked against the live Segment.
+                let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
+                if previous_end == Some(offset) {
+                    let previous = spans.last_mut().expect("previous span exists");
+                    previous.length = previous
+                        .length
+                        .checked_add(length)
+                        .ok_or_else(|| Error::Protocol("RX lease length overflow".into()))?;
+                } else {
+                    spans.push(RegisteredSpan { data, length });
+                }
+                previous_end = Some(end);
+                total = total
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Protocol("RX lease length overflow".into()))?;
+                slots.push(slot);
+            }
+            for &slot in &slots {
+                self.transition(slot, SlotState::RecvCompleted, SlotState::LeasedRx)?;
+            }
+            let recycle = match self.leases.issue(LeaseKind::Rx, slots.clone()) {
+                Ok(recycle) => recycle,
+                Err(error) => {
+                    for slot in slots {
+                        self.transition(slot, SlotState::LeasedRx, SlotState::RecvCompleted)?;
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(RegisteredRxWindowLease {
+                spans,
+                length: total,
+                core: LeaseCore {
+                    recycle: Some(recycle),
+                    notifier: self.recycle_notifier.clone(),
+                },
+                #[cfg(test)]
+                _test_backing: Vec::new(),
+            })
+        }
+
+        pub(crate) fn acquire_tx_window(&mut self, length: usize) -> Result<TxWindowLease> {
+            if length == 0 {
+                return Err(Error::InvalidConfiguration(
+                    "TX window lease length must be non-zero".into(),
+                ));
+            }
+            let slot_capacity = self
+                .slots
+                .iter()
+                .find(|slot| slot.kind == SlotKind::Tx)
+                .map(|slot| slot.len)
+                .ok_or_else(|| Error::InvalidConfiguration("TX pool is empty".into()))?;
+            let slot_count = length
+                .checked_add(slot_capacity - 1)
+                .ok_or_else(|| Error::InvalidConfiguration("TX window length overflow".into()))?
+                / slot_capacity;
+            let start = self
+                .slots
+                .iter()
+                .take_while(|slot| slot.kind == SlotKind::Tx)
+                .map(|slot| slot.state)
+                .collect::<Vec<_>>()
+                .windows(slot_count)
+                .position(|states| states.iter().all(|state| *state == SlotState::Free))
+                .ok_or_else(|| {
+                    Error::InvalidConfiguration("no contiguous TX window available".into())
+                })?;
+            let offset = self.slots[start].offset;
+            let (base, registered_len) = self
+                .segment_handle()?
+                .data()
+                .map_err(|error| native_error("borrow_tx_window", error))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::InvalidConfiguration("TX window offset overflow".into()))?;
+            if end > registered_len {
+                return Err(Error::InvalidConfiguration(
+                    "TX window exceeds registered Segment".into(),
+                ));
+            }
+            let mut slots = Vec::with_capacity(slot_count);
+            for index in start..start + slot_count {
+                self.free_tx.retain(|free| *free != index);
+                let slot = self
+                    .slots
+                    .get_mut(index)
+                    .expect("TX window was bounded by slots");
+                slot.generation = slot.generation.wrapping_add(1);
+                if slot.generation == 0 {
+                    slot.generation = 1;
+                }
+                slot.state = SlotState::LeasedTx;
+                slots.push(SlotId::new(index, slot.generation)?);
+            }
+            // SAFETY: offset..end was checked and all covered slots are exclusively leased.
+            let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
+            let recycle = match self.leases.issue(LeaseKind::Tx, slots.clone()) {
+                Ok(recycle) => recycle,
+                Err(error) => {
+                    for slot in slots {
+                        self.transition(slot, SlotState::LeasedTx, SlotState::Allocated)?;
+                        self.release(slot)?;
+                    }
+                    return Err(error);
+                }
+            };
+            Ok(TxWindowLease {
+                data,
+                length,
+                core: LeaseCore {
+                    recycle: Some(recycle),
+                    notifier: self.recycle_notifier.clone(),
+                },
+                #[cfg(test)]
+                _test_backing: Vec::new().into_boxed_slice(),
+            })
+        }
+
+        pub(crate) fn recycle_rx_lease(
+            &mut self,
+            mut lease: RegisteredRxWindowLease,
+        ) -> Result<usize> {
+            let recycle = lease.core.recycle()?;
+            let count = self.recycle(recycle, LeaseKind::Rx)?;
+            lease.core.disarm();
+            Ok(count)
+        }
+
+        pub(crate) fn recycle_tx_lease(&mut self, mut lease: TxWindowLease) -> Result<usize> {
+            let recycle = lease.core.recycle()?;
+            let count = self.recycle(recycle, LeaseKind::Tx)?;
+            lease.core.disarm();
+            Ok(count)
+        }
+
+        pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
+            let kind = self.leases.record(recycle)?.kind;
+            self.recycle(recycle, kind)
+        }
+
+        fn recycle(&mut self, recycle: LeaseRecycle, expected: LeaseKind) -> Result<usize> {
+            let record = self.leases.record(recycle)?;
+            if record.kind != expected {
+                return Err(Error::Protocol("registered lease kind mismatch".into()));
+            }
+            for &slot in &record.slots {
+                let (_, _, kind, state) = self.slot_fields(slot)?;
+                let valid = matches!(
+                    (expected, kind, state),
+                    (LeaseKind::Rx, SlotKind::Rx, SlotState::LeasedRx)
+                        | (LeaseKind::Tx, SlotKind::Tx, SlotState::LeasedTx)
+                );
+                if !valid {
+                    return Err(Error::Protocol(
+                        "registered lease slot state mismatch".into(),
+                    ));
+                }
+            }
+            let record = self.leases.finish(recycle)?;
+            let count = record.slots.len();
+            for slot in record.slots {
+                let completed = match expected {
+                    LeaseKind::Rx => SlotState::RecvCompleted,
+                    LeaseKind::Tx => SlotState::Allocated,
+                };
+                let leased = match expected {
+                    LeaseKind::Rx => SlotState::LeasedRx,
+                    LeaseKind::Tx => SlotState::LeasedTx,
+                };
+                self.transition(slot, leased, completed)?;
+                self.release(slot)?;
+            }
+            Ok(count)
+        }
+
         fn slot_fields(&self, id: SlotId) -> Result<(usize, usize, SlotKind, SlotState)> {
-            self.slots
-                .get(id.0)
-                .map(|slot| (slot.offset, slot.len, slot.kind, slot.state))
-                .ok_or_else(|| Error::InvalidConfiguration("slot id is outside buffer pool".into()))
+            let slot = self.slots.get(id.index()).ok_or_else(|| {
+                Error::InvalidConfiguration("slot id is outside buffer pool".into())
+            })?;
+            if slot.generation != id.generation() {
+                return Err(Error::Protocol("stale slot generation".into()));
+            }
+            Ok((slot.offset, slot.len, slot.kind, slot.state))
         }
 
         fn transition(&mut self, id: SlotId, from: SlotState, to: SlotState) -> Result<()> {
             let slot = self
                 .slots
-                .get_mut(id.0)
+                .get_mut(id.index())
                 .ok_or_else(|| Error::Protocol("completion slot is outside buffer pool".into()))?;
+            if slot.generation != id.generation() {
+                return Err(Error::Protocol("stale slot generation".into()));
+            }
             if slot.state != from {
                 return Err(Error::Protocol(format!(
                     "slot {} state {:?}, expected {:?}",
-                    id.0, slot.state, from
+                    id.index(),
+                    slot.state,
+                    from
                 )));
             }
             slot.state = to;
@@ -366,10 +887,26 @@ mod native {
 
         pub(crate) fn close(&mut self) -> Result<()> {
             self.stop();
-            let Some(mut segment) = self.segment.take() else {
+            self.leases.ensure_empty()?;
+            let Some(segment) = self.segment.as_mut() else {
                 return Ok(());
             };
-            segment.close()
+            segment.close()?;
+            self.segment = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for UrmaBufferPool {
+        fn drop(&mut self) {
+            if self.leases.active() != 0 {
+                // Active leases may still be read or filled on another thread.
+                // Isolate the native Segment instead of letting field Drop
+                // unregister and free backing that those leases reference.
+                if let Some(segment) = self.segment.take() {
+                    std::mem::forget(segment);
+                }
+            }
         }
     }
 
@@ -386,6 +923,7 @@ pub(crate) use native::UrmaBufferPool;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Mutex};
 
     #[test]
     fn validates_fixed_slot_layout_without_urma() {
@@ -422,5 +960,108 @@ mod tests {
             config.total_len(),
             Err(Error::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn slot_identity_round_trip_includes_generation() {
+        let first = SlotId::new(1234, 7).unwrap();
+        let reused = SlotId::new(1234, 8).unwrap();
+        assert_eq!(SlotId::decode(first.encode()), Ok(first));
+        assert_ne!(first.encode(), reused.encode());
+        assert!(SlotId::decode(1234).is_err());
+    }
+
+    #[test]
+    fn lease_book_rejects_wrong_pool_and_double_recycle() {
+        let slot = SlotId::new(4, 2).unwrap();
+        let mut first = LeaseBook::new();
+        let second = LeaseBook::new();
+        let recycle = first.issue(LeaseKind::Rx, vec![slot]).unwrap();
+
+        assert!(second.record(recycle).is_err());
+        assert_eq!(first.active(), 1);
+        let record = first.finish(recycle).unwrap();
+        assert_eq!(record.kind, LeaseKind::Rx);
+        assert_eq!(record.slots, vec![slot]);
+        assert!(first.finish(recycle).is_err());
+    }
+
+    #[test]
+    fn active_lease_blocks_registered_pool_close_gate() {
+        let mut leases = LeaseBook::new();
+        let recycle = leases
+            .issue(LeaseKind::Tx, vec![SlotId::new(1, 1).unwrap()])
+            .unwrap();
+        assert!(leases.ensure_empty().is_err());
+        leases.finish(recycle).unwrap();
+        assert!(leases.ensure_empty().is_ok());
+    }
+
+    #[test]
+    fn dropped_rx_lease_notifies_owner_and_keeps_tail_parts_borrowed() {
+        let mut leases = LeaseBook::new();
+        let slots = vec![SlotId::new(3, 1).unwrap(), SlotId::new(4, 1).unwrap()];
+        let recycle = leases.issue(LeaseKind::Rx, slots).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
+            tx.send(recycle).unwrap();
+        });
+        let lease = RegisteredRxWindowLease::from_test_parts(
+            vec![vec![1, 2, 3, 4], vec![5, 6]],
+            recycle,
+            notifier,
+        );
+
+        assert_eq!(lease.len(), 6);
+        assert_eq!(
+            lease.parts().collect::<Vec<_>>(),
+            vec![&[1, 2, 3, 4][..], &[5, 6][..]]
+        );
+        drop(lease);
+
+        let returned = rx.recv().unwrap();
+        assert_eq!(returned, recycle);
+        // Drop only notifies. The owner remains authoritative for recycling
+        // and therefore for the close gate.
+        assert_eq!(leases.active(), 1);
+        leases.finish(returned).unwrap();
+        assert!(leases.ensure_empty().is_ok());
+    }
+
+    #[test]
+    fn tx_lease_exposes_exclusive_direct_fill() {
+        let mut leases = LeaseBook::new();
+        let recycle = leases
+            .issue(LeaseKind::Tx, vec![SlotId::new(0, 1).unwrap()])
+            .unwrap();
+        let returned = Arc::new(Mutex::new(None));
+        let notifier: LeaseRecycleNotifier = {
+            let returned = returned.clone();
+            Arc::new(move |recycle| *returned.lock().unwrap() = Some(recycle))
+        };
+        let mut backing = vec![0u8; 7].into_boxed_slice();
+        let data = NonNull::new(backing.as_mut_ptr()).unwrap();
+        let mut lease = TxWindowLease {
+            data,
+            length: backing.len(),
+            core: LeaseCore {
+                recycle: Some(recycle),
+                notifier,
+            },
+            _test_backing: backing,
+        };
+        lease.bytes_mut().copy_from_slice(b"direct!");
+        assert_eq!(lease.len(), 7);
+        assert_eq!(&*lease._test_backing, b"direct!");
+        drop(lease);
+        assert_eq!(*returned.lock().unwrap(), Some(recycle));
+    }
+
+    #[test]
+    fn lease_thread_traits_match_access_modes() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RegisteredRxWindowLease>();
+        assert_send::<TxWindowLease>();
     }
 }
