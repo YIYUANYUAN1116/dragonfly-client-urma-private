@@ -5,7 +5,10 @@
 //! stay in the future `client::urma` / `server::urma` adapters.
 
 use super::{
-    fabric::{FabricCompletion, UrmaFabricHandle, UrmaLaneConfig, UrmaOpHandle},
+    buffer::RegisteredRxWindowLease,
+    fabric::{
+        FabricCompletion, UrmaFabricHandle, UrmaLaneConfig, UrmaOpHandle, UrmaRegisteredRxOpHandle,
+    },
     rendezvous::{
         read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
         PieceMetadata, ReceiveWindow, RendezvousError, UrmaCapability,
@@ -14,9 +17,10 @@ use super::{
 };
 use crate::rendezvous::{ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
 use dragonfly_client_core::Error as ClientError;
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
+    sync::{OwnedSemaphorePermit, Semaphore},
     time,
 };
 use tracing::{debug, info, warn};
@@ -141,8 +145,20 @@ impl TransferShape {
 
 struct ClientPiece {
     shape: TransferShape,
-    next_chunk: u64,
+    next_post_chunk: u64,
+    next_deliver_chunk: u64,
+    pending: VecDeque<PendingReceiveWindow>,
+    window_permits: std::sync::Arc<Semaphore>,
 }
+
+struct PendingReceiveWindow {
+    window: ReceiveWindow,
+    expected_len: usize,
+    operations: Vec<(u64, UrmaRegisteredRxOpHandle)>,
+    permit: OwnedSemaphorePermit,
+}
+
+const RECEIVE_PIPELINE_DEPTH: usize = 2;
 
 /// Downloader-side peer session. `finish_piece` returns it to Idle so the
 /// same control connection and Jetty can carry the next Piece.
@@ -262,39 +278,94 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         let metadata = shape.metadata.clone();
         self.piece = Some(ClientPiece {
             shape,
-            next_chunk: 0,
+            next_post_chunk: 0,
+            next_deliver_chunk: 0,
+            pending: VecDeque::with_capacity(RECEIVE_PIPELINE_DEPTH),
+            window_permits: std::sync::Arc::new(Semaphore::new(RECEIVE_PIPELINE_DEPTH)),
         });
         Ok(metadata)
     }
 
-    pub(crate) async fn receive_next_window(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+    async fn fill_receive_pipeline(&mut self) -> Result<()> {
         let lane_id = self.open_lane()?;
-        let piece = self
-            .piece
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
-        let window = piece.shape.window(piece.next_chunk)?;
-        let expected_window_len = piece.shape.window_len(window)?;
-        let mut operations = Vec::with_capacity(window.chunk_count as usize);
-        for chunk in window.start_chunk..window.start_chunk + u64::from(window.chunk_count) {
-            match self.fabric.post_receive(lane_id, Some(chunk)).await {
-                Ok(operation) => operations.push((chunk, operation)),
+        loop {
+            let (window, expected_len, pending_count, permits) = {
+                let piece = self
+                    .piece
+                    .as_ref()
+                    .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
+                if piece.pending.len() >= RECEIVE_PIPELINE_DEPTH
+                    || piece.next_post_chunk == piece.shape.chunk_count
+                {
+                    return Ok(());
+                }
+                let window = piece.shape.window(piece.next_post_chunk)?;
+                (
+                    window,
+                    piece.shape.window_len(window)?,
+                    piece.pending.len(),
+                    piece.window_permits.clone(),
+                )
+            };
+            let permit = match permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) if pending_count != 0 => return Ok(()),
+                Err(_) => permits.acquire_owned().await.map_err(|_| Error::Shutdown {
+                    failures: vec!["URMA RX window pipeline is closed".into()],
+                })?,
+            };
+            let sequences = (window.start_chunk
+                ..window.start_chunk + u64::from(window.chunk_count))
+                .collect::<Vec<_>>();
+            let handles = match self
+                .fabric
+                .post_receive_window_registered(lane_id, sequences.clone())
+                .await
+            {
+                Ok(handles) => handles,
+                Err(Error::BufferUnavailable { .. }) if pending_count != 0 => {
+                    // The first posted window guarantees forward progress. A
+                    // second window is optional when the process-wide RX pool
+                    // is under pressure.
+                    return Ok(());
+                }
                 Err(error) => return self.abort(error).await,
+            };
+            if let Err(error) = write_control(
+                &mut self.stream,
+                &Frame::RecvPosted(window),
+                self.control_timeout,
+                "send RecvPosted",
+            )
+            .await
+            {
+                return self.abort(error).await;
             }
+            let operations = sequences.into_iter().zip(handles).collect();
+            let piece = self.piece.as_mut().expect("active Piece");
+            piece.next_post_chunk += u64::from(window.chunk_count);
+            piece.pending.push_back(PendingReceiveWindow {
+                window,
+                expected_len,
+                operations,
+                permit,
+            });
         }
-        if let Err(error) = write_control(
-            &mut self.stream,
-            &Frame::RecvPosted(window),
-            self.control_timeout,
-            "send RecvPosted",
-        )
-        .await
-        {
-            return self.abort(error).await;
-        }
+    }
 
-        let mut bytes = Vec::with_capacity(expected_window_len);
-        for (chunk, operation) in operations {
+    pub(crate) async fn receive_next_window_registered(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<RegisteredRxWindowLease> {
+        let lane_id = self.open_lane()?;
+        self.fill_receive_pipeline().await?;
+        let pending = self
+            .piece
+            .as_mut()
+            .and_then(|piece| piece.pending.pop_front())
+            .ok_or_else(|| Error::Protocol("no pending URMA receive window".into()))?;
+        let mut leases = Vec::with_capacity(pending.operations.len());
+        for (chunk, operation) in pending.operations {
             let expected_len = self
                 .piece
                 .as_ref()
@@ -302,35 +373,67 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 .shape
                 .chunk_len(chunk)?;
             match operation.wait_timeout(timeout).await {
-                Ok(FabricCompletion::Received {
-                    lane_id: completed_lane,
-                    sequence: Some(completed_chunk),
-                    bytes: chunk_bytes,
-                }) if completed_lane == lane_id
-                    && completed_chunk == chunk
-                    && chunk_bytes.len() == expected_len =>
+                Ok(completion)
+                    if completion.lane_id == lane_id
+                        && completion.sequence == Some(chunk)
+                        && completion.lease.len() == expected_len =>
                 {
-                    bytes.extend_from_slice(&chunk_bytes);
+                    leases.push(completion.lease);
                 }
                 Ok(completion) => {
                     return self
                         .abort(Error::Protocol(format!(
-                            "invalid URMA receive completion for chunk {chunk}: {completion:?}"
+                            "invalid registered URMA receive completion for chunk {chunk}: lane={} sequence={:?} length={}",
+                            completion.lane_id,
+                            completion.sequence,
+                            completion.lease.len()
                         )))
                         .await;
                 }
                 Err(error) => return self.abort(error).await,
             }
         }
-        self.piece.as_mut().expect("active Piece").next_chunk += u64::from(window.chunk_count);
-        debug_assert_eq!(bytes.len(), expected_window_len);
+        let lease = match RegisteredRxWindowLease::merge(leases) {
+            Ok(lease) if lease.len() == pending.expected_len => {
+                lease.with_pipeline_permit(pending.permit)
+            }
+            Ok(lease) => {
+                return self
+                    .abort(Error::Protocol(format!(
+                        "registered URMA window length mismatch: expected {}, got {}",
+                        pending.expected_len,
+                        lease.len()
+                    )))
+                    .await;
+            }
+            Err(error) => return self.abort(error).await,
+        };
+        self.piece
+            .as_mut()
+            .expect("active Piece")
+            .next_deliver_chunk += u64::from(pending.window.chunk_count);
+        Ok(lease)
+    }
+
+    /// Compatibility wrapper retained until B3 switches Storage to consume
+    /// registered windows directly. It performs one aggregate copy instead of
+    /// Phase A's per-chunk copy plus aggregate copy.
+    pub(crate) async fn receive_next_window(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+        let lease = self.receive_next_window_registered(timeout).await?;
+        let mut bytes = Vec::with_capacity(lease.len());
+        for part in lease.parts() {
+            bytes.extend_from_slice(part);
+        }
+        if let Err(error) = self.fabric.recycle_rx_window(lease).await {
+            return self.abort(error).await;
+        }
         Ok(bytes)
     }
 
     pub(crate) fn piece_complete(&self) -> bool {
         self.piece
             .as_ref()
-            .is_some_and(|piece| piece.next_chunk == piece.shape.chunk_count)
+            .is_some_and(|piece| piece.next_deliver_chunk == piece.shape.chunk_count)
     }
 
     pub(crate) async fn finish_piece(&mut self) -> Result<()> {
@@ -338,7 +441,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             .piece
             .as_ref()
             .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
-        if piece.next_chunk != piece.shape.chunk_count {
+        if piece.next_deliver_chunk != piece.shape.chunk_count || !piece.pending.is_empty() {
             return Err(Error::Protocol("URMA Piece is not fully received".into()));
         }
         match read_control(&mut self.stream, self.control_timeout, "receive Piece Done").await {
@@ -379,6 +482,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
     }
 
     async fn abort<T>(&mut self, error: Error) -> Result<T> {
+        if let Some(piece) = self.piece.as_mut() {
+            piece.pending.clear();
+        }
         if let Some(lane_id) = self.lane_id.take() {
             warn!(role = "client", lane_id, %error, "aborting urma peer lane");
             let _ = self.fabric.abort_lane(lane_id).await;

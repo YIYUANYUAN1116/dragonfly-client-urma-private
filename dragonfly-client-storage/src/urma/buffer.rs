@@ -7,6 +7,7 @@ use std::{
         Arc,
     },
 };
+use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BufferPoolConfig {
@@ -254,7 +255,8 @@ struct RegisteredSpan {
 pub(crate) struct RegisteredRxWindowLease {
     spans: Vec<RegisteredSpan>,
     length: usize,
-    core: LeaseCore,
+    cores: Vec<LeaseCore>,
+    pipeline_permit: Option<OwnedSemaphorePermit>,
     #[cfg(test)]
     _test_backing: Vec<Box<[u8]>>,
 }
@@ -280,6 +282,46 @@ impl RegisteredRxWindowLease {
         self.length
     }
 
+    pub(crate) fn merge(windows: Vec<Self>) -> Result<Self> {
+        if windows.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "RX window merge requires at least one lease".into(),
+            ));
+        }
+        let mut spans = Vec::new();
+        let mut cores = Vec::new();
+        let mut length = 0usize;
+        #[cfg(test)]
+        let mut test_backing = Vec::new();
+        for mut window in windows {
+            if window.pipeline_permit.is_some() {
+                return Err(Error::Protocol(
+                    "chunk lease unexpectedly owns a pipeline permit".into(),
+                ));
+            }
+            length = length
+                .checked_add(window.length)
+                .ok_or_else(|| Error::Protocol("RX window merge length overflow".into()))?;
+            spans.append(&mut window.spans);
+            cores.append(&mut window.cores);
+            #[cfg(test)]
+            test_backing.append(&mut window._test_backing);
+        }
+        Ok(Self {
+            spans,
+            length,
+            cores,
+            pipeline_permit: None,
+            #[cfg(test)]
+            _test_backing: test_backing,
+        })
+    }
+
+    pub(crate) fn with_pipeline_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self.pipeline_permit = Some(permit);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_parts(
         parts: Vec<Vec<u8>>,
@@ -300,10 +342,11 @@ impl RegisteredRxWindowLease {
         Self {
             length: backing.iter().map(|part| part.len()).sum(),
             spans,
-            core: LeaseCore {
+            cores: vec![LeaseCore {
                 recycle: Some(recycle),
                 notifier,
-            },
+            }],
+            pipeline_permit: None,
             _test_backing: backing,
         }
     }
@@ -334,25 +377,6 @@ impl TxWindowLease {
 
     pub(crate) fn len(&self) -> usize {
         self.length
-    }
-}
-
-/// One receive completion in a transport-neutral ownership wrapper. Phase A
-/// currently copies from the C-owned registered region; callers depend only on
-/// this wrapper so the backing can later become a borrowed registered window
-/// without changing the client/storage contract.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ReceivedChunk {
-    bytes: Vec<u8>,
-}
-
-impl ReceivedChunk {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
     }
 }
 
@@ -473,6 +497,40 @@ mod native {
             SlotId::new(index, slot.generation).ok()
         }
 
+        pub(crate) fn allocate_rx_window(&mut self, count: usize) -> Result<Vec<SlotId>> {
+            if count == 0 {
+                return Err(Error::InvalidConfiguration(
+                    "RX window slot count must be non-zero".into(),
+                ));
+            }
+            if !self.accepting || self.free_rx.len() < count {
+                return Err(Error::BufferUnavailable {
+                    kind: "RX",
+                    requested: count,
+                    available: if self.accepting {
+                        self.free_rx.len()
+                    } else {
+                        0
+                    },
+                });
+            }
+            let mut slots = Vec::with_capacity(count);
+            for _ in 0..count {
+                slots.push(
+                    self.allocate(SlotKind::Rx)
+                        .expect("free RX count checked before allocation"),
+                );
+            }
+            Ok(slots)
+        }
+
+        pub(crate) fn release_unposted_rx_window(&mut self, slots: Vec<SlotId>) -> Result<()> {
+            for slot in slots {
+                self.release(slot)?;
+            }
+            Ok(())
+        }
+
         pub(crate) fn release(&mut self, id: SlotId) -> Result<()> {
             let index = id.index();
             let slot = self.slots.get_mut(index).ok_or_else(|| {
@@ -590,28 +648,6 @@ mod native {
             self.transition(id, from, to)
         }
 
-        pub(crate) fn complete_recv(&mut self, id: SlotId, length: u32) -> Result<ReceivedChunk> {
-            let (offset, capacity, kind, state) = self.slot_fields(id)?;
-            if kind != SlotKind::Rx || state != SlotState::PostedRecv {
-                return Err(Error::Protocol(
-                    "RECV CQE does not match a posted RX slot".into(),
-                ));
-            }
-            let length = usize::try_from(length)
-                .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
-            if length == 0 || length > capacity {
-                return Err(Error::Protocol(format!(
-                    "RECV completion length {length} is outside 1..={capacity}"
-                )));
-            }
-            let bytes = self
-                .segment_handle()?
-                .read(offset as u64, length as u32)
-                .map_err(|error| native_error("read_rx_slot", error))?;
-            self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)?;
-            Ok(ReceivedChunk { bytes })
-        }
-
         /// Marks one RX CQE complete without copying its registered bytes.
         /// B2 will group these completions into a published window lease.
         #[allow(dead_code)] // Selected by the B2 completion route.
@@ -707,10 +743,11 @@ mod native {
             Ok(RegisteredRxWindowLease {
                 spans,
                 length: total,
-                core: LeaseCore {
+                cores: vec![LeaseCore {
                     recycle: Some(recycle),
                     notifier: self.recycle_notifier.clone(),
-                },
+                }],
+                pipeline_permit: None,
                 #[cfg(test)]
                 _test_backing: Vec::new(),
             })
@@ -798,9 +835,14 @@ mod native {
             &mut self,
             mut lease: RegisteredRxWindowLease,
         ) -> Result<usize> {
-            let recycle = lease.core.recycle()?;
-            let count = self.recycle(recycle, LeaseKind::Rx)?;
-            lease.core.disarm();
+            let mut count = 0usize;
+            for core in &mut lease.cores {
+                let recycle = core.recycle()?;
+                count = count
+                    .checked_add(self.recycle(recycle, LeaseKind::Rx)?)
+                    .ok_or_else(|| Error::Protocol("RX recycle count overflow".into()))?;
+                core.disarm();
+            }
             Ok(count)
         }
 
@@ -1026,6 +1068,46 @@ mod tests {
         assert_eq!(leases.active(), 1);
         leases.finish(returned).unwrap();
         assert!(leases.ensure_empty().is_ok());
+    }
+
+    #[test]
+    fn merged_rx_window_preserves_parts_recycles_every_slot_and_holds_pipeline_credit() {
+        let mut leases = LeaseBook::new();
+        let first = leases
+            .issue(LeaseKind::Rx, vec![SlotId::new(8, 1).unwrap()])
+            .unwrap();
+        let second = leases
+            .issue(LeaseKind::Rx, vec![SlotId::new(9, 1).unwrap()])
+            .unwrap();
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let notifier: LeaseRecycleNotifier = {
+            let returned = returned.clone();
+            Arc::new(move |recycle| returned.lock().unwrap().push(recycle))
+        };
+        let first_window = RegisteredRxWindowLease::from_test_parts(
+            vec![vec![1, 2, 3, 4]],
+            first,
+            notifier.clone(),
+        );
+        let tail_window =
+            RegisteredRxWindowLease::from_test_parts(vec![vec![5, 6]], second, notifier);
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().try_acquire_owned().unwrap();
+        let window = RegisteredRxWindowLease::merge(vec![first_window, tail_window])
+            .unwrap()
+            .with_pipeline_permit(permit);
+
+        assert_eq!(window.len(), 6);
+        assert_eq!(
+            window.parts().collect::<Vec<_>>(),
+            vec![&[1, 2, 3, 4][..], &[5, 6][..]]
+        );
+        assert!(permits.clone().try_acquire_owned().is_err());
+        drop(window);
+        assert!(permits.try_acquire_owned().is_ok());
+        let mut actual = returned.lock().unwrap().clone();
+        actual.sort_by_key(|recycle| recycle.lease_id);
+        assert_eq!(actual, vec![first, second]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::{
-    buffer::{ReceivedChunk, UrmaBufferPool},
+    buffer::{RegisteredRxWindowLease, UrmaBufferPool},
     ffi,
     lane::{OperationType, WrToken},
     native_error, Error, Result,
@@ -25,24 +25,74 @@ pub(crate) struct CompletionStats {
 /// fabric thread.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum LaneCompletion {
-    Sent {
-        lane_id: u16,
-        sequence: Option<u64>,
-    },
-    Received {
-        lane_id: u16,
-        sequence: Option<u64>,
-        chunk: ReceivedChunk,
-    },
+    Sent { lane_id: u16, sequence: Option<u64> },
 }
 
 pub(crate) type OperationCompletionTx = oneshot::Sender<Result<LaneCompletion>>;
+
+pub(crate) struct RegisteredRxCompletion {
+    pub(crate) lane_id: u16,
+    pub(crate) sequence: Option<u64>,
+    pub(crate) lease: RegisteredRxWindowLease,
+}
+
+pub(crate) type RegisteredRxCompletionTx = oneshot::Sender<Result<RegisteredRxCompletion>>;
+
+enum CompletionTarget {
+    Owned(OperationCompletionTx),
+    RegisteredRx(RegisteredRxCompletionTx),
+}
+
+enum RoutedCompletion {
+    Owned(LaneCompletion),
+    RegisteredRx(RegisteredRxCompletion),
+}
+
+impl CompletionTarget {
+    fn send(self, result: Result<RoutedCompletion>) {
+        match (self, result) {
+            (Self::Owned(completion), Ok(RoutedCompletion::Owned(value))) => {
+                let _ = completion.send(Ok(value));
+            }
+            (Self::RegisteredRx(completion), Ok(RoutedCompletion::RegisteredRx(value))) => {
+                let _ = completion.send(Ok(value));
+            }
+            (Self::Owned(completion), Err(error)) => {
+                let _ = completion.send(Err(error));
+            }
+            (Self::RegisteredRx(completion), Err(error)) => {
+                let _ = completion.send(Err(error));
+            }
+            (Self::Owned(completion), Ok(RoutedCompletion::RegisteredRx(_))) => {
+                let _ = completion.send(Err(Error::Protocol(
+                    "registered RX completion routed to owned receiver".into(),
+                )));
+            }
+            (Self::RegisteredRx(completion), Ok(RoutedCompletion::Owned(_))) => {
+                let _ = completion.send(Err(Error::Protocol(
+                    "owned completion routed to registered RX receiver".into(),
+                )));
+            }
+        }
+    }
+
+    fn fail(self, error: Error) {
+        match self {
+            Self::Owned(completion) => {
+                let _ = completion.send(Err(error));
+            }
+            Self::RegisteredRx(completion) => {
+                let _ = completion.send(Err(error));
+            }
+        }
+    }
+}
 
 struct OutstandingWr {
     user_ctx: u64,
     handle: ffi::WrHandle,
     sequence: Option<u64>,
-    completion: Option<OperationCompletionTx>,
+    completion: Option<CompletionTarget>,
 }
 
 /// The single completion consumer for the process-shared JFCs. A JFC must not
@@ -95,7 +145,7 @@ impl CompletionRouter {
             user_ctx,
             handle,
             sequence,
-            completion: Some(completion),
+            completion: Some(CompletionTarget::Owned(completion)),
         });
         self.outstanding_total += 1;
         *self.outstanding_by_lane.entry(token.lane_id).or_default() += 1;
@@ -109,6 +159,43 @@ impl CompletionRouter {
                 self.stats.recv_post += 1;
             }
         }
+        self.stats.max_outstanding = self
+            .stats
+            .max_outstanding
+            .max(self.outstanding_total as u64);
+        Ok(())
+    }
+
+    pub(crate) fn track_registered_rx(
+        &mut self,
+        user_ctx: u64,
+        handle: ffi::WrHandle,
+        sequence: Option<u64>,
+        completion: RegisteredRxCompletionTx,
+    ) -> Result<()> {
+        let token = WrToken::decode(user_ctx)?;
+        if token.operation != OperationType::Recv {
+            return Err(Error::Protocol(
+                "registered RX completion requires a RECV WR".into(),
+            ));
+        }
+        let slot = token.slot.index();
+        if self.outstanding.len() <= slot {
+            self.outstanding.resize_with(slot + 1, || None);
+        }
+        if self.outstanding[slot].is_some() {
+            return Err(Error::Protocol("duplicate outstanding slot".into()));
+        }
+        self.outstanding[slot] = Some(OutstandingWr {
+            user_ctx,
+            handle,
+            sequence,
+            completion: Some(CompletionTarget::RegisteredRx(completion)),
+        });
+        self.outstanding_total += 1;
+        self.outstanding_recv += 1;
+        *self.outstanding_by_lane.entry(token.lane_id).or_default() += 1;
+        self.stats.recv_post += 1;
         self.stats.max_outstanding = self
             .stats
             .max_outstanding
@@ -211,10 +298,10 @@ impl CompletionRouter {
                         self.stats.send_cqe += 1;
                         pool.complete_send(token.slot)?;
                         pool.release(token.slot)?;
-                        Ok(LaneCompletion::Sent {
+                        Ok(RoutedCompletion::Owned(LaneCompletion::Sent {
                             lane_id: token.lane_id,
                             sequence: outstanding.sequence,
-                        })
+                        }))
                     }
                     OperationType::Recv => {
                         self.outstanding_recv -= 1;
@@ -228,20 +315,45 @@ impl CompletionRouter {
                                 record.opcode
                             )));
                         }
-                        let chunk = pool.complete_recv(token.slot, record.completion_len)?;
-                        pool.release(token.slot)?;
-                        Ok(LaneCompletion::Received {
-                            lane_id: token.lane_id,
-                            sequence: outstanding.sequence,
-                            chunk,
-                        })
+                        if matches!(
+                            outstanding.completion,
+                            Some(CompletionTarget::RegisteredRx(_))
+                        ) {
+                            if let Err(error) =
+                                pool.complete_recv_leased(token.slot, record.completion_len)
+                            {
+                                pool.complete_error(token.slot, token.operation)?;
+                                pool.release(token.slot)?;
+                                return Err(error);
+                            }
+                            let lease = match pool
+                                .lease_completed_rx_window(&[(token.slot, record.completion_len)])
+                            {
+                                Ok(lease) => lease,
+                                Err(error) => {
+                                    pool.release(token.slot)?;
+                                    return Err(error);
+                                }
+                            };
+                            Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
+                                lane_id: token.lane_id,
+                                sequence: outstanding.sequence,
+                                lease,
+                            }))
+                        } else {
+                            pool.complete_error(token.slot, token.operation)?;
+                            pool.release(token.slot)?;
+                            Err(Error::Protocol(
+                                "owned RX completion path is disabled".into(),
+                            ))
+                        }
                     }
                 })()
             };
 
         let owner_error = result.as_ref().err().cloned();
         if let Some(completion) = outstanding.completion.take() {
-            let _ = completion.send(result);
+            completion.send(result);
         }
         owner_error.map_or(Ok(()), Err)
     }
@@ -294,7 +406,7 @@ impl CompletionRouter {
     pub(crate) fn fail_pending(&mut self, error: &Error) {
         for outstanding in self.outstanding.iter_mut().flatten() {
             if let Some(completion) = outstanding.completion.take() {
-                let _ = completion.send(Err(error.clone()));
+                completion.fail(error.clone());
             }
         }
     }
@@ -333,6 +445,8 @@ pub(crate) fn deadline_expired(deadline: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::urma::buffer::{LeaseBook, LeaseKind, LeaseRecycleNotifier, SlotId};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn deadline_helper_expires() {
@@ -361,5 +475,35 @@ mod tests {
 
         assert_eq!(visited, vec![0, 1, 2, 3]);
         assert_eq!(result, Err("first failure"));
+    }
+
+    #[test]
+    fn registered_completion_preserves_lease_ownership_across_oneshot() {
+        let mut leases = LeaseBook::new();
+        let recycle = leases
+            .issue(LeaseKind::Rx, vec![SlotId::new(2, 5).unwrap()])
+            .unwrap();
+        let returned = Arc::new(Mutex::new(None));
+        let notifier: LeaseRecycleNotifier = {
+            let returned = returned.clone();
+            Arc::new(move |recycle| *returned.lock().unwrap() = Some(recycle))
+        };
+        let lease =
+            RegisteredRxWindowLease::from_test_parts(vec![vec![7, 8, 9]], recycle, notifier);
+        let (tx, rx) = oneshot::channel();
+        CompletionTarget::RegisteredRx(tx).send(Ok(RoutedCompletion::RegisteredRx(
+            RegisteredRxCompletion {
+                lane_id: 4,
+                sequence: Some(12),
+                lease,
+            },
+        )));
+
+        let completion = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(completion.lane_id, 4);
+        assert_eq!(completion.sequence, Some(12));
+        assert_eq!(completion.lease.parts().next().unwrap(), &[7, 8, 9]);
+        drop(completion);
+        assert_eq!(*returned.lock().unwrap(), Some(recycle));
     }
 }

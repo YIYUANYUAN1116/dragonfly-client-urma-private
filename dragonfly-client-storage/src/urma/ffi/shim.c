@@ -341,16 +341,6 @@ int dfurma_segment_write(dfurma_segment_t *segment, uint64_t offset,
     return 0;
 }
 
-int dfurma_segment_read(const dfurma_segment_t *segment, uint64_t offset,
-                          uint8_t *out, uint32_t length)
-{
-    if (out == NULL || dfurma_segment_range(segment, offset, length) != 0) {
-        return -EINVAL;
-    }
-    (void)memcpy(out, (const uint8_t *)segment->memory + offset, length);
-    return 0;
-}
-
 int dfurma_segment_data(dfurma_segment_t *segment, uint8_t **data,
                           uint64_t *length)
 {

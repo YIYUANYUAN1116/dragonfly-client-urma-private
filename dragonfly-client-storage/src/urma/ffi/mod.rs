@@ -271,19 +271,6 @@ impl SegmentHandle {
         })
     }
 
-    pub(crate) fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, FfiError> {
-        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
-        if length == 0 {
-            return Err(FfiError::Contract("zero-length Segment read"));
-        }
-        let mut out = vec![0u8; length as usize];
-        // SAFETY: out has exactly `length` writable bytes.
-        status_result(unsafe {
-            sys::dfurma_segment_read(raw.as_ptr(), offset, out.as_mut_ptr(), length)
-        })?;
-        Ok(out)
-    }
-
     /// Returns the ordinary CPU-visible allocation registered by the shim.
     /// The pointer remains valid until this Segment is successfully closed.
     pub(crate) fn data(&self) -> Result<(NonNull<u8>, usize), FfiError> {

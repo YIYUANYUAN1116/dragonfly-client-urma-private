@@ -19,6 +19,11 @@ pub enum Error {
     OperationTimeout {
         sequence: Option<u64>,
     },
+    BufferUnavailable {
+        kind: &'static str,
+        requested: usize,
+        available: usize,
+    },
     Completion {
         status: i32,
         opcode: u32,
@@ -75,6 +80,14 @@ impl fmt::Display for Error {
             Self::OperationTimeout { sequence } => {
                 write!(f, "URMA operation timed out: sequence={sequence:?}")
             }
+            Self::BufferUnavailable {
+                kind,
+                requested,
+                available,
+            } => write!(
+                f,
+                "URMA {kind} buffer unavailable: requested={requested} available={available}"
+            ),
             Self::Completion {
                 status,
                 opcode,

@@ -54,7 +54,10 @@ mod native {
     use super::*;
     use crate::urma::{
         buffer::UrmaBufferPool,
-        completion::{deadline_after, deadline_expired, CompletionRouter, OperationCompletionTx},
+        completion::{
+            deadline_after, deadline_expired, CompletionRouter, OperationCompletionTx,
+            RegisteredRxCompletionTx,
+        },
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, UrmaJetty, UrmaLane},
         native_error,
@@ -276,11 +279,11 @@ mod native {
             lane.mark_ready()
         }
 
-        pub(crate) fn post_receive(
+        pub(crate) fn post_receive_window_registered(
             &mut self,
             lane_id: u16,
-            sequence: Option<u64>,
-            completion: OperationCompletionTx,
+            sequences: Vec<u64>,
+            completion_txs: Vec<RegisteredRxCompletionTx>,
         ) -> Result<()> {
             let (lanes, pool, completions) = (
                 &mut self.lanes,
@@ -292,7 +295,7 @@ mod native {
             lanes
                 .get_mut(&lane_id)
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .post_receive(pool, completions, sequence, completion)
+                .post_receive_window_registered(pool, completions, sequences, completion_txs)
         }
 
         pub(crate) fn grant_send_credit(&mut self, lane_id: u16, count: u32) -> Result<()> {

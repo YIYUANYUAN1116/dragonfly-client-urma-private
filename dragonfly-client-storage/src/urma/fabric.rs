@@ -8,7 +8,9 @@
 
 use super::{
     buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
-    completion::{LaneCompletion, OperationCompletionTx},
+    completion::{
+        LaneCompletion, OperationCompletionTx, RegisteredRxCompletion, RegisteredRxCompletionTx,
+    },
     lane::{JettyConfig, JettyDescriptor},
     runtime::{RuntimeConfig, UrmaRuntime},
     Error, Result,
@@ -84,15 +86,7 @@ impl From<UrmaLaneConfig> for JettyConfig {
 /// code. It contains no UMDK handle or registered-memory borrow.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FabricCompletion {
-    Sent {
-        lane_id: u16,
-        sequence: Option<u64>,
-    },
-    Received {
-        lane_id: u16,
-        sequence: Option<u64>,
-        bytes: Vec<u8>,
-    },
+    Sent { lane_id: u16, sequence: Option<u64> },
 }
 
 /// Observable process-level fabric state.
@@ -224,6 +218,28 @@ pub(crate) struct UrmaOpHandle {
     abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
 }
 
+pub(crate) struct UrmaRegisteredRxOpHandle {
+    sequence: u64,
+    completion: oneshot::Receiver<Result<RegisteredRxCompletion>>,
+    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
+}
+
+impl UrmaRegisteredRxOpHandle {
+    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredRxCompletion> {
+        match tokio::time::timeout(timeout, self.completion).await {
+            Ok(result) => result.map_err(|_| fabric_stopped())?,
+            Err(_) => {
+                if let Some((command_tx, lane_id)) = self.abort {
+                    abort_lane(command_tx, lane_id).await?;
+                }
+                Err(Error::OperationTimeout {
+                    sequence: Some(self.sequence),
+                })
+            }
+        }
+    }
+}
+
 impl UrmaOpHandle {
     pub(crate) async fn wait(self) -> Result<FabricCompletion> {
         self.completion
@@ -291,20 +307,36 @@ impl UrmaFabricHandle {
         .await
     }
 
-    pub(crate) async fn post_receive(
+    pub(crate) async fn post_receive_window_registered(
         &self,
         lane_id: u16,
-        sequence: Option<u64>,
-    ) -> Result<UrmaOpHandle> {
-        self.submit_operation(lane_id, sequence, |completion, reply| {
-            FabricCommand::PostReceive {
-                lane_id,
+        sequences: Vec<u64>,
+    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
+        if sequences.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "registered RX window cannot be empty".into(),
+            ));
+        }
+        let command_tx = self.command_sender()?;
+        let mut completion_txs: Vec<RegisteredRxCompletionTx> = Vec::with_capacity(sequences.len());
+        let mut handles = Vec::with_capacity(sequences.len());
+        for &sequence in &sequences {
+            let (completion_tx, completion_rx) = oneshot::channel();
+            completion_txs.push(completion_tx);
+            handles.push(UrmaRegisteredRxOpHandle {
                 sequence,
-                completion,
-                reply,
-            }
+                completion: completion_rx,
+                abort: Some((command_tx.clone(), lane_id)),
+            });
+        }
+        self.submit(|reply| FabricCommand::PostReceiveWindowRegistered {
+            lane_id,
+            sequences,
+            completion_txs,
+            reply,
         })
-        .await
+        .await?;
+        Ok(handles)
     }
 
     /// Applies a validated peer RecvPosted window to the lane. Window ordering
@@ -498,10 +530,10 @@ enum FabricCommand {
         descriptor: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    PostReceive {
+    PostReceiveWindowRegistered {
         lane_id: u16,
-        sequence: Option<u64>,
-        completion: OperationCompletionTx,
+        sequences: Vec<u64>,
+        completion_txs: Vec<RegisteredRxCompletionTx>,
         reply: oneshot::Sender<Result<()>>,
     },
     GrantSendCredit {
@@ -689,14 +721,15 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
-        FabricCommand::PostReceive {
+        FabricCommand::PostReceiveWindowRegistered {
             lane_id,
-            sequence,
-            completion,
+            sequences,
+            completion_txs,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned)
-                .and_then(|()| runtime.post_receive(lane_id, sequence, completion));
+            let result = reject_if_poisoned(poisoned).and_then(|()| {
+                runtime.post_receive_window_registered(lane_id, sequences, completion_txs)
+            });
             let _ = reply.send(result);
             OwnerControl::Continue
         }
@@ -798,15 +831,6 @@ impl From<LaneCompletion> for FabricCompletion {
     fn from(completion: LaneCompletion) -> Self {
         match completion {
             LaneCompletion::Sent { lane_id, sequence } => Self::Sent { lane_id, sequence },
-            LaneCompletion::Received {
-                lane_id,
-                sequence,
-                chunk,
-            } => Self::Received {
-                lane_id,
-                sequence,
-                bytes: chunk.into_bytes(),
-            },
         }
     }
 }

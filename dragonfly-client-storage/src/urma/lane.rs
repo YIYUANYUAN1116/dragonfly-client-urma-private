@@ -1,6 +1,6 @@
 use super::{
     buffer::{SlotId, SlotKind, UrmaBufferPool},
-    completion::{CompletionRouter, OperationCompletionTx},
+    completion::{CompletionRouter, OperationCompletionTx, RegisteredRxCompletionTx},
     ffi, native_error,
     runtime::UrmaDeviceCapability,
     Error, Result,
@@ -437,34 +437,60 @@ impl UrmaLane {
         self.credits.grant_remote_receives(count)
     }
 
-    pub(crate) fn post_receive(
+    pub(crate) fn post_receive_window_registered(
         &mut self,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
-        sequence: Option<u64>,
-        completion: OperationCompletionTx,
+        sequences: Vec<u64>,
+        completion_txs: Vec<RegisteredRxCompletionTx>,
     ) -> Result<()> {
         if !matches!(self.state, LaneState::Bound | LaneState::Ready) {
-            return Err(self.state_error("post receive"));
+            return Err(self.state_error("post registered receive window"));
         }
-        let slot = pool
-            .allocate(SlotKind::Rx)
-            .ok_or_else(|| Error::InvalidConfiguration("no free RX slot".into()))?;
-        let (offset, length) = pool.recv_post_layout(slot)?;
-        let user_ctx = self.token(OperationType::Recv, slot).encode()?;
-        pool.mark_posted(slot, SlotKind::Rx)?;
-        let wr = match self
-            .jetty
-            .post_recv(pool.segment_handle()?, offset, length, user_ctx)
-        {
-            Ok(wr) => wr,
-            Err(error) => {
-                pool.rollback_post(slot, SlotKind::Rx)?;
-                pool.release(slot)?;
+        if sequences.is_empty() || sequences.len() != completion_txs.len() {
+            return Err(Error::InvalidConfiguration(
+                "registered RX window requires matching non-empty sequences and completions".into(),
+            ));
+        }
+        // Reserve the entire logical window before posting any native WR. A
+        // second pipeline window can therefore degrade cleanly when the global
+        // RX budget cannot satisfy it; no unmatched partial window is left on
+        // the receive queue.
+        let slots = pool.allocate_rx_window(sequences.len())?;
+        let mut slots = slots.into_iter();
+        for (sequence, completion) in sequences.into_iter().zip(completion_txs) {
+            let slot = slots.next().expect("slot count matches sequence count");
+            let post = (|| {
+                let (offset, length) = pool.recv_post_layout(slot)?;
+                let user_ctx = self.token(OperationType::Recv, slot).encode()?;
+                pool.mark_posted(slot, SlotKind::Rx)?;
+                let wr =
+                    match self
+                        .jetty
+                        .post_recv(pool.segment_handle()?, offset, length, user_ctx)
+                    {
+                        Ok(wr) => wr,
+                        Err(error) => {
+                            pool.rollback_post(slot, SlotKind::Rx)?;
+                            return Err(error);
+                        }
+                    };
+                completions.track_registered_rx(user_ctx, wr, Some(sequence), completion)
+            })();
+            if let Err(error) = post {
+                // `slot` is releasable only when no native post succeeded for
+                // it. A tracking failure after a successful post is a fatal
+                // invariant violation and the caller will drain the lane; in
+                // normal operation tracking cannot fail for freshly reserved
+                // generation-tagged slots.
+                if matches!(pool.release(slot), Err(Error::InvalidConfiguration(_))) {
+                    // Preserve the primary post/track error.
+                }
+                pool.release_unposted_rx_window(slots.collect())?;
                 return Err(error);
             }
-        };
-        completions.track(user_ctx, wr, sequence, completion)
+        }
+        Ok(())
     }
 
     pub(crate) fn send(
