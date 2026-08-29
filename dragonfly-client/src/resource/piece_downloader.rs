@@ -919,6 +919,8 @@ pub mod urma {
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Weak;
     use std::time::Instant;
     use tracing::{debug, info, warn};
 
@@ -987,6 +989,21 @@ pub mod urma {
         Ready(UrmaFabricHandle, UrmaCapability),
     }
 
+    /// CachedClient identifies the exact client generation stored for one parent. Transfer
+    /// failures retire only the generation that performed the failed operation, so a stale
+    /// request cannot remove a newer replacement client.
+    struct CachedClient {
+        last_used: Instant,
+        generation: u64,
+        client: UrmaClient,
+    }
+
+    /// ClientHandle carries cache identity alongside the clone used by one Piece request.
+    struct ClientHandle {
+        generation: u64,
+        client: UrmaClient,
+    }
+
     /// URMADownloader downloads pieces over UMDK/URMA with a shared fabric endpoint. The endpoint
     /// is opened lazily on the first download so a misconfigured or unsupported host degrades to
     /// TCP instead of failing at startup.
@@ -1007,7 +1024,15 @@ pub mod urma {
 
         /// clients keeps one persistent Session slot per parent. A client
         /// serializes Piece transfers on its lane and reconnects after failure.
-        clients: tokio::sync::Mutex<HashMap<String, (Instant, UrmaClient)>>,
+        clients: tokio::sync::Mutex<HashMap<String, CachedClient>>,
+
+        /// client_init_gates singleflight client creation per parent. Weak values avoid retaining
+        /// an entry after no request is checking or constructing that parent's client, while
+        /// separate parents never wait on each other's discovery or setup.
+        client_init_gates: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+
+        /// next_client_generation gives cache replacements a stable identity for compare/remove.
+        next_client_generation: AtomicU64,
     }
 
     /// URMADownloader implements the downloader over the UMDK/URMA transport.
@@ -1020,6 +1045,8 @@ pub mod urma {
                 unhealthy_parents: std::sync::Mutex::new(HashMap::new()),
                 capable_parents: std::sync::Mutex::new(HashMap::new()),
                 clients: tokio::sync::Mutex::new(HashMap::new()),
+                client_init_gates: std::sync::Mutex::new(HashMap::new()),
+                next_client_generation: AtomicU64::new(1),
             }
         }
 
@@ -1098,8 +1125,32 @@ pub mod urma {
             }
         }
 
-        async fn retire_client(&self, addr: &str) {
-            self.clients.lock().await.remove(addr);
+        /// client_init_gate returns the shared construction gate for one parent. The gate covers
+        /// the cache re-check and any slow discovery/setup, closing the check-then-insert race
+        /// without holding the global clients map lock across network I/O.
+        fn client_init_gate(&self, addr: &str) -> Arc<tokio::sync::Mutex<()>> {
+            let mut gates = self.client_init_gates.lock().unwrap();
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            if let Some(gate) = gates.get(addr).and_then(Weak::upgrade) {
+                return gate;
+            }
+
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            gates.insert(addr.to_string(), Arc::downgrade(&gate));
+            gate
+        }
+
+        /// retire_client removes only the client generation that observed the failure. A request
+        /// using an older clone must not evict a healthy replacement installed in the meantime.
+        async fn retire_client(&self, addr: &str, generation: u64) -> bool {
+            let mut clients = self.clients.lock().await;
+            let current = clients
+                .get(addr)
+                .is_some_and(|client| client.generation == generation);
+            if current {
+                clients.remove(addr);
+            }
+            current
         }
 
         /// check_parent errors fast for parents that are still serving a penalty.
@@ -1175,16 +1226,23 @@ pub mod urma {
         }
 
         /// client builds a UrmaClient for one parent address.
-        async fn client(&self, addr: &str) -> Result<UrmaClient> {
+        async fn client(&self, addr: &str) -> Result<ClientHandle> {
+            self.check_parent(addr)?;
+            let init_gate = self.client_init_gate(addr);
+            let _init = init_gate.lock().await;
+
+            // A concurrent request may have recorded a failure while this one waited for the
+            // parent gate. Re-check before reusing or constructing anything.
             self.check_parent(addr)?;
             let cached = {
                 let mut clients = self.clients.lock().await;
                 match clients.get_mut(addr) {
-                    Some((last_used, client))
-                        if last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT =>
-                    {
-                        *last_used = Instant::now();
-                        Some(client.clone())
+                    Some(cached) if cached.last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT => {
+                        cached.last_used = Instant::now();
+                        Some(ClientHandle {
+                            generation: cached.generation,
+                            client: cached.client.clone(),
+                        })
                     }
                     Some(_) => {
                         debug!(parent_addr = addr, "retiring idle cached urma client");
@@ -1194,12 +1252,12 @@ pub mod urma {
                     None => None,
                 }
             };
-            if let Some(client) = cached {
-                if !client.fabric_failed() {
-                    match client.take_transfer_outcome() {
+            if let Some(handle) = cached {
+                if !handle.client.fabric_failed() {
+                    match handle.client.take_transfer_outcome() {
                         Some(true) => self.record_success(addr),
                         Some(false) => {
-                            self.retire_client(addr).await;
+                            self.retire_client(addr, handle.generation).await;
                             self.record_failure(addr, Failure::Transport);
                             return Err(Error::Unsupported(format!(
                                 "parent {addr} failed its previous urma transfer"
@@ -1208,13 +1266,13 @@ pub mod urma {
                         None => {}
                     }
                     debug!(parent_addr = addr, "reusing cached urma client");
-                    return Ok(client);
+                    return Ok(handle);
                 }
                 warn!(
                     parent_addr = addr,
                     "retiring cached urma client after fabric failure"
                 );
-                self.retire_client(addr).await;
+                self.retire_client(addr, handle.generation).await;
             }
             let (fabric, capability) = self.fabric().await?;
             // advertisement records its own failures, since only it can tell an unreachable parent
@@ -1237,11 +1295,16 @@ pub mod urma {
                 rendezvous_addr = %rendezvous_addr,
                 "created cached urma client"
             );
-            self.clients
-                .lock()
-                .await
-                .insert(addr.to_string(), (Instant::now(), client.clone()));
-            Ok(client)
+            let generation = self.next_client_generation.fetch_add(1, Ordering::Relaxed);
+            self.clients.lock().await.insert(
+                addr.to_string(),
+                CachedClient {
+                    last_used: Instant::now(),
+                    generation,
+                    client: client.clone(),
+                },
+            );
+            Ok(ClientHandle { generation, client })
         }
     }
 
@@ -1257,15 +1320,18 @@ pub mod urma {
             _host_id: &str,
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
-            let client = self.client(addr).await?;
-            match client.download_piece(number, task_id).await {
+            let handle = self.client(addr).await?;
+            match handle.client.download_piece(number, task_id).await {
                 Ok(downloaded) => Ok(downloaded),
                 Err(err) => {
-                    if client.fabric_failed() {
+                    let fabric_failed = handle.client.fabric_failed();
+                    if fabric_failed {
                         self.retire_failed_fabric().await;
                     }
-                    self.retire_client(addr).await;
-                    self.record_failure(addr, classify_failure(&err));
+                    let retired = self.retire_client(addr, handle.generation).await;
+                    if retired || fabric_failed {
+                        self.record_failure(addr, classify_failure(&err));
+                    }
                     Err(err)
                 }
             }
@@ -1281,15 +1347,22 @@ pub mod urma {
             _host_id: &str,
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
-            let client = self.client(addr).await?;
-            match client.download_persistent_piece(number, task_id).await {
+            let handle = self.client(addr).await?;
+            match handle
+                .client
+                .download_persistent_piece(number, task_id)
+                .await
+            {
                 Ok(downloaded) => Ok(downloaded),
                 Err(err) => {
-                    if client.fabric_failed() {
+                    let fabric_failed = handle.client.fabric_failed();
+                    if fabric_failed {
                         self.retire_failed_fabric().await;
                     }
-                    self.retire_client(addr).await;
-                    self.record_failure(addr, classify_failure(&err));
+                    let retired = self.retire_client(addr, handle.generation).await;
+                    if retired || fabric_failed {
+                        self.record_failure(addr, classify_failure(&err));
+                    }
                     Err(err)
                 }
             }
@@ -1305,18 +1378,22 @@ pub mod urma {
             _host_id: &str,
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
-            let client = self.client(addr).await?;
-            match client
+            let handle = self.client(addr).await?;
+            match handle
+                .client
                 .download_persistent_cache_piece(number, task_id)
                 .await
             {
                 Ok(downloaded) => Ok(downloaded),
                 Err(err) => {
-                    if client.fabric_failed() {
+                    let fabric_failed = handle.client.fabric_failed();
+                    if fabric_failed {
                         self.retire_failed_fabric().await;
                     }
-                    self.retire_client(addr).await;
-                    self.record_failure(addr, classify_failure(&err));
+                    let retired = self.retire_client(addr, handle.generation).await;
+                    if retired || fabric_failed {
+                        self.record_failure(addr, classify_failure(&err));
+                    }
                     Err(err)
                 }
             }
@@ -1415,6 +1492,52 @@ pub mod urma {
                 UNHEALTHY_PARENT_MIN_BACKOFF * 4,
                 "a retry that fails again must keep escalating"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_initialization_is_serialized_per_parent() {
+            use std::sync::atomic::AtomicUsize;
+
+            const REQUESTS: usize = 8;
+            let downloader = Arc::new(test_downloader());
+            let ready = Arc::new(tokio::sync::Barrier::new(REQUESTS));
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let mut requests = Vec::with_capacity(REQUESTS);
+
+            for _ in 0..REQUESTS {
+                let downloader = downloader.clone();
+                let ready = ready.clone();
+                let active = active.clone();
+                let maximum = maximum.clone();
+                requests.push(tokio::spawn(async move {
+                    // Obtain every Arc before releasing the barrier. If the per-parent map fails
+                    // to return the same gate, the critical sections below overlap.
+                    let gate = downloader.client_init_gate("127.0.0.1:4001");
+                    ready.wait().await;
+                    let _guard = gate.lock().await;
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+
+            for request in requests {
+                request.await.unwrap();
+            }
+            assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn client_initialization_does_not_share_a_global_gate() {
+            let downloader = test_downloader();
+            let first = downloader.client_init_gate("127.0.0.1:4001");
+            let same_parent = downloader.client_init_gate("127.0.0.1:4001");
+            let other_parent = downloader.client_init_gate("127.0.0.2:4001");
+
+            assert!(Arc::ptr_eq(&first, &same_parent));
+            assert!(!Arc::ptr_eq(&first, &other_parent));
         }
     }
 }
