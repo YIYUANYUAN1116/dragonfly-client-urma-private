@@ -468,19 +468,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         })
     }
 
-    pub(crate) async fn receive_request(&mut self) -> Result<CommonPieceRequest> {
+    /// Waits for the next Piece request while the Session is idle. `Ok(None)` is a normal idle
+    /// expiry: no Piece or native operation is active, so the server can close the lane without
+    /// classifying the expiry as a transport failure.
+    pub(crate) async fn receive_request(
+        &mut self,
+        idle_timeout: Duration,
+    ) -> Result<Option<CommonPieceRequest>> {
         if self.piece.is_some() {
             return Err(Error::Protocol("an URMA Piece is already active".into()));
         }
-        let request = match read_control(
-            &mut self.stream,
-            self.control_timeout,
-            "receive Piece Request",
-        )
-        .await
-        {
-            Ok(Frame::Request(request)) => request,
-            Ok(frame) => return self.abort(unexpected(frame, "Piece request")).await,
+        let request = match read_idle_control(&mut self.stream, idle_timeout).await {
+            Ok(Some(Frame::Request(request))) => request,
+            Ok(Some(frame)) => return self.abort(unexpected(frame, "Piece request")).await,
+            Ok(None) => return Ok(None),
             Err(error) => return self.abort(error).await,
         };
         if request.task_id.is_empty()
@@ -510,7 +511,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             piece_number = request.piece_number,
             "urma piece request received on peer lane"
         );
-        Ok(request)
+        Ok(Some(request))
     }
 
     pub(crate) async fn ready(&mut self, metadata: PieceMetadata) -> Result<()> {
@@ -764,6 +765,17 @@ async fn write_error<S: AsyncWrite + Unpin>(
     .await
 }
 
+async fn read_idle_control<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    idle_timeout: Duration,
+) -> Result<Option<Frame>> {
+    match read_control(stream, idle_timeout, "wait for next Piece Request").await {
+        Ok(frame) => Ok(Some(frame)),
+        Err(Error::ControlTimeout { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,6 +891,15 @@ mod tests {
             Err(Error::ControlTimeout {
                 operation: "test read"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_idle_request_is_a_normal_expiry() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        assert_eq!(
+            read_idle_control(&mut reader, Duration::ZERO).await,
+            Ok(None)
         );
     }
 }

@@ -22,6 +22,7 @@ use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
     UrmaAdvertisement, UrmaCapability,
 };
+use crate::urma::server_session_idle_timeout;
 use crate::urma::session::UrmaServerSession;
 use crate::urma::Error as UrmaError;
 use crate::Storage;
@@ -269,6 +270,7 @@ struct UrmaServerHandler {
     capability: UrmaCapability,
     lane_config: UrmaLaneConfig,
     control_timeout: Duration,
+    session_idle_timeout: Duration,
     transfer_timeout: Duration,
     piece_timeout: Duration,
 }
@@ -292,6 +294,7 @@ impl UrmaServerHandler {
             capability,
             lane_config,
             control_timeout,
+            session_idle_timeout: server_session_idle_timeout(control_timeout),
             transfer_timeout,
             piece_timeout,
         }
@@ -313,7 +316,19 @@ impl UrmaServerHandler {
         .map_err(client_error)?;
 
         loop {
-            let request = session.receive_request().await.map_err(client_error)?;
+            let Some(request) = session
+                .receive_request(self.session_idle_timeout)
+                .await
+                .map_err(client_error)?
+            else {
+                debug!(
+                    lane_id = session.lane_id().unwrap_or_default(),
+                    idle_timeout = ?self.session_idle_timeout,
+                    "urma peer session idle timeout"
+                );
+                session.close().await.map_err(client_error)?;
+                return Ok(());
+            };
             let piece_id = self
                 .storage
                 .piece_id(&request.task_id, request.piece_number);

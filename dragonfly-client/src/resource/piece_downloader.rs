@@ -917,6 +917,7 @@ pub mod urma {
     use dragonfly_client_storage::client::urma::{discover, UrmaClient};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
+    use dragonfly_client_storage::urma::PEER_SESSION_IDLE_TIMEOUT;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -944,10 +945,6 @@ pub mod urma {
 
     /// CAPABLE_PARENT_TTL bounds how long a successful discovery result is reused.
     const CAPABLE_PARENT_TTL: Duration = Duration::from_secs(60);
-
-    /// PEER_SESSION_IDLE_TIMEOUT retires an unused persistent lane without
-    /// coupling its lifetime to the shorter capability refresh interval.
-    const PEER_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(420);
 
     /// Failure says why URMA to a parent did not work, which decides how long to avoid it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
