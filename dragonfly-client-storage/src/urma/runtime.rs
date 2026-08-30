@@ -25,6 +25,31 @@ impl RuntimeConfig {
             buffer_pool: BufferPoolConfig::default(),
         }
     }
+
+    pub(crate) fn with_registered_budget(
+        mut self,
+        max_registered_bytes: u64,
+        tx_registered_bytes: u64,
+    ) -> Result<Self> {
+        let slot_size = u64::try_from(self.buffer_pool.slot_size)
+            .map_err(|_| Error::InvalidConfiguration("URMA slot size exceeds u64".into()))?;
+        let total_slots = usize::try_from(max_registered_bytes / slot_size).map_err(|_| {
+            Error::InvalidConfiguration("URMA registered budget is too large".into())
+        })?;
+        let tx_slots = usize::try_from(tx_registered_bytes / slot_size)
+            .map_err(|_| Error::InvalidConfiguration("URMA TX budget is too large".into()))?;
+        if total_slots < 2 || tx_slots == 0 || tx_slots >= total_slots {
+            return Err(Error::InvalidConfiguration(
+                "URMA registered budget must reserve at least one slot for TX and RX".into(),
+            ));
+        }
+        self.buffer_pool.tx_slot_count = tx_slots;
+        self.buffer_pool.rx_slot_count = total_slots - tx_slots;
+        // Re-run the slot identity and multiplication bounds before native
+        // startup so an oversized budget cannot reach registration.
+        self.buffer_pool.total_len()?;
+        Ok(self)
+    }
 }
 
 fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> {
@@ -596,6 +621,12 @@ mod native {
                 ffi::MAX_POST_LIST
             )));
         }
+        if !(1..=2).contains(&config.pipeline_depth) {
+            return Err(Error::InvalidConfiguration(format!(
+                "Jetty pipeline_depth={} is outside 1..=2",
+                config.pipeline_depth
+            )));
+        }
         Ok(())
     }
 
@@ -669,6 +700,27 @@ mod tests {
         assert_eq!(config.send_jfc_depth, 4096);
         assert_eq!(config.recv_jfc_depth, 4096);
         assert_eq!(config.buffer_pool, BufferPoolConfig::default());
+        assert_eq!(config.buffer_pool.total_len().unwrap(), 40 * 1024 * 1024);
+    }
+
+    #[test]
+    fn registered_budget_preserves_tx_and_rx_guarantees() {
+        let config = RuntimeConfig::new("urma0", 0)
+            .with_registered_budget(20 * 1024 * 1024, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(config.buffer_pool.tx_slot_count, 64);
+        assert_eq!(config.buffer_pool.rx_slot_count, 256);
+        assert_eq!(config.buffer_pool.total_len().unwrap(), 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn registered_budget_requires_both_direction_reserves() {
+        assert!(RuntimeConfig::new("urma0", 0)
+            .with_registered_budget(64 * 1024, 64 * 1024)
+            .is_err());
+        assert!(RuntimeConfig::new("urma0", 0)
+            .with_registered_budget(128 * 1024, 0)
+            .is_err());
     }
 
     #[test]

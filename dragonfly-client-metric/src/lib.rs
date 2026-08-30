@@ -135,6 +135,20 @@ lazy_static! {
             &[]
         ).expect("metric can be created");
 
+    /// Process-wide URMA registered bytes split by reserved direction.
+    pub static ref URMA_REGISTERED_BYTES: IntGaugeVec =
+        IntGaugeVec::new(
+            Opts::new("urma_registered_bytes", "Gauge of process-wide UMDK registered bytes.").namespace(dragonfly_client_config::SERVICE_NAME).subsystem(dragonfly_client_config::NAME),
+            &["direction"]
+        ).expect("metric can be created");
+
+    /// Optional or required URMA window allocations rejected by bounded resources.
+    pub static ref URMA_BUDGET_PRESSURE_COUNT: IntCounterVec =
+        IntCounterVec::new(
+            Opts::new("urma_budget_pressure_total", "Counter of URMA registered-window budget pressure.").namespace(dragonfly_client_config::SERVICE_NAME).subsystem(dragonfly_client_config::NAME),
+            &["direction", "stage"]
+        ).expect("metric can be created");
+
     /// Used to record the download task duration.
     pub static ref DOWNLOAD_TASK_DURATION: HistogramVec =
         HistogramVec::new(
@@ -362,6 +376,14 @@ fn register_custom_metrics() {
 
     REGISTRY
         .register(Box::new(UPLOAD_TRAFFIC.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REGISTERED_BYTES.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_BUDGET_PRESSURE_COUNT.clone()))
         .expect("metric can be registered");
 
     REGISTRY
@@ -787,6 +809,24 @@ pub fn collect_upload_piece_finished_metrics() {
 /// Collects the upload piece traffic metrics.
 pub fn collect_upload_piece_traffic_metrics(length: u64) {
     UPLOAD_TRAFFIC.with_label_values(&[]).inc_by(length);
+}
+
+/// Publishes the fixed process-wide URMA registration split.
+pub fn collect_urma_registered_bytes_metrics(tx_bytes: u64, rx_bytes: u64) {
+    URMA_REGISTERED_BYTES
+        .with_label_values(&["tx"])
+        .set(i64::try_from(tx_bytes).unwrap_or(i64::MAX));
+    URMA_REGISTERED_BYTES
+        .with_label_values(&["rx"])
+        .set(i64::try_from(rx_bytes).unwrap_or(i64::MAX));
+}
+
+/// Counts a bounded allocation failure without using peer/Piece identifiers as
+/// high-cardinality labels; correlated logs retain those identities.
+pub fn collect_urma_budget_pressure_metrics(direction: &str, stage: &str) {
+    URMA_BUDGET_PRESSURE_COUNT
+        .with_label_values(&[direction, stage])
+        .inc();
 }
 
 /// Collects the upload piece failure metrics.

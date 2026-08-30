@@ -42,7 +42,6 @@ use tracing::{debug, error, instrument, warn, Span};
 
 /// Cap of concurrent receive windows buffered between the transfer task and the
 /// storage writer, mirroring the TCP/QUIC client backpressure.
-const WINDOW_CHANNEL_CAPACITY: usize = 2;
 
 const TRANSFER_HEALTHY: u8 = 0;
 const TRANSFER_ACTIVE: u8 = 1;
@@ -340,8 +339,14 @@ impl UrmaClient {
     ) -> Self {
         let transfer_timeout = config.storage.server.urma.transfer_timeout;
         let mut lane_config = UrmaLaneConfig::default();
-        lane_config.recv_depth = config.storage.server.urma.max_inflight_chunks;
+        lane_config.recv_depth = config
+            .storage
+            .server
+            .urma
+            .max_inflight_chunks
+            .min(fabric.max_rx_window_chunks(config.storage.server.urma.pipeline_depth));
         lane_config.post_list_size = config.storage.server.urma.post_list_size;
+        lane_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
         let fail_after_recv_windows = fail_after_recv_windows();
         if let Some(windows) = fail_after_recv_windows {
             warn!(
@@ -583,13 +588,16 @@ impl UrmaClient {
             metadata.offset, metadata.length, metadata.chunk_size, metadata.digest
         );
 
-        let (mut window_tx, window_rx) =
-            mpsc::channel::<io::Result<RegisteredRxWindowLease>>(WINDOW_CHANNEL_CAPACITY);
+        let (mut window_tx, window_rx) = mpsc::channel::<io::Result<RegisteredRxWindowLease>>(
+            self.lane_config.pipeline_depth as usize,
+        );
         let reader = UrmaStreamReader::new(window_rx, self.fabric.clone());
         let transfer_timeout = self.transfer_timeout;
         let piece_timeout = self.config.download.piece_timeout;
         let transfer_state = self.transfer_state.clone();
         let fail_after_recv_windows = self.fail_after_recv_windows;
+        let configured_pipeline_depth = self.lane_config.pipeline_depth;
+        let max_window_chunks = self.lane_config.recv_depth;
         let log_task_id = task_id.to_string();
         transfer_state.store(TRANSFER_ACTIVE, Ordering::Release);
         tokio::spawn(async move {
@@ -623,6 +631,8 @@ impl UrmaClient {
                         warn!(
                             lane_id = session.lane_id().unwrap_or_default(),
                             completed_windows,
+                            configured_pipeline_depth,
+                            max_window_chunks,
                             "injecting urma failure after real receive completions"
                         );
                         return Err(UrmaError::Protocol(format!(

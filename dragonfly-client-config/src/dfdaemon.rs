@@ -333,6 +333,24 @@ fn default_storage_server_urma_eid_index() -> u32 {
     0
 }
 
+/// Process-wide registered Segment budget. The default preserves the existing
+/// 128 TX + 512 RX slots at the fixed 64 KiB slot size.
+#[inline]
+fn default_storage_server_urma_max_registered_bytes() -> ByteSize {
+    ByteSize::mib(40)
+}
+
+/// TX-reserved portion of the process-wide URMA registration budget.
+#[inline]
+fn default_storage_server_urma_tx_registered_bytes() -> ByteSize {
+    ByteSize::mib(8)
+}
+
+#[inline]
+fn default_storage_server_urma_pipeline_depth() -> u32 {
+    2
+}
+
 /// default_storage_server_urma_max_inflight_chunks bounds the posted receive windows for one
 /// piece transfer, keeping the receive queue bounded regardless of piece or chunk size.
 #[inline]
@@ -1272,6 +1290,22 @@ pub struct UrmaServer {
     #[validate(length(min = 1))]
     pub fabric_tag: Option<String>,
 
+    /// Process-wide memory registered with UMDK. TX and RX share this ceiling,
+    /// while `txRegisteredBytes` reserves a non-stealable TX portion.
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_urma_max_registered_bytes"
+    )]
+    pub max_registered_bytes: ByteSize,
+
+    /// Portion of `maxRegisteredBytes` reserved for TX. The remainder is the
+    /// RX guarantee, preventing one direction from consuming the other.
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_urma_tx_registered_bytes"
+    )]
+    pub tx_registered_bytes: ByteSize,
+
     /// Maximum number of receive windows posted concurrently for one piece transfer. Peers
     /// negotiate the lower value.
     #[serde(default = "default_storage_server_urma_max_inflight_chunks")]
@@ -1284,6 +1318,12 @@ pub struct UrmaServer {
     #[serde(default = "default_storage_server_urma_post_list_size")]
     #[validate(range(min = 1, max = 64))]
     pub post_list_size: u32,
+
+    /// Maximum registered windows retained by one Piece pipeline. Depth two
+    /// enables overlap; depth one is the deterministic low-memory fallback.
+    #[serde(default = "default_storage_server_urma_pipeline_depth")]
+    #[validate(range(min = 1, max = 2))]
+    pub pipeline_depth: u32,
 
     /// Maximum number of accepted URMA peer lanes served concurrently. Admission is rejected
     /// with a typed BUSY response so the downloader can fall back without retiring capability.
@@ -1313,6 +1353,8 @@ const URMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
 /// URMA_MAX_TRANSFER_TIMEOUT bounds how long a stuck transfer can pin receive buffers before it
 /// is abandoned in favour of TCP.
 const URMA_MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+const URMA_REGISTERED_SLOT_SIZE: u64 = 64 * 1024;
+const URMA_MAX_REGISTERED_BYTES: u64 = (u16::MAX as u64 + 1) * URMA_REGISTERED_SLOT_SIZE;
 
 /// validate_urma_server rejects URMA settings that are individually parseable but cannot work.
 fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), ValidationError> {
@@ -1321,6 +1363,21 @@ fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), Validation
     {
         return Err(ValidationError::new(
             "transferTimeout must be between 1s and 10m",
+        ));
+    }
+
+    let registered = urma.max_registered_bytes.as_u64();
+    let tx_registered = urma.tx_registered_bytes.as_u64();
+    if registered < 2 * URMA_REGISTERED_SLOT_SIZE || registered > URMA_MAX_REGISTERED_BYTES {
+        return Err(ValidationError::new(
+            "maxRegisteredBytes must be between 128KiB and 4GiB",
+        ));
+    }
+    if tx_registered < URMA_REGISTERED_SLOT_SIZE
+        || tx_registered > registered.saturating_sub(URMA_REGISTERED_SLOT_SIZE)
+    {
+        return Err(ValidationError::new(
+            "txRegisteredBytes must leave at least one 64KiB slot for both TX and RX",
         ));
     }
 
@@ -1336,8 +1393,11 @@ impl Default for UrmaServer {
             device: None,
             eid_index: default_storage_server_urma_eid_index(),
             fabric_tag: None,
+            max_registered_bytes: default_storage_server_urma_max_registered_bytes(),
+            tx_registered_bytes: default_storage_server_urma_tx_registered_bytes(),
             max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
             post_list_size: default_storage_server_urma_post_list_size(),
+            pipeline_depth: default_storage_server_urma_pipeline_depth(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
             mmap_content: false,
@@ -2618,8 +2678,11 @@ key: /etc/ssl/private/client.pem
         assert!(urma.device.is_none());
         assert_eq!(urma.eid_index, 0);
         assert!(urma.fabric_tag.is_none());
+        assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));
+        assert_eq!(urma.tx_registered_bytes, ByteSize::mib(8));
         assert_eq!(urma.max_inflight_chunks, 512);
         assert_eq!(urma.post_list_size, 1);
+        assert_eq!(urma.pipeline_depth, 2);
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
         assert!(!urma.mmap_content);
@@ -2654,6 +2717,38 @@ key: /etc/ssl/private/client.pem
         for post_list_size in [0, 65] {
             let urma = UrmaServer {
                 post_list_size,
+                ..Default::default()
+            };
+            assert!(urma.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn reject_invalid_urma_registered_budget_split() {
+        for urma in [
+            UrmaServer {
+                max_registered_bytes: ByteSize::kib(64),
+                ..Default::default()
+            },
+            UrmaServer {
+                tx_registered_bytes: ByteSize::b(0),
+                ..Default::default()
+            },
+            UrmaServer {
+                max_registered_bytes: ByteSize::mib(1),
+                tx_registered_bytes: ByteSize::mib(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(urma.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn reject_invalid_urma_pipeline_depth() {
+        for pipeline_depth in [0, 3] {
+            let urma = UrmaServer {
+                pipeline_depth,
                 ..Default::default()
             };
             assert!(urma.validate().is_err());

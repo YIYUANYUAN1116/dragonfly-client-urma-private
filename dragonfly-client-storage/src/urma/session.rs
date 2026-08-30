@@ -15,6 +15,7 @@ use super::{
 };
 use crate::rendezvous::{ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
 use dragonfly_client_core::Error as ClientError;
+use dragonfly_client_metric::collect_urma_budget_pressure_metrics;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -161,6 +162,7 @@ struct ClientPiece {
     next_deliver_chunk: u64,
     pending: VecDeque<PendingReceiveWindow>,
     window_permits: std::sync::Arc<Semaphore>,
+    pipeline_depth: usize,
 }
 
 struct PendingReceiveWindow {
@@ -170,8 +172,6 @@ struct PendingReceiveWindow {
     permit: OwnedSemaphorePermit,
 }
 
-const RECEIVE_PIPELINE_DEPTH: usize = 2;
-
 /// Downloader-side peer session. `finish_piece` returns it to Idle so the
 /// same control connection and Jetty can carry the next Piece.
 pub(crate) struct UrmaClientSession<S> {
@@ -180,6 +180,7 @@ pub(crate) struct UrmaClientSession<S> {
     lane_id: Option<u16>,
     max_message_size: u64,
     max_receive_inflight: u32,
+    receive_pipeline_depth: usize,
     control_timeout: Duration,
     piece: Option<ClientPiece>,
 }
@@ -230,6 +231,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             lane_id: Some(lane_id),
             max_message_size,
             max_receive_inflight: lane_config.recv_depth,
+            receive_pipeline_depth: lane_config.pipeline_depth as usize,
             control_timeout,
             piece: None,
         })
@@ -292,8 +294,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             shape,
             next_post_chunk: 0,
             next_deliver_chunk: 0,
-            pending: VecDeque::with_capacity(RECEIVE_PIPELINE_DEPTH),
-            window_permits: std::sync::Arc::new(Semaphore::new(RECEIVE_PIPELINE_DEPTH)),
+            pending: VecDeque::with_capacity(self.receive_pipeline_depth),
+            window_permits: std::sync::Arc::new(Semaphore::new(self.receive_pipeline_depth)),
+            pipeline_depth: self.receive_pipeline_depth,
         });
         Ok(metadata)
     }
@@ -306,7 +309,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                     .piece
                     .as_ref()
                     .ok_or_else(|| Error::Protocol("no active URMA Piece".into()))?;
-                if piece.pending.len() >= RECEIVE_PIPELINE_DEPTH
+                if piece.pending.len() >= piece.pipeline_depth
                     || piece.next_post_chunk == piece.shape.chunk_count
                 {
                     return Ok(());
@@ -329,17 +332,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             let sequences = (window.start_chunk
                 ..window.start_chunk + u64::from(window.chunk_count))
                 .collect::<Vec<_>>();
-            let handles = match self
-                .fabric
-                .post_receive_window_registered(lane_id, sequences.clone())
-                .await
-            {
+            let post = if pending_count == 0 {
+                self.fabric
+                    .post_receive_window_registered(lane_id, sequences.clone())
+                    .await
+            } else {
+                self.fabric
+                    .try_post_receive_window_registered(lane_id, sequences.clone())
+                    .await
+            };
+            let handles = match post {
                 Ok(handles) => handles,
-                Err(Error::BufferUnavailable { .. }) if pending_count != 0 => {
+                Err(error @ Error::BufferUnavailable { .. }) if pending_count != 0 => {
                     // The first posted window guarantees forward progress. A
                     // second window is optional when the process-wide RX pool
                     // is under pressure.
+                    debug!(
+                        lane_id,
+                        %error,
+                        "URMA RX second window unavailable; continuing with one-window pipeline"
+                    );
+                    collect_urma_budget_pressure_metrics("rx", "optional");
                     return Ok(());
+                }
+                Err(error @ Error::BufferUnavailable { .. }) => {
+                    collect_urma_budget_pressure_metrics("rx", "required");
+                    return self.abort(error).await;
                 }
                 Err(error) => return self.abort(error).await,
             };

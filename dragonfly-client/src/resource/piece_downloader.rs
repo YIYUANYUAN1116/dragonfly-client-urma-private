@@ -1083,16 +1083,29 @@ pub mod urma {
                 ));
             };
 
-            match UrmaFabric::get_or_start(device, urma_config.eid_index) {
+            match UrmaFabric::get_or_start_with_budget(
+                device,
+                urma_config.eid_index,
+                urma_config.max_registered_bytes.as_u64(),
+                urma_config.tx_registered_bytes.as_u64(),
+            ) {
                 Ok(fabric) => {
+                    dragonfly_client_metric::collect_urma_registered_bytes_metrics(
+                        fabric.tx_registered_bytes(),
+                        fabric.rx_registered_bytes(),
+                    );
                     let capability = UrmaCapability {
                         transport_type: fabric.transport_type(),
                         fabric_tag: fabric_tag.to_string(),
                         max_message_size: fabric.max_message_size(),
                     };
                     info!(
+                        registered_bytes = fabric.registered_bytes(),
+                        tx_registered_bytes = fabric.tx_registered_bytes(),
+                        rx_registered_bytes = fabric.rx_registered_bytes(),
                         "urma downloader ready: transport type {}, fabric tag {}",
-                        capability.transport_type, capability.fabric_tag
+                        capability.transport_type,
+                        capability.fabric_tag
                     );
                     *state = FabricState::Ready(fabric.clone(), capability.clone());
                     Ok((fabric, capability))

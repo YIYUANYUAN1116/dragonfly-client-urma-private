@@ -33,6 +33,7 @@ use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use dragonfly_client_metric::{
     collect_upload_piece_failure_metrics, collect_upload_piece_finished_metrics,
     collect_upload_piece_started_metrics, collect_upload_piece_traffic_metrics,
+    collect_urma_budget_pressure_metrics, collect_urma_registered_bytes_metrics,
 };
 use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
@@ -188,19 +189,37 @@ impl UrmaServer {
             ));
         };
 
-        let fabric =
-            UrmaFabric::get_or_start(device, urma_config.eid_index).map_err(client_error)?;
+        let fabric = UrmaFabric::get_or_start_with_budget(
+            device,
+            urma_config.eid_index,
+            urma_config.max_registered_bytes.as_u64(),
+            urma_config.tx_registered_bytes.as_u64(),
+        )
+        .map_err(client_error)?;
         let capability = UrmaCapability {
             transport_type: fabric.transport_type(),
             fabric_tag: fabric_tag.to_string(),
             max_message_size: fabric.max_message_size(),
         };
+        info!(
+            registered_bytes = fabric.registered_bytes(),
+            tx_registered_bytes = fabric.tx_registered_bytes(),
+            rx_registered_bytes = fabric.rx_registered_bytes(),
+            pipeline_depth = urma_config.pipeline_depth,
+            post_list_size = urma_config.post_list_size,
+            "urma process registration budget ready"
+        );
+        collect_urma_registered_bytes_metrics(
+            fabric.tx_registered_bytes(),
+            fabric.rx_registered_bytes(),
+        );
         let lane_config = UrmaLaneConfig {
             send_depth: urma_config
                 .max_inflight_chunks
-                .min(fabric.max_tx_window_chunks()),
+                .min(fabric.max_tx_window_chunks(urma_config.pipeline_depth)),
             recv_depth: urma_config.max_inflight_chunks,
             post_list_size: urma_config.post_list_size,
+            pipeline_depth: urma_config.pipeline_depth,
             ..Default::default()
         };
         let handler = Arc::new(UrmaServerHandler::new(
@@ -537,6 +556,9 @@ impl UrmaServerHandler {
         let mut current = match acquired {
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => {
+                if matches!(error, UrmaError::BufferUnavailable { .. }) {
+                    collect_urma_budget_pressure_metrics("tx", "required");
+                }
                 let code = if matches!(error, UrmaError::BufferUnavailable { .. }) {
                     ERROR_CODE_BUSY
                 } else {
@@ -569,7 +591,7 @@ impl UrmaServerHandler {
         // this transfer to a one-window pipeline without changing allocator
         // structure or blocking every admitted peer behind the ring.
         let first_window_len = current.len() as u64;
-        let mut spare = if first_window_len < piece.length {
+        let mut spare = if self.lane_config.pipeline_depth > 1 && first_window_len < piece.length {
             let next_lengths = tx_window_chunk_lengths(
                 piece.length,
                 chunk_size,
@@ -577,13 +599,8 @@ impl UrmaServerHandler {
                 first_window_len,
             )?;
             let next_window_chunks = next_lengths.len();
-            match time::timeout(
-                self.transfer_timeout,
-                self.fabric.acquire_tx_window_chunks(next_lengths),
-            )
-            .await
-            {
-                Ok(Ok(lease)) => {
+            match self.fabric.try_acquire_tx_window_chunks(next_lengths).await {
+                Ok(lease) => {
                     debug!(
                         tx_ring_depth = 2,
                         window_chunks = next_window_chunks,
@@ -591,14 +608,15 @@ impl UrmaServerHandler {
                     );
                     Some(lease)
                 }
-                Ok(Err(UrmaError::BufferUnavailable { .. })) | Err(_) => {
+                Err(UrmaError::BufferUnavailable { .. }) => {
+                    collect_urma_budget_pressure_metrics("tx", "optional");
                     debug!(
                         tx_ring_depth = 1,
                         "URMA TX second lease unavailable; falling back to single ring"
                     );
                     None
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     let _ = session
                         .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
                         .await;
@@ -751,6 +769,8 @@ impl UrmaServerHandler {
             tx_ring_depth,
             tx_overlap_windows,
             tx_second_lease_fallback,
+            configured_pipeline_depth = self.lane_config.pipeline_depth,
+            max_window_chunks = self.lane_config.send_depth,
             limiter_wait_ns,
             source_open_ns,
             tx_ready_ns,

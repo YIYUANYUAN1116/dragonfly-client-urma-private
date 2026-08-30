@@ -104,6 +104,10 @@ impl LaneCredits {
         debug_assert!(self.remote_receives_available >= count);
         self.remote_receives_available -= count;
     }
+
+    fn clear(&mut self) {
+        self.remote_receives_available = 0;
+    }
 }
 
 const JETTY_DESCRIPTOR_VERSION: u16 = 1;
@@ -206,6 +210,7 @@ pub(crate) struct JettyConfig {
     pub(crate) max_send_sge: u32,
     pub(crate) max_recv_sge: u32,
     pub(crate) post_list_size: u32,
+    pub(crate) pipeline_depth: u32,
     pub(crate) token: u32,
 }
 
@@ -217,6 +222,7 @@ impl Default for JettyConfig {
             max_send_sge: 1,
             max_recv_sge: 1,
             post_list_size: 1,
+            pipeline_depth: 2,
             token: 0,
         }
     }
@@ -697,6 +703,7 @@ impl UrmaLane {
         }
         match self.jetty.close() {
             Ok(()) => {
+                self.credits.clear();
                 self.state = LaneState::Closed;
                 Ok(())
             }

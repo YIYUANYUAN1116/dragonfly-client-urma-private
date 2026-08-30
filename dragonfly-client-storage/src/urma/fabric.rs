@@ -33,6 +33,11 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 
+fn window_chunks_for_slots(slots: usize, pipeline_depth: u32) -> u32 {
+    let depth = usize::try_from(pipeline_depth).unwrap_or(usize::MAX).max(1);
+    u32::try_from((slots / depth).max(1)).unwrap_or(u32::MAX)
+}
+
 /// Process-wide weak registry used by dfdaemon's server and downloader adapters. Native UMDK
 /// permits one Runtime owner in this implementation, so independently starting both adapters
 /// would make the second one fail with `AlreadyInitialized`.
@@ -57,6 +62,7 @@ pub(crate) struct UrmaLaneConfig {
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
     pub post_list_size: u32,
+    pub pipeline_depth: u32,
     pub token: u32,
 }
 
@@ -68,6 +74,7 @@ impl Default for UrmaLaneConfig {
             max_send_sge: 1,
             max_recv_sge: 1,
             post_list_size: 1,
+            pipeline_depth: 2,
             token: 0,
         }
     }
@@ -81,6 +88,7 @@ impl From<UrmaLaneConfig> for JettyConfig {
             max_send_sge: config.max_send_sge,
             max_recv_sge: config.max_recv_sge,
             post_list_size: config.post_list_size,
+            pipeline_depth: config.pipeline_depth,
             token: config.token,
         }
     }
@@ -116,7 +124,21 @@ impl UrmaFabric {
         device_name: impl Into<String>,
         eid_index: u32,
     ) -> Result<UrmaFabricHandle> {
-        let config = RuntimeConfig::new(device_name, eid_index);
+        Self::get_or_start_config(RuntimeConfig::new(device_name, eid_index))
+    }
+
+    pub fn get_or_start_with_budget(
+        device_name: impl Into<String>,
+        eid_index: u32,
+        max_registered_bytes: u64,
+        tx_registered_bytes: u64,
+    ) -> Result<UrmaFabricHandle> {
+        let config = RuntimeConfig::new(device_name, eid_index)
+            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?;
+        Self::get_or_start_config(config)
+    }
+
+    fn get_or_start_config(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
         let mut shared = SHARED_FABRIC
             .get_or_init(|| Mutex::new(Weak::new()))
             .lock()
@@ -268,11 +290,37 @@ impl UrmaFabricHandle {
         self.inner.max_message_size
     }
 
-    /// Maximum logical SEND window that leaves room for a second registered
-    /// lease in the fixed TX pool. A one-slot pool still supports ring=1.
-    pub(crate) fn max_tx_window_chunks(&self) -> u32 {
+    pub fn registered_bytes(&self) -> u64 {
+        u64::try_from(
+            self.inner
+                .runtime_config
+                .buffer_pool
+                .total_len()
+                .unwrap_or_default(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    pub fn tx_registered_bytes(&self) -> u64 {
+        let pool = &self.inner.runtime_config.buffer_pool;
+        u64::try_from(pool.slot_size.saturating_mul(pool.tx_slot_count)).unwrap_or(u64::MAX)
+    }
+
+    pub fn rx_registered_bytes(&self) -> u64 {
+        let pool = &self.inner.runtime_config.buffer_pool;
+        u64::try_from(pool.slot_size.saturating_mul(pool.rx_slot_count)).unwrap_or(u64::MAX)
+    }
+
+    /// Maximum logical SEND window after dividing the TX reserve across the
+    /// configured per-Piece pipeline. A one-slot pool still supports depth one.
+    pub(crate) fn max_tx_window_chunks(&self, pipeline_depth: u32) -> u32 {
         let slots = self.inner.runtime_config.buffer_pool.tx_slot_count;
-        u32::try_from((slots / 2).max(1)).unwrap_or(u32::MAX)
+        window_chunks_for_slots(slots, pipeline_depth)
+    }
+
+    pub(crate) fn max_rx_window_chunks(&self, pipeline_depth: u32) -> u32 {
+        let slots = self.inner.runtime_config.buffer_pool.rx_slot_count;
+        window_chunks_for_slots(slots, pipeline_depth)
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -303,6 +351,25 @@ impl UrmaFabricHandle {
         lane_id: u16,
         sequences: Vec<u64>,
     ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
+        self.post_receive_window_registered_with_admission(lane_id, sequences, false)
+            .await
+    }
+
+    pub(crate) async fn try_post_receive_window_registered(
+        &self,
+        lane_id: u16,
+        sequences: Vec<u64>,
+    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
+        self.post_receive_window_registered_with_admission(lane_id, sequences, true)
+            .await
+    }
+
+    async fn post_receive_window_registered_with_admission(
+        &self,
+        lane_id: u16,
+        sequences: Vec<u64>,
+        try_admission: bool,
+    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
         if sequences.is_empty() {
             return Err(Error::InvalidConfiguration(
                 "registered RX window cannot be empty".into(),
@@ -320,13 +387,23 @@ impl UrmaFabricHandle {
                 abort: Some((command_tx.clone(), lane_id)),
             });
         }
-        self.submit(|reply| FabricCommand::PostReceiveWindowRegistered {
-            lane_id,
-            sequences,
-            completion_txs,
-            reply,
-        })
-        .await?;
+        if try_admission {
+            self.try_submit(|reply| FabricCommand::PostReceiveWindowRegistered {
+                lane_id,
+                sequences,
+                completion_txs,
+                reply,
+            })
+            .await?;
+        } else {
+            self.submit(|reply| FabricCommand::PostReceiveWindowRegistered {
+                lane_id,
+                sequences,
+                completion_txs,
+                reply,
+            })
+            .await?;
+        }
         Ok(handles)
     }
 
@@ -362,6 +439,20 @@ impl UrmaFabricHandle {
     pub(crate) async fn recycle_tx_window(&self, lease: TxWindowLease) -> Result<usize> {
         self.submit_urgent(|reply| FabricCommand::RecycleTxWindow { lease, reply })
             .await
+    }
+
+    /// Non-blocking admission variant used while a Piece already owns its
+    /// first TX window. This prevents a full command queue from turning an
+    /// optional overlap window into a circular resource wait.
+    pub(crate) async fn try_acquire_tx_window_chunks(
+        &self,
+        chunk_lengths: Vec<usize>,
+    ) -> Result<TxWindowLease> {
+        self.try_submit(|reply| FabricCommand::AcquireTxWindowChunks {
+            chunk_lengths,
+            reply,
+        })
+        .await
     }
 
     #[allow(dead_code)] // B1 ownership API, consumed by B2/B3.
@@ -432,6 +523,29 @@ impl UrmaFabricHandle {
             .acquire_owned()
             .await
             .map_err(|_| fabric_stopped())?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(CommandEnvelope::admitted(make_command(reply_tx), permit))
+            .map_err(|_| fabric_stopped())?;
+        reply_rx.await.map_err(|_| fabric_stopped())?
+    }
+
+    async fn try_submit<T>(
+        &self,
+        make_command: impl FnOnce(oneshot::Sender<Result<T>>) -> FabricCommand,
+    ) -> Result<T> {
+        let command_tx = self.command_sender()?;
+        let available = self.inner.command_slots.available_permits();
+        let permit = self
+            .inner
+            .command_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::BufferUnavailable {
+                kind: "fabric command",
+                requested: 1,
+                available,
+            })?;
         let (reply_tx, reply_rx) = oneshot::channel();
         command_tx
             .send(CommandEnvelope::admitted(make_command(reply_tx), permit))
@@ -931,15 +1045,24 @@ mod tests {
             max_send_sge: 3,
             max_recv_sge: 4,
             post_list_size: 5,
+            pipeline_depth: 2,
             token: 6,
         };
         let native: JettyConfig = config.into();
         assert_eq!(native.send_depth, 1);
         assert_eq!(native.recv_depth, 2);
         assert_eq!(native.post_list_size, 5);
+        assert_eq!(native.pipeline_depth, 2);
         assert_eq!(native.max_send_sge, 3);
         assert_eq!(native.max_recv_sge, 4);
         assert_eq!(native.token, 6);
+    }
+
+    #[test]
+    fn pipeline_depth_reserves_slots_for_each_window() {
+        assert_eq!(window_chunks_for_slots(128, 1), 128);
+        assert_eq!(window_chunks_for_slots(128, 2), 64);
+        assert_eq!(window_chunks_for_slots(1, 2), 1);
     }
 
     #[test]
