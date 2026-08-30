@@ -26,6 +26,8 @@ use reqwest::header::HeaderMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "urma")]
+use std::time::Instant;
 use tokio::{
     fs,
     io::{AsyncBufRead, AsyncRead, AsyncReadExt},
@@ -938,13 +940,26 @@ impl Storage {
         reader: &mut crate::client::urma::UrmaStreamReader,
         timeout: Duration,
     ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
         let response = self
             .content
             .write_piece_from_urma_stream(piece_id, task_id, offset, length, reader, timeout)
             .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
         let piece =
             self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
         self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "normal",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
         Ok(piece)
     }
 
@@ -963,15 +978,28 @@ impl Storage {
         reader: &mut crate::client::urma::UrmaStreamReader,
         timeout: Duration,
     ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
         let response = self
             .content
             .write_persistent_piece_from_urma_stream(
                 piece_id, task_id, offset, length, reader, timeout,
             )
             .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
         let piece =
             self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
         self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "persistent",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
         Ok(piece)
     }
 
@@ -990,15 +1018,28 @@ impl Storage {
         reader: &mut crate::client::urma::UrmaStreamReader,
         timeout: Duration,
     ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
         let response = self
             .content
             .write_persistent_cache_piece_from_urma_stream(
                 piece_id, task_id, offset, length, reader, timeout,
             )
             .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
         let piece =
             self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
         self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "persistent-cache",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
         Ok(piece)
     }
 

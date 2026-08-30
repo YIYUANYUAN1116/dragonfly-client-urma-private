@@ -24,7 +24,7 @@ use crate::urma::rendezvous::{
     UrmaAdvertisement, UrmaCapability,
 };
 use crate::urma::server_session_idle_timeout;
-use crate::urma::session::UrmaServerSession;
+use crate::urma::session::{RegisteredSendTiming, UrmaServerSession};
 use crate::urma::Error as UrmaError;
 use crate::urma::TxWindowLease;
 use crate::Storage;
@@ -446,6 +446,7 @@ impl UrmaServerHandler {
         request: &CommonPieceRequest,
         piece_id: &str,
     ) -> ClientResult<u64> {
+        let piece_total_start = Instant::now();
         let piece = match self.piece_metadata(request.kind, piece_id) {
             Ok(Some(piece)) => piece,
             Ok(None) => {
@@ -494,7 +495,10 @@ impl UrmaServerHandler {
             }
         };
 
+        let limiter_start = Instant::now();
         self.upload_bandwidth_limiter.acquire(piece_length).await;
+        let limiter_wait_ns = limiter_start.elapsed().as_nanos() as u64;
+        let source_open_start = Instant::now();
         let mut source = match self.open_piece_source(request, piece_id).await {
             Ok(source) => source,
             Err(error) => {
@@ -504,6 +508,7 @@ impl UrmaServerHandler {
                 return Err(error);
             }
         };
+        let source_open_ns = source_open_start.elapsed().as_nanos() as u64;
 
         // TX ring observability. tx_ring_depth reports the effective ring
         // depth (2 only when at least one send overlapped a concurrent fill);
@@ -556,7 +561,8 @@ impl UrmaServerHandler {
             let _ = self.fabric.recycle_tx_window(current).await;
             return Err(error);
         }
-        tx_fill_ns += fill_start.elapsed().as_nanos() as u64;
+        let tx_initial_fill_ns = fill_start.elapsed().as_nanos() as u64;
+        tx_fill_ns += tx_initial_fill_ns;
 
         // A second exclusive lease is optional. Fixed pool pressure degrades
         // this transfer to a one-window pipeline without changing allocator
@@ -601,6 +607,7 @@ impl UrmaServerHandler {
         } else {
             None
         };
+        let ready_start = Instant::now();
         session
             .ready(PieceMetadata {
                 offset: piece.offset,
@@ -611,6 +618,16 @@ impl UrmaServerHandler {
             })
             .await
             .map_err(client_error)?;
+        let tx_ready_ns = ready_start.elapsed().as_nanos() as u64;
+
+        let accumulate_send_timing =
+            |total: &mut RegisteredSendTiming, timing: RegisteredSendTiming| {
+                total.recv_posted_wait_ns += timing.recv_posted_wait_ns;
+                total.grant_credit_ns += timing.grant_credit_ns;
+                total.wr_post_ns += timing.wr_post_ns;
+                total.send_cqe_wait_ns += timing.send_cqe_wait_ns;
+            };
+        let mut send_timing = RegisteredSendTiming::default();
 
         let mut sent = 0u64;
         while sent < piece.length {
@@ -642,12 +659,12 @@ impl UrmaServerHandler {
                         let result = source.fill(next_offset, &mut next).await;
                         (start.elapsed().as_nanos() as u64, result)
                     };
-                    let ((send_ns, send_result), (fill_ns, fill_result)) =
-                        tokio::join!(send, fill);
+                    let ((send_ns, send_result), (fill_ns, fill_result)) = tokio::join!(send, fill);
                     tx_send_wait_ns += send_ns;
                     tx_fill_ns += fill_ns;
                     tx_overlap_windows += 1;
-                    let returned = send_result.map_err(client_error)?;
+                    let (returned, timing) = send_result.map_err(client_error)?;
+                    accumulate_send_timing(&mut send_timing, timing);
                     if let Err(error) = fill_result {
                         let _ = session
                             .reject_piece(ERROR_CODE_INTERNAL, &error.to_string())
@@ -661,10 +678,11 @@ impl UrmaServerHandler {
                 } else {
                     tx_second_lease_fallback = true;
                     let send_start = Instant::now();
-                    let mut returned = session
+                    let (mut returned, timing) = session
                         .send_next_registered_window(current, self.transfer_timeout)
                         .await
                         .map_err(client_error)?;
+                    accumulate_send_timing(&mut send_timing, timing);
                     tx_send_wait_ns += send_start.elapsed().as_nanos() as u64;
                     returned.reshape(&next_lengths).map_err(client_error)?;
                     let fill_start = Instant::now();
@@ -687,10 +705,12 @@ impl UrmaServerHandler {
                 }
             } else {
                 let send_start = Instant::now();
-                current = session
+                let (returned, timing) = session
                     .send_next_registered_window(current, self.transfer_timeout)
                     .await
                     .map_err(client_error)?;
+                current = returned;
+                accumulate_send_timing(&mut send_timing, timing);
                 tx_send_wait_ns += send_start.elapsed().as_nanos() as u64;
             }
             sent = sent
@@ -713,7 +733,14 @@ impl UrmaServerHandler {
                 .await
                 .map_err(client_error)?;
         }
+        let done_start = Instant::now();
         session.finish_piece().await.map_err(client_error)?;
+        let tx_done_ns = done_start.elapsed().as_nanos() as u64;
+        let tx_recv_posted_wait_ns = send_timing.recv_posted_wait_ns;
+        let tx_grant_credit_ns = send_timing.grant_credit_ns;
+        let tx_wr_post_ns = send_timing.wr_post_ns;
+        let tx_send_cqe_wait_ns = send_timing.send_cqe_wait_ns;
+        let piece_total_ns = piece_total_start.elapsed().as_nanos() as u64;
         let tx_ring_depth = if tx_overlap_windows > 0 { 2 } else { 1 };
         debug!(
             lane_id = session.lane_id().unwrap_or_default(),
@@ -723,8 +750,18 @@ impl UrmaServerHandler {
             tx_ring_depth,
             tx_overlap_windows,
             tx_second_lease_fallback,
+            limiter_wait_ns,
+            source_open_ns,
+            tx_ready_ns,
+            tx_initial_fill_ns,
             tx_fill_ns,
             tx_send_wait_ns,
+            tx_recv_posted_wait_ns,
+            tx_grant_credit_ns,
+            tx_wr_post_ns,
+            tx_send_cqe_wait_ns,
+            tx_done_ns,
+            piece_total_ns,
             "finished uploading piece content over urma"
         );
         Ok(piece.length)

@@ -729,6 +729,7 @@ impl Piece {
         parent_id: &str,
         tcp_addr: &str,
     ) -> Result<metadata::Piece> {
+        let child_piece_e2e_start = Instant::now();
         let Some(downloader) = self.urma_direct_downloader.as_ref() else {
             return Err(Error::Unknown("urma downloader is disabled".to_string()));
         };
@@ -796,7 +797,7 @@ impl Piece {
             }
         };
 
-        match finished {
+        let result = match finished {
             Ok(piece) => Ok(piece),
             Err(error) => {
                 match kind {
@@ -822,7 +823,16 @@ impl Piece {
                 }
                 Err(error)
             }
-        }
+        };
+        debug!(
+            piece_id,
+            piece_kind = ?kind,
+            length,
+            success = result.is_ok(),
+            child_piece_e2e_ns = child_piece_e2e_start.elapsed().as_nanos() as u64,
+            "finished dragonfly urma piece attempt"
+        );
+        result
     }
 
     /// Downloads a single piece from the source.

@@ -15,7 +15,10 @@ use super::{
 };
 use crate::rendezvous::{ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
 use dragonfly_client_core::Error as ClientError;
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -35,6 +38,17 @@ fn unexpected(frame: Frame, phase: &str) -> Error {
         },
         frame => Error::Protocol(format!("unexpected URMA frame during {phase}: {frame:?}")),
     }
+}
+
+/// Timing for the control, submission, and completion portions of one
+/// registered TX window. Keeping these phases separate prevents the server's
+/// Piece log from treating the old aggregate send wait as pure NIC time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RegisteredSendTiming {
+    pub(crate) recv_posted_wait_ns: u64,
+    pub(crate) grant_credit_ns: u64,
+    pub(crate) wr_post_ns: u64,
+    pub(crate) send_cqe_wait_ns: u64,
 }
 
 async fn read_control<S: AsyncRead + Unpin>(
@@ -640,7 +654,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         &mut self,
         lease: TxWindowLease,
         timeout: Duration,
-    ) -> Result<TxWindowLease> {
+    ) -> Result<(TxWindowLease, RegisteredSendTiming)> {
+        let mut timing = RegisteredSendTiming::default();
         let lane_id = self.open_lane()?;
         let piece = self
             .piece
@@ -651,6 +666,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             .as_ref()
             .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
         let expected = shape.window(piece.next_chunk)?;
+        let recv_posted_start = Instant::now();
         let window = match read_control(
             &mut self.stream,
             self.control_timeout,
@@ -662,6 +678,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             Ok(frame) => return self.abort_peer(unexpected(frame, "receive credit")).await,
             Err(error) => return self.abort(error).await,
         };
+        timing.recv_posted_wait_ns = recv_posted_start.elapsed().as_nanos() as u64;
         if window != expected {
             return self
                 .abort_peer(Error::Protocol(format!(
@@ -680,6 +697,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
                 )))
                 .await;
         }
+        let grant_credit_start = Instant::now();
         if let Err(error) = self
             .fabric
             .grant_send_credit(lane_id, window.chunk_count)
@@ -687,8 +705,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         {
             return self.abort_peer(error).await;
         }
+        timing.grant_credit_ns = grant_credit_start.elapsed().as_nanos() as u64;
         let sequences = (window.start_chunk..window.start_chunk + u64::from(window.chunk_count))
             .collect::<Vec<_>>();
+        let wr_post_start = Instant::now();
         let operation = match self
             .fabric
             .send_registered_window(lane_id, lease, sequences.clone())
@@ -697,10 +717,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             Ok(operation) => operation,
             Err(error) => return self.abort_peer(error).await,
         };
+        timing.wr_post_ns = wr_post_start.elapsed().as_nanos() as u64;
+        let send_cqe_start = Instant::now();
         let completed = match operation.wait_timeout(timeout).await {
             Ok(completed) => completed,
             Err(error) => return self.abort_peer(error).await,
         };
+        timing.send_cqe_wait_ns = send_cqe_start.elapsed().as_nanos() as u64;
         if completed.lane_id != lane_id || completed.sequences != sequences {
             return self
                 .abort_peer(Error::Protocol(
@@ -709,7 +732,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
                 .await;
         }
         self.piece.as_mut().expect("active Piece").next_chunk += u64::from(window.chunk_count);
-        Ok(completed.lease)
+        Ok((completed.lease, timing))
     }
 
     pub(crate) async fn finish_piece(&mut self) -> Result<()> {

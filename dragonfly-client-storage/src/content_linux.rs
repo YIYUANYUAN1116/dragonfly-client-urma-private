@@ -27,8 +27,12 @@ use std::cmp::max;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "urma")]
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncRead;
+#[cfg(feature = "urma")]
+use tracing::debug;
 use tracing::{error, info, instrument, warn};
 use walkdir::WalkDir;
 
@@ -572,22 +576,33 @@ impl Content {
         use std::os::unix::fs::FileExt;
         use tokio::time::timeout;
 
+        let storage_total_start = Instant::now();
+        let file_open_start = Instant::now();
         let file = self
             .fd_cache
             .open_write(&task_path)
             .await
             .inspect_err(|error| error!("open {:?} failed: {}", task_path, error))?;
+        let file_open_ns = file_open_start.elapsed().as_nanos() as u64;
         let mut hasher = crc32fast::Hasher::new();
         let mut length = 0u64;
+        let mut rx_windows = 0u64;
+        let mut rx_window_wait_ns = 0u64;
+        let mut digest_ns = 0u64;
+        let mut pwrite_ns = 0u64;
+        let mut recycle_ns = 0u64;
 
         loop {
+            let window_wait_start = Instant::now();
             let window = match timeout(window_timeout, reader.next_window()).await {
                 Ok(window) => window?,
                 Err(_) => return Err(Error::DownloadPieceFinishedTimeout(piece_id.to_string())),
             };
+            rx_window_wait_ns += window_wait_start.elapsed().as_nanos() as u64;
             let Some(window) = window else {
                 break;
             };
+            rx_windows += 1;
             let window_length = u64::try_from(window.len())
                 .map_err(|_| Error::Unknown("URMA window length exceeds u64".into()))?;
             let remaining = expected_length.checked_sub(length).ok_or_else(|| {
@@ -608,16 +623,18 @@ impl Content {
             let digest = {
                 let window = window.clone();
                 tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
                     for part in window.parts() {
                         hasher.update(part);
                     }
-                    hasher
+                    (hasher, start.elapsed().as_nanos() as u64)
                 })
             };
             let write = {
                 let window = window.clone();
                 let file = file.clone();
                 tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
                     let mut part_offset = position;
                     for part in window.parts() {
                         file.write_all_at(part, part_offset)?;
@@ -626,17 +643,22 @@ impl Content {
                                 std::io::Error::other("URMA positional write offset overflow")
                             })?;
                     }
-                    Ok::<(), std::io::Error>(())
+                    Ok::<u64, std::io::Error>(start.elapsed().as_nanos() as u64)
                 })
             };
 
             let (digest, write) = tokio::join!(digest, write);
             let window = Arc::try_unwrap(window)
                 .map_err(|_| Error::Unknown("URMA window worker retained its lease".into()))?;
+            let recycle_start = Instant::now();
             let recycle = window.recycle().await;
+            recycle_ns += recycle_start.elapsed().as_nanos() as u64;
 
-            hasher = digest.map_err(|error| Error::Unknown(format!("digest panicked: {error}")))?;
-            write
+            let (next_hasher, window_digest_ns) =
+                digest.map_err(|error| Error::Unknown(format!("digest panicked: {error}")))?;
+            hasher = next_hasher;
+            digest_ns += window_digest_ns;
+            pwrite_ns += write
                 .map_err(|error| Error::Unknown(format!("write piece panicked: {error}")))?
                 .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
             recycle?;
@@ -648,6 +670,20 @@ impl Content {
                 "expected length {expected_length} but got {length}"
             )));
         }
+
+        let storage_total_ns = storage_total_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            expected_length,
+            rx_windows,
+            file_open_ns,
+            rx_window_wait_ns,
+            digest_ns,
+            pwrite_ns,
+            recycle_ns,
+            storage_total_ns,
+            "finished writing urma piece from registered receive windows"
+        );
 
         Ok(super::io::WriteRangeResponse {
             length,

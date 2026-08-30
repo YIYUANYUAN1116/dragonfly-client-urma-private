@@ -35,7 +35,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time;
 use tracing::{debug, error, instrument, warn, Span};
@@ -513,10 +513,13 @@ impl UrmaClient {
         number: u32,
         task_id: &str,
     ) -> ClientResult<(UrmaStreamReader, u64, String)> {
+        let client_piece_total_start = Instant::now();
         // The owned guard is moved into the transfer task. This serializes
         // Piece requests on the persistent lane without exposing Session above
         // the storage adapter.
+        let session_queue_start = Instant::now();
         let mut session_slot = self.session.clone().lock_owned().await;
+        let session_queue_wait_ns = session_queue_start.elapsed().as_nanos() as u64;
         if self.transfer_state.load(Ordering::Acquire) == TRANSFER_FAILED {
             return Err(ClientError::Unknown(
                 "previous urma transfer failed; retire the cached peer session".into(),
@@ -569,7 +572,9 @@ impl UrmaClient {
             chunk_size: max_message_size,
             max_inflight_chunks: self.lane_config.recv_depth,
         };
+        let request_ready_start = Instant::now();
         let metadata = session.request_piece(request).await.map_err(urma_error)?;
+        let request_ready_ns = request_ready_start.elapsed().as_nanos() as u64;
         let result_offset = metadata.offset;
         let result_digest = metadata.digest.clone();
         debug!(
@@ -584,22 +589,35 @@ impl UrmaClient {
         let piece_timeout = self.config.download.piece_timeout;
         let transfer_state = self.transfer_state.clone();
         let fail_after_recv_windows = self.fail_after_recv_windows;
+        let log_task_id = task_id.to_string();
         transfer_state.store(TRANSFER_ACTIVE, Ordering::Release);
         tokio::spawn(async move {
             let mut transfer = Box::pin(async {
                 let mut completed_windows = 0u64;
+                let mut received_bytes = 0u64;
+                let mut rx_window_wait_ns = 0u64;
+                let mut window_publish_wait_ns = 0u64;
+                let mut done_wait_ns = 0u64;
                 loop {
+                    let rx_window_wait_start = Instant::now();
                     let window = session
                         .receive_next_window_registered(transfer_timeout)
                         .await?;
+                    rx_window_wait_ns += rx_window_wait_start.elapsed().as_nanos() as u64;
                     completed_windows += 1;
+                    received_bytes += window.len() as u64;
                     if fail_after_recv_windows == Some(completed_windows) {
                         // Publish a non-final completed window first so Storage contains a real
                         // partial Piece when the normal error/fallback path resets it. The final
                         // window stays behind the existing Done gate.
-                        if !session.piece_complete() && window_tx.send(Ok(window)).await.is_err() {
-                            transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
-                            return Ok(());
+                        if !session.piece_complete() {
+                            let publish_start = Instant::now();
+                            let published = window_tx.send(Ok(window)).await;
+                            window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
+                            if published.is_err() {
+                                transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
+                                return Ok(());
+                            }
                         }
                         warn!(
                             lane_id = session.lane_id().unwrap_or_default(),
@@ -615,14 +633,34 @@ impl UrmaClient {
                         // byte count. Hold the final bytes until Done has been
                         // validated so a terminal protocol failure cannot be
                         // hidden behind a successful length/digest check.
+                        let done_wait_start = Instant::now();
                         session.finish_piece().await?;
+                        done_wait_ns += done_wait_start.elapsed().as_nanos() as u64;
                         *session_slot = Some(session);
                         drop(session_slot);
                         transfer_state.store(TRANSFER_SUCCEEDED, Ordering::Release);
+                        let publish_start = Instant::now();
                         let _ = window_tx.send(Ok(window)).await;
+                        window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
+                        debug!(
+                            task_id = %log_task_id,
+                            piece_number = number,
+                            received_bytes,
+                            completed_windows,
+                            session_queue_wait_ns,
+                            request_ready_ns,
+                            rx_window_wait_ns,
+                            done_wait_ns,
+                            window_publish_wait_ns,
+                            client_piece_total_ns = client_piece_total_start.elapsed().as_nanos() as u64,
+                            "finished receiving urma piece into registered windows"
+                        );
                         return Ok::<(), UrmaError>(());
                     }
-                    if window_tx.send(Ok(window)).await.is_err() {
+                    let publish_start = Instant::now();
+                    let published = window_tx.send(Ok(window)).await;
+                    window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
+                    if published.is_err() {
                         // This is local cancellation, not evidence that the
                         // parent is unhealthy. Dropping Session aborts the lane.
                         transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
