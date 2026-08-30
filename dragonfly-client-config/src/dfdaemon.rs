@@ -340,6 +340,13 @@ fn default_storage_server_urma_max_inflight_chunks() -> u32 {
     512
 }
 
+/// Linked WR lists are opt-in until each deployed UMDK provider has been
+/// calibrated; one preserves the proven scalar post path.
+#[inline]
+fn default_storage_server_urma_post_list_size() -> u32 {
+    1
+}
+
 /// default_storage_server_urma_max_concurrent_transfers bounds persistent peer lanes and their
 /// Storage readers independently of the native command queue and registered buffer pool.
 #[inline]
@@ -1271,6 +1278,13 @@ pub struct UrmaServer {
     #[validate(range(min = 1, max = 4096))]
     pub max_inflight_chunks: u32,
 
+    /// Maximum SEND/RECV WRs linked into one native post call. The effective
+    /// batch is also bounded by the current window, queue depth, slots, and
+    /// remote posted-receive credits.
+    #[serde(default = "default_storage_server_urma_post_list_size")]
+    #[validate(range(min = 1, max = 64))]
+    pub post_list_size: u32,
+
     /// Maximum number of accepted URMA peer lanes served concurrently. Admission is rejected
     /// with a typed BUSY response so the downloader can fall back without retiring capability.
     #[serde(default = "default_storage_server_urma_max_concurrent_transfers")]
@@ -1323,6 +1337,7 @@ impl Default for UrmaServer {
             eid_index: default_storage_server_urma_eid_index(),
             fabric_tag: None,
             max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
+            post_list_size: default_storage_server_urma_post_list_size(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
             mmap_content: false,
@@ -2604,6 +2619,7 @@ key: /etc/ssl/private/client.pem
         assert_eq!(urma.eid_index, 0);
         assert!(urma.fabric_tag.is_none());
         assert_eq!(urma.max_inflight_chunks, 512);
+        assert_eq!(urma.post_list_size, 1);
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
         assert!(!urma.mmap_content);
@@ -2631,6 +2647,17 @@ key: /etc/ssl/private/client.pem
             ..Default::default()
         };
         assert!(urma.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_urma_post_list_size() {
+        for post_list_size in [0, 65] {
+            let urma = UrmaServer {
+                post_list_size,
+                ..Default::default()
+            };
+            assert!(urma.validate().is_err());
+        }
     }
 
     #[test]

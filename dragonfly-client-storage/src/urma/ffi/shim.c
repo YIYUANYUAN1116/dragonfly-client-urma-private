@@ -739,6 +739,155 @@ int dfurma_post_recv(dfurma_jetty_t *jetty,
     return 0;
 }
 
+static void dfurma_wr_return_range(dfurma_wr_t **wr_list, uint32_t begin,
+                                   uint32_t end)
+{
+    uint32_t i;
+
+    for (i = begin; i < end; ++i) {
+        dfurma_wr_return(wr_list[i]);
+    }
+}
+
+static int dfurma_post_list_prepare(dfurma_jetty_t *jetty,
+                                    dfurma_segment_t *segment,
+                                    const dfurma_post_entry_t *entries,
+                                    uint32_t count, dfurma_wr_t **wr_list,
+                                    dfurma_wr_t **out, uint32_t *posted)
+{
+    uint32_t i;
+    int status;
+
+    if (jetty == NULL || segment == NULL || entries == NULL || out == NULL ||
+        posted == NULL || count == 0 || count > DFURMA_MAX_POST_LIST) {
+        return -EINVAL;
+    }
+    *posted = 0;
+    for (i = 0; i < count; ++i) {
+        out[i] = NULL;
+        status = dfurma_wr_acquire(jetty, segment, entries[i].offset,
+                                   entries[i].length, &wr_list[i]);
+        if (status != 0) {
+            dfurma_wr_return_range(wr_list, 0, i);
+            return status;
+        }
+    }
+    return 0;
+}
+
+int dfurma_post_send_list(dfurma_jetty_t *jetty,
+                          dfurma_segment_t *segment,
+                          const dfurma_post_entry_t *entries, uint32_t count,
+                          dfurma_wr_t **out, uint32_t *posted)
+{
+    dfurma_wr_t *wr_list[DFURMA_MAX_POST_LIST];
+    urma_jfs_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int result_status;
+    uint32_t prefix = 0;
+    uint32_t i;
+    int prepare_status;
+
+    if (jetty == NULL || jetty->target == NULL || jetty->bound == 0) {
+        return -ENOTCONN;
+    }
+    prepare_status = dfurma_post_list_prepare(jetty, segment, entries, count,
+                                              wr_list, out, posted);
+    if (prepare_status != 0) {
+        return prepare_status;
+    }
+    for (i = 0; i < count; ++i) {
+        dfurma_wr_t *wr = wr_list[i];
+        wr->send_wr.opcode = URMA_OPC_SEND;
+        wr->send_wr.flag.value = 0;
+        wr->send_wr.flag.bs.complete_enable = 1;
+        wr->send_wr.tjetty = jetty->target;
+        wr->send_wr.user_ctx = entries[i].user_ctx;
+        wr->send_wr.send.src.sge = &wr->sge;
+        wr->send_wr.send.src.num_sge = 1;
+        wr->send_wr.send.imm_data = 0;
+        wr->send_wr.next = i + 1 < count ? &wr_list[i + 1]->send_wr : NULL;
+    }
+
+    status = urma_post_jetty_send_wr(jetty->jetty, &wr_list[0]->send_wr,
+                                     &bad_wr);
+    result_status = (int)status;
+    if (status == URMA_SUCCESS) {
+        prefix = count;
+    } else {
+        for (i = 0; i < count; ++i) {
+            if (bad_wr == &wr_list[i]->send_wr) {
+                prefix = i;
+                break;
+            }
+        }
+        if (bad_wr == NULL || i == count) {
+            /* Ownership is ambiguous on a broken provider contract. Retain
+             * every WR as outstanding so teardown cannot free live metadata. */
+            prefix = count;
+            result_status = -EPROTO;
+        }
+    }
+    for (i = 0; i < prefix; ++i) {
+        dfurma_wr_posted(wr_list[i]);
+        out[i] = wr_list[i];
+    }
+    dfurma_wr_return_range(wr_list, prefix, count);
+    *posted = prefix;
+    return result_status;
+}
+
+int dfurma_post_recv_list(dfurma_jetty_t *jetty,
+                          dfurma_segment_t *segment,
+                          const dfurma_post_entry_t *entries, uint32_t count,
+                          dfurma_wr_t **out, uint32_t *posted)
+{
+    dfurma_wr_t *wr_list[DFURMA_MAX_POST_LIST];
+    urma_jfr_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int result_status;
+    uint32_t prefix = 0;
+    uint32_t i;
+    int prepare_status = dfurma_post_list_prepare(
+        jetty, segment, entries, count, wr_list, out, posted);
+
+    if (prepare_status != 0) {
+        return prepare_status;
+    }
+    for (i = 0; i < count; ++i) {
+        dfurma_wr_t *wr = wr_list[i];
+        wr->recv_wr.src.sge = &wr->sge;
+        wr->recv_wr.src.num_sge = 1;
+        wr->recv_wr.user_ctx = entries[i].user_ctx;
+        wr->recv_wr.next = i + 1 < count ? &wr_list[i + 1]->recv_wr : NULL;
+    }
+
+    status = urma_post_jetty_recv_wr(jetty->jetty, &wr_list[0]->recv_wr,
+                                     &bad_wr);
+    result_status = (int)status;
+    if (status == URMA_SUCCESS) {
+        prefix = count;
+    } else {
+        for (i = 0; i < count; ++i) {
+            if (bad_wr == &wr_list[i]->recv_wr) {
+                prefix = i;
+                break;
+            }
+        }
+        if (bad_wr == NULL || i == count) {
+            prefix = count;
+            result_status = -EPROTO;
+        }
+    }
+    for (i = 0; i < prefix; ++i) {
+        dfurma_wr_posted(wr_list[i]);
+        out[i] = wr_list[i];
+    }
+    dfurma_wr_return_range(wr_list, prefix, count);
+    *posted = prefix;
+    return result_status;
+}
+
 void dfurma_wr_complete(dfurma_wr_t *wr)
 {
     if (wr == NULL) {

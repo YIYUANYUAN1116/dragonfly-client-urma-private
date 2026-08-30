@@ -120,6 +120,7 @@ mod native {
     pub(crate) struct UrmaRuntime {
         capability: UrmaDeviceCapability,
         max_payload_size: u64,
+        max_post_list_size: u32,
         buffer_pool: Option<UrmaBufferPool>,
         recv_jfc: Option<UrmaJfc>,
         send_jfc: Option<UrmaJfc>,
@@ -177,6 +178,11 @@ mod native {
             }
             let max_payload_size =
                 effective_max_message_size(capability.max_msg_size, config.buffer_pool.slot_size)?;
+            let max_post_list_size = config
+                .send_jfc_depth
+                .min(config.recv_jfc_depth)
+                .min(u32::try_from(config.buffer_pool.tx_slot_count).unwrap_or(u32::MAX))
+                .min(u32::try_from(config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX));
 
             let send_jfc = match UrmaJfc::create(&mut native, JfcKind::Send, config.send_jfc_depth)
             {
@@ -220,6 +226,7 @@ mod native {
             Ok(Self {
                 capability,
                 max_payload_size,
+                max_post_list_size,
                 buffer_pool: Some(buffer_pool),
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
@@ -263,7 +270,12 @@ mod native {
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
             let jetty = UrmaJetty::create(native, send_jfc.handle(), recv_jfc.handle(), &config)?;
-            let mut lane = UrmaLane::new(lane_id, 1, capability, jetty)?;
+            let effective_post_list_size = config
+                .post_list_size
+                .min(config.send_depth)
+                .min(config.recv_depth)
+                .min(self.max_post_list_size);
+            let mut lane = UrmaLane::new(lane_id, 1, capability, jetty, effective_post_list_size)?;
             let descriptor = lane.export_descriptor()?;
             self.lanes.insert(lane_id, lane);
             Ok((lane_id, descriptor))
@@ -576,6 +588,13 @@ mod native {
             return Err(Error::InvalidConfiguration(
                 "device does not advertise an RC remote-SGE capability".into(),
             ));
+        }
+        if config.post_list_size == 0 || config.post_list_size > ffi::MAX_POST_LIST {
+            return Err(Error::InvalidConfiguration(format!(
+                "Jetty post_list_size={} is outside 1..={}",
+                config.post_list_size,
+                ffi::MAX_POST_LIST
+            )));
         }
         Ok(())
     }

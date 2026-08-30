@@ -200,6 +200,7 @@ impl UrmaServer {
                 .max_inflight_chunks
                 .min(fabric.max_tx_window_chunks()),
             recv_depth: urma_config.max_inflight_chunks,
+            post_list_size: urma_config.post_list_size,
             ..Default::default()
         };
         let handler = Arc::new(UrmaServerHandler::new(

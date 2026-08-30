@@ -38,6 +38,20 @@ pub(crate) struct JettyConfig {
     pub token: u32,
 }
 
+pub(crate) const MAX_POST_LIST: u32 = sys::DFURMA_MAX_POST_LIST;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PostEntry {
+    pub(crate) offset: u64,
+    pub(crate) length: u32,
+    pub(crate) user_ctx: u64,
+}
+
+pub(crate) struct PostBatch {
+    pub(crate) handles: Vec<WrHandle>,
+    pub(crate) error: Option<FfiError>,
+}
+
 pub(crate) struct JettyDescriptorData {
     pub transport_type: u32,
     pub eid_index: u32,
@@ -416,6 +430,84 @@ impl JettyHandle {
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
         self.post(segment, offset, length, user_ctx, false)
+    }
+
+    pub(crate) fn post_send_list(
+        &mut self,
+        segment: &SegmentHandle,
+        entries: &[PostEntry],
+    ) -> Result<PostBatch, FfiError> {
+        self.post_list(segment, entries, true)
+    }
+
+    pub(crate) fn post_recv_list(
+        &mut self,
+        segment: &SegmentHandle,
+        entries: &[PostEntry],
+    ) -> Result<PostBatch, FfiError> {
+        self.post_list(segment, entries, false)
+    }
+
+    fn post_list(
+        &mut self,
+        segment: &SegmentHandle,
+        entries: &[PostEntry],
+        send: bool,
+    ) -> Result<PostBatch, FfiError> {
+        if entries.is_empty() || entries.len() > sys::DFURMA_MAX_POST_LIST as usize {
+            return Err(FfiError::Contract("invalid linked WR post-list length"));
+        }
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let raw_entries: Vec<sys::dfurma_post_entry_t> = entries
+            .iter()
+            .map(|entry| sys::dfurma_post_entry_t {
+                offset: entry.offset,
+                length: entry.length,
+                user_ctx: entry.user_ctx,
+            })
+            .collect();
+        let mut raw_handles = vec![std::ptr::null_mut(); entries.len()];
+        let mut posted = 0u32;
+        // SAFETY: All input/output slices remain live for the synchronous shim
+        // call. The shim validates every segment range before posting the list.
+        let status = unsafe {
+            if send {
+                sys::dfurma_post_send_list(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    raw_entries.as_ptr(),
+                    raw_entries.len() as u32,
+                    raw_handles.as_mut_ptr(),
+                    &mut posted,
+                )
+            } else {
+                sys::dfurma_post_recv_list(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    raw_entries.as_ptr(),
+                    raw_entries.len() as u32,
+                    raw_handles.as_mut_ptr(),
+                    &mut posted,
+                )
+            }
+        };
+        let posted = usize::try_from(posted)
+            .map_err(|_| FfiError::Contract("posted WR prefix does not fit usize"))?;
+        if posted > entries.len() || (status == 0 && posted != entries.len()) {
+            return Err(FfiError::Contract("invalid posted WR prefix from shim"));
+        }
+        let mut handles = Vec::with_capacity(posted);
+        for raw in raw_handles.into_iter().take(posted) {
+            handles.push(WrHandle {
+                raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
+                _not_send_sync: PhantomData,
+            });
+        }
+        Ok(PostBatch {
+            handles,
+            error: (status != 0).then_some(FfiError::Status(status)),
+        })
     }
 
     fn post(

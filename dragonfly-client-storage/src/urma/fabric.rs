@@ -56,6 +56,7 @@ pub(crate) struct UrmaLaneConfig {
     pub recv_depth: u32,
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
+    pub post_list_size: u32,
     pub token: u32,
 }
 
@@ -66,6 +67,7 @@ impl Default for UrmaLaneConfig {
             recv_depth: 512,
             max_send_sge: 1,
             max_recv_sge: 1,
+            post_list_size: 1,
             token: 0,
         }
     }
@@ -78,6 +80,7 @@ impl From<UrmaLaneConfig> for JettyConfig {
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,
             max_recv_sge: config.max_recv_sge,
+            post_list_size: config.post_list_size,
             token: config.token,
         }
     }
@@ -927,14 +930,16 @@ mod tests {
             recv_depth: 2,
             max_send_sge: 3,
             max_recv_sge: 4,
-            token: 5,
+            post_list_size: 5,
+            token: 6,
         };
         let native: JettyConfig = config.into();
         assert_eq!(native.send_depth, 1);
         assert_eq!(native.recv_depth, 2);
+        assert_eq!(native.post_list_size, 5);
         assert_eq!(native.max_send_sge, 3);
         assert_eq!(native.max_recv_sge, 4);
-        assert_eq!(native.token, 5);
+        assert_eq!(native.token, 6);
     }
 
     #[test]

@@ -341,6 +341,7 @@ impl UrmaClient {
         let transfer_timeout = config.storage.server.urma.transfer_timeout;
         let mut lane_config = UrmaLaneConfig::default();
         lane_config.recv_depth = config.storage.server.urma.max_inflight_chunks;
+        lane_config.post_list_size = config.storage.server.urma.post_list_size;
         let fail_after_recv_windows = fail_after_recv_windows();
         if let Some(windows) = fail_after_recv_windows {
             warn!(

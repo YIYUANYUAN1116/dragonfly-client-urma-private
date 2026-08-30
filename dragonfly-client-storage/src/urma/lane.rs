@@ -100,9 +100,9 @@ impl LaneCredits {
         Ok(())
     }
 
-    fn consume_remote_receive(&mut self) {
-        debug_assert_ne!(self.remote_receives_available, 0);
-        self.remote_receives_available -= 1;
+    fn consume_remote_receives(&mut self, count: usize) {
+        debug_assert!(self.remote_receives_available >= count);
+        self.remote_receives_available -= count;
     }
 }
 
@@ -205,6 +205,7 @@ pub(crate) struct JettyConfig {
     pub(crate) recv_depth: u32,
     pub(crate) max_send_sge: u32,
     pub(crate) max_recv_sge: u32,
+    pub(crate) post_list_size: u32,
     pub(crate) token: u32,
 }
 
@@ -215,6 +216,7 @@ impl Default for JettyConfig {
             recv_depth: 512,
             max_send_sge: 1,
             max_recv_sge: 1,
+            post_list_size: 1,
             token: 0,
         }
     }
@@ -312,6 +314,48 @@ impl UrmaJetty {
             .map_err(|error| native_error("post_jetty_recv_wr", error))
     }
 
+    fn post_send_batch(
+        &mut self,
+        segment: &ffi::SegmentHandle,
+        entries: &[ffi::PostEntry],
+    ) -> Result<ffi::PostBatch> {
+        if let [entry] = entries {
+            return Ok(ffi::PostBatch {
+                handles: vec![self.post_send(
+                    segment,
+                    entry.offset,
+                    entry.length,
+                    entry.user_ctx,
+                )?],
+                error: None,
+            });
+        }
+        self.handle
+            .post_send_list(segment, entries)
+            .map_err(|error| native_error("post_jetty_send_wr_list", error))
+    }
+
+    fn post_recv_batch(
+        &mut self,
+        segment: &ffi::SegmentHandle,
+        entries: &[ffi::PostEntry],
+    ) -> Result<ffi::PostBatch> {
+        if let [entry] = entries {
+            return Ok(ffi::PostBatch {
+                handles: vec![self.post_recv(
+                    segment,
+                    entry.offset,
+                    entry.length,
+                    entry.user_ctx,
+                )?],
+                error: None,
+            });
+        }
+        self.handle
+            .post_recv_list(segment, entries)
+            .map_err(|error| native_error("post_jetty_recv_wr_list", error))
+    }
+
     fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
         if self.bound {
@@ -368,6 +412,7 @@ pub(crate) struct UrmaLane {
     capability: UrmaDeviceCapability,
     jetty: UrmaJetty,
     credits: LaneCredits,
+    post_list_size: usize,
 }
 
 impl UrmaLane {
@@ -376,6 +421,7 @@ impl UrmaLane {
         generation: u8,
         capability: UrmaDeviceCapability,
         jetty: UrmaJetty,
+        post_list_size: u32,
     ) -> Result<Self> {
         if id == 0 || generation == 0 {
             return Err(Error::InvalidConfiguration(
@@ -389,6 +435,7 @@ impl UrmaLane {
             capability,
             jetty,
             credits: LaneCredits::default(),
+            post_list_size: post_list_size as usize,
         })
     }
 
@@ -461,36 +508,83 @@ impl UrmaLane {
         // RX budget cannot satisfy it; no unmatched partial window is left on
         // the receive queue.
         let slots = pool.allocate_rx_window(sequences.len())?;
-        let mut slots = slots.into_iter();
-        for (sequence, completion) in sequences.into_iter().zip(completion_txs) {
-            let slot = slots.next().expect("slot count matches sequence count");
-            let post = (|| {
-                let (offset, length) = pool.recv_post_layout(slot)?;
-                let user_ctx = self.token(OperationType::Recv, slot).encode()?;
-                pool.mark_posted(slot, SlotKind::Rx)?;
-                let wr =
-                    match self
-                        .jetty
-                        .post_recv(pool.segment_handle()?, offset, length, user_ctx)
-                    {
-                        Ok(wr) => wr,
-                        Err(error) => {
-                            pool.rollback_post(slot, SlotKind::Rx)?;
-                            return Err(error);
-                        }
-                    };
-                completions.track_registered_rx(user_ctx, wr, Some(sequence), completion)
-            })();
-            if let Err(error) = post {
-                // `slot` is releasable only when no native post succeeded for
-                // it. A tracking failure after a successful post is a fatal
-                // invariant violation and the caller will drain the lane; in
-                // normal operation tracking cannot fail for freshly reserved
-                // generation-tagged slots.
-                if matches!(pool.release(slot), Err(Error::InvalidConfiguration(_))) {
-                    // Preserve the primary post/track error.
+        let mut pending: Vec<_> = slots
+            .into_iter()
+            .zip(sequences)
+            .zip(completion_txs)
+            .map(|((slot, sequence), completion)| (slot, sequence, completion))
+            .collect();
+        while !pending.is_empty() {
+            let batch_len = self.post_list_size.min(pending.len());
+            let batch: Vec<_> = pending.drain(..batch_len).collect();
+            let mut entries = Vec::with_capacity(batch_len);
+            let prepare = (|| {
+                for (slot, _, _) in &batch {
+                    let (offset, length) = pool.recv_post_layout(*slot)?;
+                    let user_ctx = self.token(OperationType::Recv, *slot).encode()?;
+                    pool.mark_posted(*slot, SlotKind::Rx)?;
+                    entries.push(ffi::PostEntry {
+                        offset,
+                        length,
+                        user_ctx,
+                    });
                 }
-                pool.release_unposted_rx_window(slots.collect())?;
+                Ok(())
+            })();
+            if let Err(error) = prepare {
+                for (slot, _, _) in batch.iter().take(entries.len()) {
+                    pool.rollback_post(*slot, SlotKind::Rx)?;
+                }
+                pool.release_unposted_rx_window(
+                    batch
+                        .into_iter()
+                        .map(|(slot, _, _)| slot)
+                        .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                        .collect(),
+                )?;
+                return Err(error);
+            }
+            let posted = match self.jetty.post_recv_batch(pool.segment_handle()?, &entries) {
+                Ok(posted) => posted,
+                Err(error) => {
+                    for (slot, _, _) in &batch {
+                        pool.rollback_post(*slot, SlotKind::Rx)?;
+                    }
+                    pool.release_unposted_rx_window(
+                        batch
+                            .into_iter()
+                            .map(|(slot, _, _)| slot)
+                            .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                            .collect(),
+                    )?;
+                    return Err(error);
+                }
+            };
+            let posted_len = posted.handles.len();
+            let mut handles = posted.handles.into_iter();
+            let mut first_error = posted
+                .error
+                .map(|error| native_error("post_jetty_recv_wr_list", error));
+            for (index, (slot, sequence, completion)) in batch.into_iter().enumerate() {
+                if index < posted_len {
+                    let wr = handles.next().expect("posted prefix handle count matches");
+                    if let Err(error) = completions.track_registered_rx(
+                        entries[index].user_ctx,
+                        wr,
+                        Some(sequence),
+                        completion,
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                } else {
+                    pool.rollback_post(slot, SlotKind::Rx)?;
+                    pool.release(slot)?;
+                }
+            }
+            if let Some(error) = first_error {
+                pool.release_unposted_rx_window(
+                    pending.into_iter().map(|(slot, _, _)| slot).collect(),
+                )?;
                 return Err(error);
             }
         }
@@ -515,26 +609,62 @@ impl UrmaLane {
         let layouts = pool.tx_lease_layouts(&lease)?;
         let state = RegisteredTxWindowState::new(self.id, sequences.clone(), lease, completion);
 
-        for ((slot, offset, length), sequence) in layouts.into_iter().zip(sequences) {
-            let posted = (|| {
-                let user_ctx = self.token(OperationType::Send, slot).encode()?;
-                pool.mark_tx_lease_posted(slot)?;
-                let wr =
-                    match self
-                        .jetty
-                        .post_send(pool.segment_handle()?, offset, length, user_ctx)
-                    {
-                        Ok(wr) => wr,
-                        Err(error) => {
-                            pool.rollback_tx_lease_post(slot)?;
-                            return Err(error);
-                        }
-                    };
-                completions.track_registered_tx(user_ctx, wr, sequence, state.clone())?;
-                self.credits.consume_remote_receive();
+        let mut pending: Vec<_> = layouts.into_iter().zip(sequences).collect();
+        while !pending.is_empty() {
+            let batch_len = self.post_list_size.min(pending.len());
+            let batch: Vec<_> = pending.drain(..batch_len).collect();
+            let mut entries = Vec::with_capacity(batch_len);
+            let prepare = (|| {
+                for ((slot, offset, length), _) in &batch {
+                    let user_ctx = self.token(OperationType::Send, *slot).encode()?;
+                    pool.mark_tx_lease_posted(*slot)?;
+                    entries.push(ffi::PostEntry {
+                        offset: *offset,
+                        length: *length,
+                        user_ctx,
+                    });
+                }
                 Ok(())
             })();
-            if let Err(error) = posted {
+            if let Err(error) = prepare {
+                for ((slot, _, _), _) in batch.iter().take(entries.len()) {
+                    pool.rollback_tx_lease_post(*slot)?;
+                }
+                state.finish_posting(Some(error.clone()));
+                return Err(error);
+            }
+            let posted = match self.jetty.post_send_batch(pool.segment_handle()?, &entries) {
+                Ok(posted) => posted,
+                Err(error) => {
+                    for ((slot, _, _), _) in &batch {
+                        pool.rollback_tx_lease_post(*slot)?;
+                    }
+                    state.finish_posting(Some(error.clone()));
+                    return Err(error);
+                }
+            };
+            let posted_len = posted.handles.len();
+            self.credits.consume_remote_receives(posted_len);
+            let mut handles = posted.handles.into_iter();
+            let mut first_error = posted
+                .error
+                .map(|error| native_error("post_jetty_send_wr_list", error));
+            for (index, ((slot, _, _), sequence)) in batch.into_iter().enumerate() {
+                if index < posted_len {
+                    let wr = handles.next().expect("posted prefix handle count matches");
+                    if let Err(error) = completions.track_registered_tx(
+                        entries[index].user_ctx,
+                        wr,
+                        sequence,
+                        state.clone(),
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                } else {
+                    pool.rollback_tx_lease_post(slot)?;
+                }
+            }
+            if let Some(error) = first_error {
                 state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
@@ -653,7 +783,16 @@ mod tests {
 
         credits.grant_remote_receives(1).unwrap();
         assert!(credits.require_remote_receives(1).is_ok());
-        credits.consume_remote_receive();
+        credits.consume_remote_receives(1);
         assert!(credits.require_remote_receives(1).is_err());
+    }
+
+    #[test]
+    fn partial_post_consumes_only_the_submitted_credit_prefix() {
+        let mut credits = LaneCredits::default();
+        credits.grant_remote_receives(5).unwrap();
+        credits.consume_remote_receives(3);
+        assert!(credits.require_remote_receives(2).is_ok());
+        assert!(credits.require_remote_receives(3).is_err());
     }
 }

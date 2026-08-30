@@ -72,6 +72,16 @@ typedef struct dfurma_completion {
     uint8_t reserved;
 } dfurma_completion_t;
 
+/* One pointer-free element in a linked WR post list. */
+typedef struct dfurma_post_entry {
+    uint64_t offset;
+    uint32_t length;
+    uint64_t user_ctx;
+} dfurma_post_entry_t;
+
+/* Bounds shim stack storage and the maximum native doorbell batch. */
+#define DFURMA_MAX_POST_LIST 64
+
 /*
  * Opens the smallest process-global chain: urma_init -> device -> context.
  * `device_name` must be NUL terminated and `out` must be a valid writable pointer.
@@ -136,6 +146,19 @@ int dfurma_post_recv(dfurma_jetty_t *jetty,
                      dfurma_segment_t *segment, uint64_t offset,
                      uint32_t length, uint64_t user_ctx,
                      dfurma_wr_t **out);
+/*
+ * Posts an ordered linked list. `posted` is always the successfully submitted
+ * prefix, including when the provider returns an error and `bad_wr` identifies
+ * the first unsubmitted entry. Only out[0..*posted] contain owned WR handles.
+ */
+int dfurma_post_send_list(dfurma_jetty_t *jetty,
+                          dfurma_segment_t *segment,
+                          const dfurma_post_entry_t *entries, uint32_t count,
+                          dfurma_wr_t **out, uint32_t *posted);
+int dfurma_post_recv_list(dfurma_jetty_t *jetty,
+                          dfurma_segment_t *segment,
+                          const dfurma_post_entry_t *entries, uint32_t count,
+                          dfurma_wr_t **out, uint32_t *posted);
 void dfurma_wr_complete(dfurma_wr_t *wr);
 
 /* Non-blocking poll. Returns a count in [0, capacity], or a negative error. */
