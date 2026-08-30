@@ -175,6 +175,14 @@ struct OutstandingWr {
     completion: Option<CompletionTarget>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LaneRetirement {
+    jetty_id: u32,
+    jfr_id: u32,
+    waiting_for_flush: bool,
+    flush_done: bool,
+}
+
 /// The single completion consumer for the process-shared JFCs. A JFC must not
 /// be polled independently by individual lanes because any poll may return a
 /// completion belonging to any Jetty attached to that JFC.
@@ -185,6 +193,8 @@ pub(crate) struct CompletionRouter {
     outstanding_send: usize,
     outstanding_recv: usize,
     outstanding_by_lane: HashMap<u16, usize>,
+    retirement_by_lane: HashMap<u16, LaneRetirement>,
+    lane_by_jetty_id: HashMap<u32, u16>,
     stats: CompletionStats,
 }
 
@@ -202,8 +212,72 @@ impl CompletionRouter {
             outstanding_send: 0,
             outstanding_recv: 0,
             outstanding_by_lane: HashMap::new(),
+            retirement_by_lane: HashMap::new(),
+            lane_by_jetty_id: HashMap::new(),
             stats: CompletionStats::default(),
         })
+    }
+
+    pub(crate) fn register_lane(&mut self, lane_id: u16, jetty_id: u32, jfr_id: u32) -> Result<()> {
+        if self.retirement_by_lane.contains_key(&lane_id) {
+            return Err(Error::Protocol(format!(
+                "duplicate completion lifecycle registration for lane {lane_id}"
+            )));
+        }
+        if let Some(existing) = self.lane_by_jetty_id.insert(jetty_id, lane_id) {
+            self.lane_by_jetty_id.insert(jetty_id, existing);
+            return Err(Error::Protocol(format!(
+                "native Jetty id {jetty_id} is already owned by lane {existing}"
+            )));
+        }
+        self.retirement_by_lane.insert(
+            lane_id,
+            LaneRetirement {
+                jetty_id,
+                jfr_id,
+                waiting_for_flush: false,
+                flush_done: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn begin_lane_retirement(&mut self, lane_id: u16) -> Result<()> {
+        let retirement = self.retirement_by_lane.get_mut(&lane_id).ok_or_else(|| {
+            Error::Protocol(format!(
+                "lane {lane_id} has no completion lifecycle registration"
+            ))
+        })?;
+        retirement.waiting_for_flush = true;
+        tracing::debug!(
+            lane_id,
+            native_jetty_id = retirement.jetty_id,
+            native_jfr_id = retirement.jfr_id,
+            "waiting for URMA lane flush completion"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn lane_flush_done(&self, lane_id: u16) -> bool {
+        self.retirement_by_lane
+            .get(&lane_id)
+            .is_some_and(|retirement| retirement.flush_done)
+    }
+
+    pub(crate) fn unregister_lane(&mut self, lane_id: u16) -> Result<()> {
+        let retirement = self.retirement_by_lane.remove(&lane_id).ok_or_else(|| {
+            Error::Protocol(format!(
+                "lane {lane_id} has no completion lifecycle registration"
+            ))
+        })?;
+        self.lane_by_jetty_id.remove(&retirement.jetty_id);
+        Ok(())
+    }
+
+    fn has_pending_flush(&self) -> bool {
+        self.retirement_by_lane
+            .values()
+            .any(|retirement| retirement.waiting_for_flush && !retirement.flush_done)
     }
 
     pub(crate) fn track_registered_rx(
@@ -290,7 +364,7 @@ impl CompletionRouter {
         self.stats.poll_calls += 1;
         let mut completed = 0;
         let mut first_error = None;
-        if self.outstanding_send != 0 {
+        if self.outstanding_send != 0 || self.has_pending_flush() {
             match self.poll_jfc(send_jfc, false, pool) {
                 Ok(count) => completed += count,
                 Err(error) => first_error = Some(error),
@@ -334,6 +408,25 @@ impl CompletionRouter {
         recv_queue: bool,
         pool: &mut UrmaBufferPool,
     ) -> Result<()> {
+        match record.event_kind {
+            ffi::CompletionEventKind::FlushErrorDone => {
+                return self.route_flush_done(record, recv_queue);
+            }
+            ffi::CompletionEventKind::SuspendDone => {
+                self.stats.cqe_error += 1;
+                return Err(Error::Protocol(format!(
+                    "unexpected WR_SUSPEND_DONE lifecycle CQE on native object {}",
+                    record.local_id
+                )));
+            }
+            ffi::CompletionEventKind::Unknown(kind) => {
+                self.stats.cqe_error += 1;
+                return Err(Error::Protocol(format!(
+                    "unknown URMA completion event kind {kind}"
+                )));
+            }
+            ffi::CompletionEventKind::WorkRequest => {}
+        }
         if !record.user_ctx_valid {
             self.stats.cqe_error += 1;
             return Err(Error::Completion {
@@ -345,6 +438,10 @@ impl CompletionRouter {
             });
         }
         let token = WrToken::decode(record.user_ctx)?;
+        let retiring = self
+            .retirement_by_lane
+            .get(&token.lane_id)
+            .is_some_and(|retirement| retirement.waiting_for_flush);
         let mut outstanding = self.take_outstanding(record.user_ctx)?;
         outstanding.handle.complete();
         let expected_recv = token.operation == OperationType::Recv;
@@ -452,7 +549,47 @@ impl CompletionRouter {
         if let Some(completion) = outstanding.completion.take() {
             completion.send(result);
         }
-        owner_error.map_or(Ok(()), Err)
+        match owner_error {
+            Some(Error::Completion { .. }) if retiring => Ok(()),
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn route_flush_done(&mut self, record: ffi::CompletionRecord, recv_queue: bool) -> Result<()> {
+        if recv_queue {
+            self.stats.cqe_error += 1;
+            return Err(Error::Protocol(
+                "WR_FLUSH_ERR_DONE arrived on the receive JFC".into(),
+            ));
+        }
+        let lane_id = self
+            .lane_by_jetty_id
+            .get(&record.local_id)
+            .copied()
+            .ok_or_else(|| {
+                Error::Protocol(format!(
+                    "WR_FLUSH_ERR_DONE references unknown native Jetty {}",
+                    record.local_id
+                ))
+            })?;
+        let retirement = self
+            .retirement_by_lane
+            .get_mut(&lane_id)
+            .expect("native Jetty map and lane retirement map agree");
+        if !retirement.waiting_for_flush {
+            self.stats.cqe_error += 1;
+            return Err(Error::Protocol(format!(
+                "lane {lane_id} received WR_FLUSH_ERR_DONE before retirement"
+            )));
+        }
+        retirement.flush_done = true;
+        tracing::debug!(
+            lane_id,
+            native_jetty_id = record.local_id,
+            "received URMA lane flush completion"
+        );
+        Ok(())
     }
 
     fn take_outstanding(&mut self, user_ctx: u64) -> Result<OutstandingWr> {
@@ -635,5 +772,89 @@ mod tests {
         assert_eq!(completion.lease.len(), 5);
         drop(completion);
         assert_eq!(*returned.lock().unwrap(), Some(recycle));
+    }
+
+    #[test]
+    fn partial_post_failure_waits_only_for_the_submitted_prefix() {
+        let slots = vec![
+            SlotId::new(0, 1).unwrap(),
+            SlotId::new(1, 1).unwrap(),
+            SlotId::new(2, 1).unwrap(),
+        ];
+        let mut leases = LeaseBook::new();
+        let recycle = leases.issue(LeaseKind::Tx, slots).unwrap();
+        let returned = Arc::new(Mutex::new(None));
+        let notifier: LeaseRecycleNotifier = {
+            let returned = returned.clone();
+            Arc::new(move |recycle| *returned.lock().unwrap() = Some(recycle))
+        };
+        let lease = TxWindowLease::from_test_parts(vec![4, 4, 4], recycle, notifier);
+        let (tx, mut rx) = oneshot::channel();
+        let state = RegisteredTxWindowState::new(3, vec![20, 21, 22], lease, tx);
+
+        // The provider accepted only the first two WRs. The unposted suffix
+        // owns no CQE and must not extend the lease's completion gate.
+        state.posted();
+        state.posted();
+        state.finish_posting(Some(Error::Protocol("partial post".into())));
+        state.completed(&Ok(RoutedCompletion::RegisteredTx));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        state.completed(&Ok(RoutedCompletion::RegisteredTx));
+        assert!(matches!(
+            rx.blocking_recv().unwrap(),
+            Err(Error::Protocol(_))
+        ));
+        assert_eq!(*returned.lock().unwrap(), Some(recycle));
+    }
+
+    #[test]
+    fn flush_done_is_routed_by_native_jetty_id_and_gates_retirement() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_lane(7, 101, 202).unwrap();
+        router.begin_lane_retirement(7).unwrap();
+        assert!(router.has_pending_flush());
+        assert!(!router.lane_flush_done(7));
+
+        router
+            .route_flush_done(
+                ffi::CompletionRecord {
+                    status: 13,
+                    local_id: 101,
+                    event_kind: ffi::CompletionEventKind::FlushErrorDone,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(router.lane_flush_done(7));
+        assert!(!router.has_pending_flush());
+        router.unregister_lane(7).unwrap();
+    }
+
+    #[test]
+    fn flush_done_rejects_receive_jfc_and_unknown_native_id() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_lane(8, 303, 404).unwrap();
+        router.begin_lane_retirement(8).unwrap();
+        let record = ffi::CompletionRecord {
+            status: 13,
+            local_id: 303,
+            event_kind: ffi::CompletionEventKind::FlushErrorDone,
+            ..Default::default()
+        };
+        assert!(router.route_flush_done(record, true).is_err());
+        assert!(router
+            .route_flush_done(
+                ffi::CompletionRecord {
+                    local_id: 999,
+                    ..record
+                },
+                false,
+            )
+            .is_err());
     }
 }

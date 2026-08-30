@@ -302,6 +302,8 @@ mod native {
                 .min(self.max_post_list_size);
             let mut lane = UrmaLane::new(lane_id, 1, capability, jetty, effective_post_list_size)?;
             let descriptor = lane.export_descriptor()?;
+            let (jetty_id, jfr_id) = lane.local_ids();
+            self.completions.register_lane(lane_id, jetty_id, jfr_id)?;
             self.lanes.insert(lane_id, lane);
             Ok((lane_id, descriptor))
         }
@@ -439,19 +441,15 @@ mod native {
         }
 
         pub(crate) fn close_lane(&mut self, lane_id: u16) -> Result<()> {
-            let outstanding = self.completions.outstanding_for_lane(lane_id);
-            let lane = self.lane_mut(lane_id)?;
-            lane.close(outstanding)?;
-            self.lanes.remove(&lane_id);
-            Ok(())
+            // Close is asynchronous at the provider boundary. The lane stays
+            // owned by Runtime until `reap_drained_lanes` observes both gates.
+            self.abort_lane(lane_id)
         }
 
         pub(crate) fn abort_lane(&mut self, lane_id: u16) -> Result<()> {
+            self.completions.begin_lane_retirement(lane_id)?;
             self.lane_mut(lane_id)?.begin_draining()?;
-            if self.completions.outstanding_for_lane(lane_id) == 0 {
-                self.close_lane(lane_id)?;
-            }
-            Ok(())
+            self.reap_drained_lanes()
         }
 
         fn reap_drained_lanes(&mut self) -> Result<()> {
@@ -459,12 +457,18 @@ mod native {
                 .lanes
                 .iter()
                 .filter_map(|(&lane_id, lane)| {
-                    (lane.is_draining() && self.completions.outstanding_for_lane(lane_id) == 0)
-                        .then_some(lane_id)
+                    (lane.is_draining()
+                        && lane.is_retirement_armed()
+                        && self.completions.outstanding_for_lane(lane_id) == 0
+                        && self.completions.lane_flush_done(lane_id))
+                    .then_some(lane_id)
                 })
                 .collect::<Vec<_>>();
             for lane_id in drained {
-                self.close_lane(lane_id)?;
+                let outstanding = self.completions.outstanding_for_lane(lane_id);
+                self.lane_mut(lane_id)?.close(outstanding)?;
+                self.completions.unregister_lane(lane_id)?;
+                self.lanes.remove(&lane_id);
             }
             Ok(())
         }
@@ -488,55 +492,49 @@ mod native {
             self.accepting = false;
             let mut failures = Vec::new();
 
-            for lane in self.lanes.values_mut() {
-                if self.completions.outstanding_for_lane(lane.id()) != 0 {
-                    if let Err(error) = lane.begin_draining() {
-                        failures.push(error.to_string());
-                    }
+            let lane_ids = self.lanes.keys().copied().collect::<Vec<_>>();
+            for lane_id in lane_ids {
+                if let Err(error) = self.abort_lane(lane_id) {
+                    failures.push(error.to_string());
                 }
             }
             let drain_deadline = deadline_after(Duration::from_secs(1));
-            while self.completions.outstanding() != 0 && !deadline_expired(drain_deadline) {
+            while !self.lanes.is_empty() && !deadline_expired(drain_deadline) {
                 if let Err(error) = self.poll_once() {
                     if !matches!(error, Error::Completion { .. }) {
                         failures.push(error.to_string());
                     }
                 }
             }
-            if self.completions.outstanding() != 0 {
+            if !self.lanes.is_empty() {
                 failures.push(format!(
-                    "timed out draining {} outstanding URMA WRs",
-                    self.completions.outstanding()
+                    "timed out retiring {} URMA lanes with {} outstanding WRs",
+                    self.lanes.len(),
+                    self.completions.outstanding(),
                 ));
             }
 
-            for lane in self.lanes.values_mut() {
-                let outstanding = self.completions.outstanding_for_lane(lane.id());
-                if let Err(error) = lane.close(outstanding) {
-                    failures.push(error.to_string());
+            if self.lanes.is_empty() {
+                if let Some(mut pool) = self.buffer_pool.take() {
+                    pool.stop();
+                    if let Err(error) = pool.close() {
+                        failures.push(error.to_string());
+                    }
                 }
-            }
-            self.lanes.clear();
-
-            if let Some(mut pool) = self.buffer_pool.take() {
-                pool.stop();
-                if let Err(error) = pool.close() {
-                    failures.push(error.to_string());
+                if let Some(mut recv_jfc) = self.recv_jfc.take() {
+                    if let Err(error) = recv_jfc.close() {
+                        failures.push(error.to_string());
+                    }
                 }
-            }
-            if let Some(mut recv_jfc) = self.recv_jfc.take() {
-                if let Err(error) = recv_jfc.close() {
-                    failures.push(error.to_string());
+                if let Some(mut send_jfc) = self.send_jfc.take() {
+                    if let Err(error) = send_jfc.close() {
+                        failures.push(error.to_string());
+                    }
                 }
-            }
-            if let Some(mut send_jfc) = self.send_jfc.take() {
-                if let Err(error) = send_jfc.close() {
-                    failures.push(error.to_string());
-                }
-            }
-            if let Some(mut native) = self.native.take() {
-                if let Err(error) = native.close() {
-                    failures.push(native_error("runtime_close", error).to_string());
+                if let Some(mut native) = self.native.take() {
+                    if let Err(error) = native.close() {
+                        failures.push(native_error("runtime_close", error).to_string());
+                    }
                 }
             }
 

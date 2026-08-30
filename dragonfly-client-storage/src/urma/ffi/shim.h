@@ -66,11 +66,18 @@ typedef struct dfurma_completion {
     uint32_t opcode;
     uint64_t user_ctx;
     uint32_t completion_len;
+    uint32_t local_id;
     uint8_t is_recv;
     uint8_t is_jetty;
     uint8_t user_ctx_valid;
-    uint8_t reserved;
+    uint8_t event_kind;
 } dfurma_completion_t;
+
+enum dfurma_completion_event_kind {
+    DFURMA_COMPLETION_WR = 0,
+    DFURMA_COMPLETION_WR_SUSPEND_DONE = 1,
+    DFURMA_COMPLETION_WR_FLUSH_ERR_DONE = 2,
+};
 
 /* One pointer-free element in a linked WR post list. */
 typedef struct dfurma_post_entry {
@@ -117,8 +124,11 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
                         const dfurma_jetty_config_t *config,
                         dfurma_jetty_t **out);
 
-/* Optional shutdown transition; CQ drain is owned by the Rust fabric layer. */
+/* Moves both the Jetty and its owned shared JFR to ERROR. */
 int dfurma_jetty_mark_error(dfurma_jetty_t *jetty);
+/* Returns the provider IDs used to route shared-JFC lifecycle completions. */
+int dfurma_jetty_local_ids(dfurma_jetty_t *jetty,
+                           uint32_t *jetty_id, uint32_t *jfr_id);
 
 int dfurma_jetty_export_descriptor(dfurma_jetty_t *jetty,
                                    dfurma_jetty_descriptor_meta_t *meta,

@@ -487,6 +487,8 @@ impl UrmaFabricHandle {
         })
     }
 
+    /// Starts provider-backed retirement. The owner keeps the native lane
+    /// until every WR and the shared-JFC flush sentinel have been consumed.
     pub(crate) async fn close_lane(&self, lane_id: u16) -> Result<()> {
         self.submit(|reply| FabricCommand::CloseLane { lane_id, reply })
             .await

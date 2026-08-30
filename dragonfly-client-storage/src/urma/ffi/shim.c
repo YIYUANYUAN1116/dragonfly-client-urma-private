@@ -54,6 +54,8 @@ struct dfurma_jetty {
     urma_jetty_t *jetty;
     urma_target_jetty_t *target;
     int bound;
+    int jetty_error;
+    int jfr_error;
     uint32_t outstanding_wr_count;
     dfurma_wr_t *wr_arena;
     dfurma_wr_t *free_wr;
@@ -445,13 +447,48 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
 int dfurma_jetty_mark_error(dfurma_jetty_t *jetty)
 {
     urma_jetty_attr_t attr = {0};
+    urma_jfr_attr_t jfr_attr = {0};
+    urma_status_t status;
+    int first_error = 0;
 
-    if (jetty == NULL || jetty->jetty == NULL) {
+    if (jetty == NULL || jetty->jetty == NULL || jetty->jfr == NULL) {
         return -EINVAL;
     }
-    attr.mask = JETTY_STATE;
-    attr.state = URMA_JETTY_STATE_ERROR;
-    return (int)urma_modify_jetty(jetty->jetty, &attr);
+    if (jetty->jetty_error == 0) {
+        attr.mask = JETTY_STATE;
+        attr.state = URMA_JETTY_STATE_ERROR;
+        status = urma_modify_jetty(jetty->jetty, &attr);
+        if (status == URMA_SUCCESS) {
+            jetty->jetty_error = 1;
+        } else {
+            first_error = (int)status;
+        }
+    }
+    /* The Jetty was created with an independently owned shared JFR. Moving
+     * only the Jetty to ERROR does not flush receive WRs on that JFR. */
+    if (jetty->jfr_error == 0) {
+        jfr_attr.mask = JFR_STATE;
+        jfr_attr.state = URMA_JFR_STATE_ERROR;
+        status = urma_modify_jfr(jetty->jfr, &jfr_attr);
+        if (status == URMA_SUCCESS) {
+            jetty->jfr_error = 1;
+        } else if (first_error == 0) {
+            first_error = (int)status;
+        }
+    }
+    return first_error;
+}
+
+int dfurma_jetty_local_ids(dfurma_jetty_t *jetty,
+                             uint32_t *jetty_id, uint32_t *jfr_id)
+{
+    if (jetty == NULL || jetty->jetty == NULL || jetty->jfr == NULL ||
+        jetty_id == NULL || jfr_id == NULL) {
+        return -EINVAL;
+    }
+    *jetty_id = jetty->jetty->jetty_id.id;
+    *jfr_id = jetty->jfr->jfr_id.id;
+    return 0;
 }
 
 int dfurma_jetty_export_descriptor(dfurma_jetty_t *jetty,
@@ -925,11 +962,19 @@ int dfurma_jfc_poll(dfurma_jfc_t *jfc, uint32_t capacity,
         out[i].opcode = (uint32_t)cr[i].opcode;
         out[i].user_ctx = cr[i].user_ctx;
         out[i].completion_len = cr[i].completion_len;
+        out[i].local_id = cr[i].local_id;
         out[i].is_recv = cr[i].flag.bs.s_r;
         out[i].is_jetty = cr[i].flag.bs.jetty;
         out[i].user_ctx_valid =
             (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
              cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
+        if (cr[i].status == URMA_CR_WR_SUSPEND_DONE) {
+            out[i].event_kind = DFURMA_COMPLETION_WR_SUSPEND_DONE;
+        } else if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {
+            out[i].event_kind = DFURMA_COMPLETION_WR_FLUSH_ERR_DONE;
+        } else {
+            out[i].event_kind = DFURMA_COMPLETION_WR;
+        }
     }
     return count;
 }

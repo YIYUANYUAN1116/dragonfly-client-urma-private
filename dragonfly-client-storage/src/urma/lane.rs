@@ -231,6 +231,8 @@ impl Default for JettyConfig {
 /// Safe owner of a local Jetty and an optional imported/bound remote Jetty.
 pub(crate) struct UrmaJetty {
     handle: ffi::JettyHandle,
+    local_jetty_id: u32,
+    local_jfr_id: u32,
     token: u32,
     imported: bool,
     bound: bool,
@@ -252,8 +254,13 @@ impl UrmaJetty {
         };
         let handle = ffi::JettyHandle::create(runtime, send_jfc, recv_jfc, &ffi_config)
             .map_err(|error| native_error("create_jetty", error))?;
+        let (local_jetty_id, local_jfr_id) = handle
+            .local_ids()
+            .map_err(|error| native_error("query_jetty_local_ids", error))?;
         Ok(Self {
             handle,
+            local_jetty_id,
+            local_jfr_id,
             token: config.token,
             imported: false,
             bound: false,
@@ -294,6 +301,10 @@ impl UrmaJetty {
         self.handle
             .mark_error()
             .map_err(|error| native_error("modify_jetty_error", error))
+    }
+
+    pub(crate) fn local_ids(&self) -> (u32, u32) {
+        (self.local_jetty_id, self.local_jfr_id)
     }
 
     fn post_send(
@@ -419,6 +430,7 @@ pub(crate) struct UrmaLane {
     jetty: UrmaJetty,
     credits: LaneCredits,
     post_list_size: usize,
+    retirement_armed: bool,
 }
 
 impl UrmaLane {
@@ -442,6 +454,7 @@ impl UrmaLane {
             jetty,
             credits: LaneCredits::default(),
             post_list_size: post_list_size as usize,
+            retirement_armed: false,
         })
     }
 
@@ -680,15 +693,25 @@ impl UrmaLane {
     }
 
     pub(crate) fn begin_draining(&mut self) -> Result<()> {
-        if matches!(self.state, LaneState::Draining | LaneState::Closed) {
+        if self.state == LaneState::Closed {
             return Ok(());
         }
         self.state = LaneState::Draining;
-        self.jetty.mark_error()
+        self.jetty.mark_error()?;
+        self.retirement_armed = true;
+        Ok(())
+    }
+
+    pub(crate) fn local_ids(&self) -> (u32, u32) {
+        self.jetty.local_ids()
     }
 
     pub(crate) fn is_draining(&self) -> bool {
         self.state == LaneState::Draining
+    }
+
+    pub(crate) fn is_retirement_armed(&self) -> bool {
+        self.retirement_armed
     }
 
     pub(crate) fn close(&mut self, outstanding: usize) -> Result<()> {

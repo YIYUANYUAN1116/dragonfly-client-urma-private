@@ -65,9 +65,20 @@ pub(crate) struct CompletionRecord {
     pub opcode: u32,
     pub user_ctx: u64,
     pub completion_len: u32,
+    pub local_id: u32,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
+    pub event_kind: CompletionEventKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CompletionEventKind {
+    #[default]
+    WorkRequest,
+    SuspendDone,
+    FlushErrorDone,
+    Unknown(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,9 +227,16 @@ impl JfcHandle {
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
                 completion_len: record.completion_len,
+                local_id: record.local_id,
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
+                event_kind: match record.event_kind {
+                    0 => CompletionEventKind::WorkRequest,
+                    1 => CompletionEventKind::SuspendDone,
+                    2 => CompletionEventKind::FlushErrorDone,
+                    other => CompletionEventKind::Unknown(other),
+                },
             };
         }
         Ok(count)
@@ -430,6 +448,17 @@ impl JettyHandle {
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
         self.post(segment, offset, length, user_ctx, false)
+    }
+
+    pub(crate) fn local_ids(&self) -> Result<(u32, u32), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let mut jetty_id = 0;
+        let mut jfr_id = 0;
+        // SAFETY: Jetty is live and both integer outputs are writable.
+        status_result(unsafe {
+            sys::dfurma_jetty_local_ids(jetty.as_ptr(), &mut jetty_id, &mut jfr_id)
+        })?;
+        Ok((jetty_id, jfr_id))
     }
 
     pub(crate) fn post_send_list(
