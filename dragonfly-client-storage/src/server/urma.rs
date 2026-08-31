@@ -45,7 +45,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time;
-use tracing::{debug, error, info, info_span, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 use dragonfly_client_util::shutdown;
 
@@ -418,14 +418,6 @@ impl UrmaServerHandler {
             let piece_id = self
                 .storage
                 .piece_id(&request.task_id, request.piece_number);
-            // Per-Piece span with fields fixed at creation. Recording
-            // task_id/piece_id repeatedly on the connection span made fmt
-            // subscribers print every recorded value, so logs accumulated
-            // one (task_id, piece_id) pair per served Piece.
-            let piece_span =
-                info_span!("urma_piece", task_id = %request.task_id, piece_id = %piece_id);
-            let _piece_guard = piece_span.enter();
-
             collect_upload_piece_started_metrics();
             info!(
                 lane_id = session.lane_id().unwrap_or_default(),
@@ -465,6 +457,13 @@ impl UrmaServerHandler {
         }
     }
 
+    // The per-Piece span is attached to this future via #[instrument], so it
+    // is entered only while this future is polled. A manually held enter()
+    // guard across the awaits leaked the thread-local span context into every
+    // other task on the same worker (including the TCP accept loop), which
+    // both accumulated fields into unrelated logs and eventually panicked the
+    // subscriber with "tried to clone a span that already closed".
+    #[instrument(skip_all, fields(task_id = %request.task_id, piece_id = %piece_id))]
     async fn handle_piece(
         &self,
         session: &mut UrmaServerSession<TcpStream>,
