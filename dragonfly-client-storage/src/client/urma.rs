@@ -15,7 +15,7 @@
  */
 
 use super::PieceContentStream;
-use crate::rendezvous::{PieceKind, ERROR_CODE_INCOMPATIBLE};
+use crate::rendezvous::{PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE};
 use crate::urma::fabric::{UrmaFabricHandle, UrmaLaneConfig};
 use crate::urma::rendezvous::{
     read_frame, write_frame, CommonPieceRequest, Frame, UrmaAdvertisement, UrmaCapability,
@@ -270,11 +270,16 @@ pub async fn discover(addr: &str, timeout: Duration) -> ClientResult<UrmaAdverti
 }
 
 /// Maps the storage-internal [`UrmaError`] onto the core client error so URMA
-/// failures fall back to the TCP piece transport exactly like RDMA.
+/// failures fall back to the TCP piece transport exactly like RDMA. A peer
+/// BUSY rejection maps to [`ClientError::Busy`]: it is a transient budget
+/// rejection, not evidence of a broken transport.
 fn urma_error(error: UrmaError) -> ClientError {
     match error {
         UrmaError::PeerRejected { code, message } if code == ERROR_CODE_INCOMPATIBLE => {
             ClientError::Unsupported(message)
+        }
+        UrmaError::PeerRejected { code, message } if code == ERROR_CODE_BUSY => {
+            ClientError::Busy(format!("urma peer busy ({code}): {message}"))
         }
         UrmaError::PeerRejected { code, message } => {
             ClientError::Unknown(format!("urma peer rejected ({code}): {message}"))
@@ -579,7 +584,20 @@ impl UrmaClient {
             max_inflight_chunks: self.lane_config.recv_depth,
         };
         let request_ready_start = Instant::now();
-        let metadata = session.request_piece(request).await.map_err(urma_error)?;
+        let metadata = match session.request_piece(request).await {
+            Ok(metadata) => metadata,
+            // A transient BUSY rejection leaves the session (and its lane)
+            // healthy: put it back for the next Piece and report Busy so the
+            // caller falls back to TCP without retiring the cached client.
+            Err(UrmaError::PeerRejected { code, message }) if code == ERROR_CODE_BUSY => {
+                *session_slot = Some(session);
+                drop(session_slot);
+                return Err(ClientError::Busy(format!(
+                    "urma peer busy ({code}): {message}"
+                )));
+            }
+            Err(error) => return Err(urma_error(error)),
+        };
         let request_ready_ns = request_ready_start.elapsed().as_nanos() as u64;
         let result_offset = metadata.offset;
         let result_digest = metadata.digest.clone();

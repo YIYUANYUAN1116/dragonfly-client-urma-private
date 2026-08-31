@@ -439,9 +439,14 @@ impl UrmaServerHandler {
             )
             .await
             {
-                Ok(Ok(length)) => {
+                Ok(Ok(Some(length))) => {
                     collect_upload_piece_finished_metrics();
                     collect_upload_piece_traffic_metrics(length);
+                }
+                // Transient BUSY rejection: the peer lane stays alive, so keep
+                // serving further Piece requests on this connection.
+                Ok(Ok(None)) => {
+                    collect_upload_piece_failure_metrics();
                 }
                 Ok(Err(error)) => {
                     collect_upload_piece_failure_metrics();
@@ -465,7 +470,7 @@ impl UrmaServerHandler {
         session: &mut UrmaServerSession<TcpStream>,
         request: &CommonPieceRequest,
         piece_id: &str,
-    ) -> ClientResult<u64> {
+    ) -> ClientResult<Option<u64>> {
         let piece_total_start = Instant::now();
         let piece = match self.piece_metadata(request.kind, piece_id) {
             Ok(Some(piece)) => piece,
@@ -558,13 +563,17 @@ impl UrmaServerHandler {
             Ok(Err(error)) => {
                 if matches!(error, UrmaError::BufferUnavailable { .. }) {
                     collect_urma_budget_pressure_metrics("tx", "required");
+                    // Transient budget pressure: nothing was posted on the
+                    // lane yet, so reject with BUSY and keep the peer session
+                    // usable. The client falls back for this Piece only.
+                    let _ = session
+                        .reject_piece_transient(ERROR_CODE_BUSY, &error.to_string())
+                        .await;
+                    return Ok(None);
                 }
-                let code = if matches!(error, UrmaError::BufferUnavailable { .. }) {
-                    ERROR_CODE_BUSY
-                } else {
-                    ERROR_CODE_TOO_LARGE
-                };
-                let _ = session.reject_piece(code, &error.to_string()).await;
+                let _ = session
+                    .reject_piece(ERROR_CODE_TOO_LARGE, &error.to_string())
+                    .await;
                 return Err(client_error(error));
             }
             Err(_) => {
@@ -572,8 +581,11 @@ impl UrmaServerHandler {
                     "URMA TX registration unavailable after {:?}",
                     self.transfer_timeout
                 );
-                let _ = session.reject_piece(ERROR_CODE_BUSY, &message).await;
-                return Err(ClientError::Unknown(message));
+                collect_urma_budget_pressure_metrics("tx", "required");
+                let _ = session
+                    .reject_piece_transient(ERROR_CODE_BUSY, &message)
+                    .await;
+                return Ok(None);
             }
         };
         let fill_start = Instant::now();
@@ -785,7 +797,7 @@ impl UrmaServerHandler {
             piece_total_ns,
             "finished uploading piece content over urma"
         );
-        Ok(piece.length)
+        Ok(Some(piece.length))
     }
 
     fn piece_metadata(

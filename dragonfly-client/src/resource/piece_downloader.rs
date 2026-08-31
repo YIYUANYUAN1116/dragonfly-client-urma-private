@@ -965,6 +965,14 @@ pub mod urma {
         }
     }
 
+    /// Reports whether the error is a transient BUSY rejection from a peer at
+    /// its URMA registration budget. The cached client, its lane and the
+    /// parent's reputation all stay healthy: only this piece should fall back
+    /// to TCP. Every other error keeps the existing retire + penalty policy.
+    fn is_transient_busy(error: &Error) -> bool {
+        matches!(error, Error::Busy(_))
+    }
+
     /// ParentPenalty skips URMA for a parent that just failed.
     struct ParentPenalty {
         /// until is when URMA may be attempted against this parent again.
@@ -1325,6 +1333,7 @@ pub mod urma {
         ) -> Result<(UrmaStreamReader, u64, String)> {
             match result {
                 Ok(downloaded) => Ok(downloaded),
+                Err(err) if is_transient_busy(&err) => Err(err),
                 Err(err) => {
                     let fabric_failed = handle.client.fabric_failed();
                     if fabric_failed {
@@ -1380,6 +1389,32 @@ pub mod urma {
                 .await;
             self.handle_stream_result(addr, handle, result).await
         }
+
+        /// Applies the shared failure policy for non-stream downloads: BUSY is
+        /// transient (keep the cached client and parent reputation), anything
+        /// else still retires the client and records a failure.
+        async fn handle_piece_result<T>(
+            &self,
+            addr: &str,
+            handle: ClientHandle,
+            result: dragonfly_client_core::Result<T>,
+        ) -> dragonfly_client_core::Result<T> {
+            match result {
+                Ok(downloaded) => Ok(downloaded),
+                Err(err) if is_transient_busy(&err) => Err(err),
+                Err(err) => {
+                    let fabric_failed = handle.client.fabric_failed();
+                    if fabric_failed {
+                        self.retire_failed_fabric().await;
+                    }
+                    let retired = self.retire_client(addr, handle.generation).await;
+                    if retired || fabric_failed {
+                        self.record_failure(addr, classify_failure(&err));
+                    }
+                    Err(err)
+                }
+            }
+        }
     }
 
     /// URMADownloader implements the Downloader trait.
@@ -1395,20 +1430,8 @@ pub mod urma {
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
             let handle = self.client(addr).await?;
-            match handle.client.download_piece(number, task_id).await {
-                Ok(downloaded) => Ok(downloaded),
-                Err(err) => {
-                    let fabric_failed = handle.client.fabric_failed();
-                    if fabric_failed {
-                        self.retire_failed_fabric().await;
-                    }
-                    let retired = self.retire_client(addr, handle.generation).await;
-                    if retired || fabric_failed {
-                        self.record_failure(addr, classify_failure(&err));
-                    }
-                    Err(err)
-                }
-            }
+            let result = handle.client.download_piece(number, task_id).await;
+            self.handle_piece_result(addr, handle, result).await
         }
 
         /// download_persistent_piece downloads a persistent piece from the other peer over the
@@ -1422,24 +1445,11 @@ pub mod urma {
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
             let handle = self.client(addr).await?;
-            match handle
+            let result = handle
                 .client
                 .download_persistent_piece(number, task_id)
-                .await
-            {
-                Ok(downloaded) => Ok(downloaded),
-                Err(err) => {
-                    let fabric_failed = handle.client.fabric_failed();
-                    if fabric_failed {
-                        self.retire_failed_fabric().await;
-                    }
-                    let retired = self.retire_client(addr, handle.generation).await;
-                    if retired || fabric_failed {
-                        self.record_failure(addr, classify_failure(&err));
-                    }
-                    Err(err)
-                }
-            }
+                .await;
+            self.handle_piece_result(addr, handle, result).await
         }
 
         /// download_persistent_cache_piece downloads a persistent cache piece from the other peer
@@ -1453,24 +1463,11 @@ pub mod urma {
             task_id: &str,
         ) -> Result<(PieceContentStream, u64, String)> {
             let handle = self.client(addr).await?;
-            match handle
+            let result = handle
                 .client
                 .download_persistent_cache_piece(number, task_id)
-                .await
-            {
-                Ok(downloaded) => Ok(downloaded),
-                Err(err) => {
-                    let fabric_failed = handle.client.fabric_failed();
-                    if fabric_failed {
-                        self.retire_failed_fabric().await;
-                    }
-                    let retired = self.retire_client(addr, handle.generation).await;
-                    if retired || fabric_failed {
-                        self.record_failure(addr, classify_failure(&err));
-                    }
-                    Err(err)
-                }
-            }
+                .await;
+            self.handle_piece_result(addr, handle, result).await
         }
     }
 
@@ -1532,6 +1529,20 @@ pub mod urma {
                 classify_failure(&Error::Unknown("completion failed".into())),
                 Failure::Transport
             );
+        }
+
+        #[test]
+        fn busy_errors_are_transient_and_skip_the_failure_policy() {
+            // BUSY maps to Error::Busy and must be intercepted by the
+            // is_transient_busy guard before the retire/penalty policy runs:
+            // classify_failure alone still buckets it as Transport.
+            let busy = Error::Busy("urma peer busy".into());
+            assert!(is_transient_busy(&busy));
+            assert!(matches!(classify_failure(&busy), Failure::Transport));
+
+            // Every other error keeps the existing policy unchanged.
+            assert!(!is_transient_busy(&Error::Unknown("cqe error".into())));
+            assert!(!is_transient_busy(&Error::Unsupported("no device".into())));
         }
 
         #[test]

@@ -13,7 +13,7 @@ use super::{
     },
     Error, Result,
 };
-use crate::rendezvous::{ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
+use crate::rendezvous::{ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
 use dragonfly_client_core::Error as ClientError;
 use dragonfly_client_metric::collect_urma_budget_pressure_metrics;
 use std::{
@@ -277,6 +277,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         .await
         {
             Ok(Frame::Ready(metadata)) => metadata,
+            // A transient BUSY rejection leaves the peer lane alive: the
+            // server rejected before posting any WR. Keep this session (and
+            // its lane) usable for the next Piece instead of aborting.
+            Ok(Frame::Error(err)) if err.code == ERROR_CODE_BUSY => {
+                return Err(Error::PeerRejected {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
             Ok(frame) => return self.abort(unexpected(frame, "Piece request")).await,
             Err(error) => return self.abort(error).await,
         };
@@ -802,6 +811,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         write_result.and(abort_result)
     }
 
+    /// Rejects the pending Piece with a transient error while keeping the peer
+    /// lane and control stream alive. This is reserved for ERROR_CODE_BUSY:
+    /// the server rejects before posting any WR, so the lane holds no state
+    /// and can serve the next Piece request unchanged. Every other rejection
+    /// must keep using reject_piece, which retires the lane.
+    pub(crate) async fn reject_piece_transient(&mut self, code: u32, message: &str) -> Result<()> {
+        if self.piece.is_none() {
+            return Err(Error::Protocol("no pending URMA Piece to reject".into()));
+        }
+        let write_result = write_error(&mut self.stream, code, message, self.control_timeout).await;
+        self.piece = None;
+        write_result
+    }
+
     pub(crate) async fn close(mut self) -> Result<()> {
         if self.piece.is_some() {
             return self
@@ -986,6 +1009,20 @@ mod tests {
                 code: crate::rendezvous::ERROR_CODE_NOT_FOUND,
                 message: "missing Piece".into(),
             }
+        );
+    }
+
+    #[test]
+    fn busy_is_distinguishable_from_terminal_peer_rejections() {
+        // The BUSY guard in request_piece and the adapter mapping both key on
+        // this code; NOT_FOUND must keep flowing through the terminal path.
+        assert_ne!(
+            crate::rendezvous::ERROR_CODE_BUSY,
+            crate::rendezvous::ERROR_CODE_NOT_FOUND
+        );
+        assert_ne!(
+            crate::rendezvous::ERROR_CODE_BUSY,
+            crate::rendezvous::ERROR_CODE_INCOMPATIBLE
         );
     }
 

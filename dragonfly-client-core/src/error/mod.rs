@@ -158,6 +158,12 @@ pub enum DFError {
     #[error("unknown {0}")]
     Unknown(String),
 
+    /// The error for a transient busy rejection, e.g. a URMA peer at its
+    /// registration budget. The transport stays healthy; only this piece
+    /// should retry or fall back.
+    #[error("busy {0}")]
+    Busy(String),
+
     /// The error when the feature is not implemented.
     #[error{"unimplemented"}]
     Unimplemented,
