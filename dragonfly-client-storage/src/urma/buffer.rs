@@ -374,16 +374,6 @@ impl RegisteredRxWindowLease {
             _test_backing: backing,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_lengths(lengths: Vec<usize>) -> Self {
-        let slots = (0..lengths.len())
-            .map(|index| SlotId::new(index, 1).unwrap())
-            .collect();
-        let mut leases = LeaseBook::new();
-        let recycle = leases.issue(LeaseKind::Tx, slots).unwrap();
-        Self::from_test_parts(lengths, recycle, Arc::new(|_| {}))
-    }
 }
 
 /// Exclusive ownership of registered TX backing before any SEND is posted.
@@ -495,6 +485,16 @@ impl TxWindowLease {
             },
             _test_backing: backing,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_lengths(lengths: Vec<usize>) -> Self {
+        let slots = (0..lengths.len())
+            .map(|index| SlotId::new(index, 1).unwrap())
+            .collect();
+        let mut leases = LeaseBook::new();
+        let recycle = leases.issue(LeaseKind::Tx, slots).unwrap();
+        Self::from_test_parts(lengths, recycle, Arc::new(|_| {}))
     }
 }
 

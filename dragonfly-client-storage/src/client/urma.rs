@@ -633,6 +633,7 @@ impl UrmaClient {
                             completed_windows,
                             configured_pipeline_depth,
                             max_window_chunks,
+                            window_publish_wait_ns,
                             "injecting urma failure after real receive completions"
                         );
                         return Err(UrmaError::Protocol(format!(

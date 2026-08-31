@@ -633,7 +633,7 @@ impl UrmaLane {
             let batch_len = self.post_list_size.min(pending.len());
             let batch: Vec<_> = pending.drain(..batch_len).collect();
             let mut entries = Vec::with_capacity(batch_len);
-            let prepare = (|| {
+            let prepare: Result<()> = (|| {
                 for ((slot, offset, length), _) in &batch {
                     let user_ctx = self.token(OperationType::Send, *slot).encode()?;
                     pool.mark_tx_lease_posted(*slot)?;
