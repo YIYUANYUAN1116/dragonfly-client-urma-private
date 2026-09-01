@@ -30,6 +30,12 @@ path = "src/bin/dfstore/main.rs"
 name = "dfctl"
 path = "src/bin/dfctl/main.rs"
 
+[features]
+# Enables the Linux UMDK/URMA piece transport.
+urma = ["dragonfly-client-storage/urma"]
+# Opt-in validation-only URMA failpoints; do not use in production packages.
+urma-test-failpoints = ["urma", "dragonfly-client-storage/urma-test-failpoints"]
+
 [dependencies]
 dragonfly-client-core.workspace = true
 dragonfly-client-config.workspace = true

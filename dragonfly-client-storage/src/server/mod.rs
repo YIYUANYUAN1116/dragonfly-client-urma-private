@@ -16,6 +16,8 @@
 
 pub mod quic;
 pub mod tcp;
+#[cfg(feature = "urma")]
+pub mod urma;
 
 use std::time::Duration;
 

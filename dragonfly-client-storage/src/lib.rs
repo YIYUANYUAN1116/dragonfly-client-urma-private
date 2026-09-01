@@ -26,6 +26,8 @@ use reqwest::header::HeaderMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "urma")]
+use std::time::Instant;
 use tokio::{
     fs,
     io::{AsyncBufRead, AsyncRead, AsyncReadExt},
@@ -48,8 +50,12 @@ pub mod client;
 pub mod content;
 pub mod io;
 pub mod metadata;
+#[cfg(feature = "urma")]
+mod rendezvous;
 pub mod server;
 pub mod storage_engine;
+#[cfg(feature = "urma")]
+pub mod urma;
 
 /// The fallback interval for re-checking the piece metadata while waiting for an
 /// in-flight piece completion notification, guarding against missed notifications
@@ -902,6 +908,137 @@ impl Storage {
             .write_piece_from_stream(task_id, offset, length, stream)
             .await?;
 
+        self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)
+    }
+
+    /// Writes a normal Piece directly from registered URMA receive windows.
+    /// Only the wait for each window is timed out; submitted blocking writes
+    /// are always joined before an error can trigger TCP fallback.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
+        let response = self
+            .content
+            .write_piece_from_urma_stream(piece_id, task_id, offset, length, reader, timeout)
+            .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "normal",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
+        Ok(piece)
+    }
+
+    /// Writes a persistent Piece directly from registered URMA windows.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_persistent_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
+        let response = self
+            .content
+            .write_persistent_piece_from_urma_stream(
+                piece_id, task_id, offset, length, reader, timeout,
+            )
+            .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "persistent",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
+        Ok(piece)
+    }
+
+    /// Writes a persistent-cache Piece directly from registered URMA windows.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_persistent_cache_piece_from_parent_finished_urma(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
+        let response = self
+            .content
+            .write_persistent_cache_piece_from_urma_stream(
+                piece_id, task_id, offset, length, reader, timeout,
+            )
+            .await?;
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+        let commit_start = Instant::now();
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "persistent-cache",
+            storage_write_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma piece to storage"
+        );
+        Ok(piece)
+    }
+
+    fn finish_parent_piece(
+        &self,
+        piece_id: &str,
+        offset: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        response: io::WriteRangeResponse,
+    ) -> Result<metadata::Piece> {
         let length = response.length;
         let digest = Digest::new(Algorithm::Crc32, response.hash);
 
@@ -972,6 +1109,88 @@ impl Storage {
                 // Failed uploading the task.
                 self.metadata.upload_task_failed(task_id);
                 Err(err)
+            }
+        }
+    }
+
+    /// Memory-maps finished on-disk piece bytes for URMA upload. Cache-resident
+    /// pieces and missing content return an error so callers can fall back to `upload_piece`.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn map_upload_piece(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        kind: crate::rendezvous::PieceKind,
+    ) -> Result<content::MappedPiece> {
+        let piece = match kind {
+            crate::rendezvous::PieceKind::Piece => self.wait_for_piece_finished(piece_id).await?,
+            crate::rendezvous::PieceKind::PersistentPiece => {
+                self.wait_for_persistent_piece_finished(piece_id).await?
+            }
+            crate::rendezvous::PieceKind::PersistentCachePiece => {
+                self.wait_for_persistent_cache_piece_finished(piece_id)
+                    .await?
+            }
+        };
+
+        if self.cache.contains_piece(task_id, piece_id).await {
+            return Err(Error::Unsupported(
+                "urma mmap upload is unavailable for cache-resident pieces".to_string(),
+            ));
+        }
+
+        match kind {
+            crate::rendezvous::PieceKind::Piece => {
+                self.metadata.upload_task_started(task_id);
+                match self
+                    .content
+                    .map_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata.upload_task_finished(task_id);
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_task_failed(task_id);
+                        Err(err)
+                    }
+                }
+            }
+            crate::rendezvous::PieceKind::PersistentPiece => {
+                self.metadata.upload_persistent_task_started(task_id);
+                match self
+                    .content
+                    .map_persistent_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata.upload_persistent_task_finished(task_id);
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_persistent_task_failed(task_id);
+                        Err(err)
+                    }
+                }
+            }
+            crate::rendezvous::PieceKind::PersistentCachePiece => {
+                self.metadata.upload_persistent_cache_task_started(task_id);
+                match self
+                    .content
+                    .map_persistent_cache_piece(task_id, piece.offset, piece.length)
+                    .await
+                {
+                    Ok(mapped) => {
+                        self.metadata.upload_persistent_cache_task_finished(task_id);
+                        Ok(mapped)
+                    }
+                    Err(err) => {
+                        self.metadata.upload_persistent_cache_task_failed(task_id);
+                        Err(err)
+                    }
+                }
             }
         }
     }
@@ -2297,5 +2516,77 @@ mod tests {
             .upload_piece(piece_id.as_str(), TASK_ID, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tcp_fallback_overwrites_partial_write_without_reclaim() {
+        // Simulates the URMA -> TCP fallback: download_piece_started claims the
+        // piece, a failed URMA attempt leaves partial bytes in the piece range,
+        // and the TCP fallback overwrites the whole range without any
+        // intermediate download_piece_failed + download_piece_started reclaim.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(Config::default());
+        let storage = Arc::new(
+            Storage::new(config, dir.path(), dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        const TASK_ID: &str = "c8add1f66b0d0b8083f14479d6e181ec9e2b34cf07d4a1a2ee2fcf51d3a3f14f";
+        const CONTENT: &[u8] = b"piece content";
+        storage
+            .download_task_started(TASK_ID, CONTENT.len() as u64, CONTENT.len() as u64, None)
+            .await
+            .unwrap();
+
+        // The current thread becomes the sole piece owner.
+        let piece_id = storage.piece_id(TASK_ID, 0);
+        let piece = storage
+            .download_piece_started(piece_id.as_str(), 0, 0, CONTENT.len() as u64)
+            .await
+            .unwrap();
+        assert!(!piece.is_finished());
+        assert!(storage
+            .in_flight_piece_notifier(piece_id.as_str())
+            .is_some());
+
+        // The failed URMA attempt partially pwrote stale bytes into the piece
+        // range and returned an error without touching the claim.
+        let task_path = dir
+            .path()
+            .join(content::DEFAULT_CONTENT_DIR)
+            .join(content::DEFAULT_TASK_DIR)
+            .join(&TASK_ID[..3])
+            .join(TASK_ID);
+        std::fs::create_dir_all(task_path.parent().unwrap()).unwrap();
+        std::fs::write(&task_path, b"urma-partial").unwrap();
+
+        // The claim is kept for the TCP fallback, no remove_and_notify in between.
+        assert!(storage
+            .in_flight_piece_notifier(piece_id.as_str())
+            .is_some());
+
+        // The TCP fallback rewrites the whole piece range from the piece start
+        // offset and finishes the piece normally.
+        let mut stream = content_stream(CONTENT);
+        let piece = storage
+            .download_piece_from_source_finished(
+                piece_id.as_str(),
+                TASK_ID,
+                0,
+                CONTENT.len() as u64,
+                &mut stream,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(piece.is_finished());
+        assert!(storage
+            .in_flight_piece_notifier(piece_id.as_str())
+            .is_none());
+
+        // The partial URMA bytes were fully overwritten.
+        let data = std::fs::read(&task_path).unwrap();
+        assert_eq!(&data[..CONTENT.len()], CONTENT);
     }
 }

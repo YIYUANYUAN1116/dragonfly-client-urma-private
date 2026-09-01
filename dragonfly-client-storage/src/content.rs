@@ -47,6 +47,31 @@ pub const DEFAULT_PERSISTENT_CACHE_TASK_DIR: &str = "persistent-cache-tasks";
 /// content, multiplied by the largest configured buffer size to size the pool.
 pub const MAX_BUFFER_POOL_IDLE_BUFFERS: usize = 128;
 
+/// A read-only memory map of finished piece bytes on disk.
+#[cfg(feature = "urma")]
+pub struct MappedPiece {
+    mmap: memmap2::Mmap,
+}
+
+#[cfg(feature = "urma")]
+impl MappedPiece {
+    pub(crate) fn new(mmap: memmap2::Mmap) -> Self {
+        Self { mmap }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    pub fn len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+}
+
 /// The capacity of the background writeback queue, roughly the ranges a
 /// congested disk drains within the kernel dirty expire window. A full
 /// queue drops further ranges and the kernel writeback covers them.

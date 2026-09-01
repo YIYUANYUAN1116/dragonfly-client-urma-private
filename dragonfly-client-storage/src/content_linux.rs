@@ -28,8 +28,12 @@ use std::cmp::max;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "urma")]
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncRead;
+#[cfg(feature = "urma")]
+use tracing::debug;
 use tracing::{error, info, instrument, warn};
 use walkdir::WalkDir;
 
@@ -295,6 +299,97 @@ impl Content {
         ))
     }
 
+    /// Memory-maps finished piece bytes for registered URMA send windows.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn map_piece(
+        &self,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<super::content::MappedPiece> {
+        self.map_path_range(self.get_task_path(task_id), offset, length)
+            .await
+    }
+
+    /// map_persistent_piece memory-maps finished persistent piece bytes on disk.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn map_persistent_piece(
+        &self,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<super::content::MappedPiece> {
+        self.map_path_range(self.get_persistent_task_path(task_id), offset, length)
+            .await
+    }
+
+    /// map_persistent_cache_piece memory-maps finished persistent cache piece bytes on disk.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn map_persistent_cache_piece(
+        &self,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<super::content::MappedPiece> {
+        self.map_path_range(self.get_persistent_cache_task_path(task_id), offset, length)
+            .await
+    }
+
+    /// map_path_range memory-maps `[offset, offset+length)` of a content file.
+    #[cfg(feature = "urma")]
+    async fn map_path_range(
+        &self,
+        path: PathBuf,
+        offset: u64,
+        length: u64,
+    ) -> Result<super::content::MappedPiece> {
+        if length == 0 {
+            return Err(Error::InvalidParameter);
+        }
+        let mapped = tokio::task::spawn_blocking(move || -> Result<super::content::MappedPiece> {
+            let file = std::fs::File::open(&path).inspect_err(|err| {
+                error!("open {:?} failed: {}", path, err);
+            })?;
+            let metadata = file.metadata().inspect_err(|err| {
+                error!("stat {:?} failed: {}", path, err);
+            })?;
+            let end = offset.checked_add(length).ok_or(Error::InvalidParameter)?;
+            if end > metadata.len() {
+                return Err(Error::Unknown(format!(
+                    "piece range [{}, {}) exceeds content length {}",
+                    offset,
+                    end,
+                    metadata.len()
+                )));
+            }
+            // Safety: the file remains open while the mapping is constructed; MappedPiece owns
+            // the resulting pages for the piece lifetime.
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(offset)
+                    .len(length as usize)
+                    .map(&file)
+            }
+            .inspect_err(|err| {
+                error!(
+                    "mmap {:?} offset {} length {} failed: {}",
+                    path, offset, length, err
+                );
+            })?;
+            // Fault pages in so later window copies do not block the fabric send path on major
+            // page faults under memory pressure.
+            mmap.advise(memmap2::Advice::Sequential).ok();
+            mmap.advise(memmap2::Advice::WillNeed).ok();
+            Ok(super::content::MappedPiece::new(mmap))
+        })
+        .await
+        .map_err(|err| Error::Unknown(format!("mmap piece task join failed: {err}")))??;
+        Ok(mapped)
+    }
+
     /// Writes the piece from the stream of bytes chunks to the content and
     /// calculates the hash of the piece by crc32.
     #[instrument(level = "debug", skip_all)]
@@ -331,6 +426,208 @@ impl Content {
 
         self.writeback.trigger(&fd, offset, response.length).await;
         Ok(response)
+    }
+
+    /// Writes normal-task content directly from immutable registered URMA
+    /// receive spans. No aggregate userspace buffer is constructed.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_piece_from_urma_stream(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        window_timeout: std::time::Duration,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_urma_stream_to_path(
+            piece_id,
+            self.get_task_path(task_id),
+            offset,
+            expected_length,
+            reader,
+            window_timeout,
+        )
+        .await
+    }
+
+    /// Writes persistent-task content directly from registered URMA spans.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_persistent_piece_from_urma_stream(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        window_timeout: std::time::Duration,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_urma_stream_to_path(
+            piece_id,
+            self.get_persistent_task_path(task_id),
+            offset,
+            expected_length,
+            reader,
+            window_timeout,
+        )
+        .await
+    }
+
+    /// Writes persistent-cache content directly from registered URMA spans.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_persistent_cache_piece_from_urma_stream(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        window_timeout: std::time::Duration,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_urma_stream_to_path(
+            piece_id,
+            self.get_persistent_cache_task_path(task_id),
+            offset,
+            expected_length,
+            reader,
+            window_timeout,
+        )
+        .await
+    }
+
+    /// Runs the B3 direct-RX consumer. Digest and positional write share an
+    /// immutable lease on separate blocking workers while the Session receives
+    /// into the other pipeline window. The lease is explicitly recycled only
+    /// after both workers have joined, including their error paths.
+    #[cfg(feature = "urma")]
+    async fn write_urma_stream_to_path(
+        &self,
+        piece_id: &str,
+        task_path: PathBuf,
+        offset: u64,
+        expected_length: u64,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        window_timeout: std::time::Duration,
+    ) -> Result<super::io::WriteRangeResponse> {
+        use std::os::unix::fs::FileExt;
+        use tokio::time::timeout;
+
+        let storage_total_start = Instant::now();
+        let file_open_start = Instant::now();
+        let file = self
+            .fd_cache
+            .open_write(&task_path)
+            .await
+            .inspect_err(|error| error!("open {:?} failed: {}", task_path, error))?;
+        let file_open_ns = file_open_start.elapsed().as_nanos() as u64;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut length = 0u64;
+        let mut rx_windows = 0u64;
+        let mut rx_window_wait_ns = 0u64;
+        let mut digest_ns = 0u64;
+        let mut pwrite_ns = 0u64;
+        let mut recycle_ns = 0u64;
+
+        loop {
+            let window_wait_start = Instant::now();
+            let window = match timeout(window_timeout, reader.next_window()).await {
+                Ok(window) => window?,
+                Err(_) => return Err(Error::DownloadPieceFinishedTimeout(piece_id.to_string())),
+            };
+            rx_window_wait_ns += window_wait_start.elapsed().as_nanos() as u64;
+            let Some(window) = window else {
+                break;
+            };
+            rx_windows += 1;
+            let window_length = u64::try_from(window.len())
+                .map_err(|_| Error::Unknown("URMA window length exceeds u64".into()))?;
+            let remaining = expected_length.checked_sub(length).ok_or_else(|| {
+                Error::Unknown(format!(
+                    "urma stream exceeded expected length {expected_length}"
+                ))
+            })?;
+            if window_length > remaining {
+                return Err(Error::Unknown(format!(
+                    "urma stream exceeded expected length {expected_length}"
+                )));
+            }
+
+            let position = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::Unknown("URMA write offset overflow".into()))?;
+            let window = Arc::new(window);
+            let digest = {
+                let window = window.clone();
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    for part in window.parts() {
+                        hasher.update(part);
+                    }
+                    (hasher, start.elapsed().as_nanos() as u64)
+                })
+            };
+            let write = {
+                let window = window.clone();
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let mut part_offset = position;
+                    for part in window.parts() {
+                        file.write_all_at(part, part_offset)?;
+                        part_offset =
+                            part_offset.checked_add(part.len() as u64).ok_or_else(|| {
+                                std::io::Error::other("URMA positional write offset overflow")
+                            })?;
+                    }
+                    Ok::<u64, std::io::Error>(start.elapsed().as_nanos() as u64)
+                })
+            };
+
+            let (digest, write) = tokio::join!(digest, write);
+            let window = Arc::try_unwrap(window)
+                .map_err(|_| Error::Unknown("URMA window worker retained its lease".into()))?;
+            let recycle_start = Instant::now();
+            let recycle = window.recycle().await;
+            recycle_ns += recycle_start.elapsed().as_nanos() as u64;
+
+            let (next_hasher, window_digest_ns) =
+                digest.map_err(|error| Error::Unknown(format!("digest panicked: {error}")))?;
+            hasher = next_hasher;
+            digest_ns += window_digest_ns;
+            pwrite_ns += write
+                .map_err(|error| Error::Unknown(format!("write piece panicked: {error}")))?
+                .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
+            recycle?;
+            length += window_length;
+        }
+
+        if length != expected_length {
+            return Err(Error::Unknown(format!(
+                "expected length {expected_length} but got {length}"
+            )));
+        }
+
+        let storage_total_ns = storage_total_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            expected_length,
+            rx_windows,
+            file_open_ns,
+            rx_window_wait_ns,
+            digest_ns,
+            pwrite_ns,
+            recycle_ns,
+            storage_total_ns,
+            "finished writing urma piece from registered receive windows"
+        );
+
+        Ok(super::io::WriteRangeResponse {
+            length,
+            hash: hasher.finalize().to_string(),
+        })
     }
 
     /// Returns the task path by task id.
@@ -1480,5 +1777,70 @@ mod tests {
 
         let has_space = content.has_enough_space(ByteSize::mib(9).as_u64()).unwrap();
         assert!(has_space);
+    }
+}
+
+#[cfg(all(test, feature = "urma"))]
+mod urma_direct_write_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use tempfile::tempdir;
+
+    const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writes_registered_windows_without_aggregate_buffer() {
+        let temp_dir = tempdir().unwrap();
+        let content = Content::new(Arc::new(Config::default()), temp_dir.path())
+            .await
+            .unwrap();
+        let task_id = "3fd7e2a2c1b7a5b19a4b3f7f2a9e6c1d3f5a7b9c1e3d5f7a9b1c3e5d7f9a1b3c";
+        let payload = b"urma-tail";
+        content.create_task(task_id, 10).await.unwrap();
+        let (mut reader, recycled) =
+            crate::client::urma::UrmaStreamReader::from_test_windows(vec![
+                vec![b"ur".to_vec(), b"ma".to_vec()],
+                vec![b"-tail".to_vec()],
+            ]);
+
+        let response = content
+            .write_piece_from_urma_stream(
+                "piece",
+                task_id,
+                1,
+                payload.len() as u64,
+                &mut reader,
+                WINDOW_TIMEOUT,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.hash, crc32fast::hash(payload).to_string());
+        assert_eq!(recycled.load(Ordering::Acquire), 2);
+        let written = tokio::fs::read(content.get_task_path(task_id))
+            .await
+            .unwrap();
+        assert_eq!(&written[1..], payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_registered_window_length_mismatch() {
+        let temp_dir = tempdir().unwrap();
+        let content = Content::new(Arc::new(Config::default()), temp_dir.path())
+            .await
+            .unwrap();
+        let task_id = "4ad7e2a2c1b7a5b19a4b3f7f2a9e6c1d3f5a7b9c1e3d5f7a9b1c3e5d7f9a1b3c";
+        content.create_task(task_id, 8).await.unwrap();
+        let (mut reader, _) =
+            crate::client::urma::UrmaStreamReader::from_test_windows(vec![vec![b"0123".to_vec()]]);
+
+        let result = content
+            .write_piece_from_urma_stream("piece", task_id, 0, 8, &mut reader, WINDOW_TIMEOUT)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("short URMA stream must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected length 8 but got 4"));
     }
 }

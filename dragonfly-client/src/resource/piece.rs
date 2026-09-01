@@ -46,6 +46,14 @@ pub use dragonfly_client_config::MIN_PIECE_LENGTH;
 /// The maximum piece length.
 pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
 
+#[cfg(feature = "urma")]
+#[derive(Clone, Copy, Debug)]
+enum UrmaPieceKind {
+    Piece,
+    PersistentPiece,
+    PersistentCachePiece,
+}
+
 /// Sets the optimization strategy of piece length.
 pub enum PieceLengthStrategy {
     /// OptimizeByFileLength optimizes the piece length by the file length.
@@ -68,6 +76,10 @@ pub struct Piece {
 
     /// The QUIC piece downloader.
     quic_downloader: Arc<dyn piece_downloader::Downloader>,
+
+    /// URMA downloader retaining the registered-window stream path.
+    #[cfg(feature = "urma")]
+    urma_direct_downloader: Option<Arc<piece_downloader::urma::URMADownloader>>,
 
     /// The backend factory.
     backend_factory: Arc<BackendFactory>,
@@ -93,12 +105,22 @@ impl Piece {
         prefetch_bandwidth_limiter: Arc<RateLimiter>,
         back_to_source_bandwidth_limiter: Arc<RateLimiter>,
     ) -> Result<Self> {
+        #[cfg(feature = "urma")]
+        let urma_direct_downloader = (config.download.protocol == "urma")
+            .then(|| Arc::new(piece_downloader::urma::URMADownloader::new(config.clone())));
+        #[cfg(not(feature = "urma"))]
+        if config.download.protocol == "urma" {
+            warn!("download protocol is urma but this build lacks the urma feature; using tcp");
+        }
+
         Ok(Self {
             config: config.clone(),
             storage,
             tcp_downloader: piece_downloader::DownloaderFactory::new("tcp", config.clone())?
                 .build(),
             quic_downloader: piece_downloader::DownloaderFactory::new("quic", config)?.build(),
+            #[cfg(feature = "urma")]
+            urma_direct_downloader,
             backend_factory,
             download_bandwidth_limiter,
             prefetch_bandwidth_limiter,
@@ -404,13 +426,47 @@ impl Piece {
 
         // Record the start time.
         let start_time = Instant::now();
+        #[cfg(feature = "urma")]
+        if self.config.download.protocol == "urma" {
+            if let (Some(ip), Some(port)) =
+                (parent.download_ip.as_deref(), parent.download_tcp_port)
+            {
+                let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+                match self
+                    .download_piece_from_parent_over_urma(
+                        UrmaPieceKind::Piece,
+                        piece_id,
+                        task_id,
+                        number,
+                        length,
+                        parent.id.as_str(),
+                        &addr,
+                    )
+                    .await
+                {
+                    Ok(piece) => {
+                        collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                        collect_download_piece_duration_metrics(
+                            &TrafficType::RemotePeer,
+                            start_time.elapsed(),
+                        );
+                        scopeguard::ScopeGuard::into_inner(guard);
+                        return Ok(piece);
+                    }
+                    Err(error) => {
+                        warn!(%error, "urma download failed; falling back to tcp downloader");
+                    }
+                }
+            }
+        }
+
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
             parent.download_tcp_port,
             parent.download_quic_port,
         ) {
-            ("tcp", Some(ip), Some(port), _) => {
+            ("tcp" | "urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
@@ -481,6 +537,110 @@ impl Piece {
                 Err(err)
             }
         }
+    }
+
+    /// Downloads one of Dragonfly's three Piece kinds through the B3 URMA
+    /// registered-window path. On failure the piece claim and metadata are
+    /// kept, so the caller's TCP fallback rewrites the whole piece range.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    async fn download_piece_from_parent_over_urma(
+        &self,
+        kind: UrmaPieceKind,
+        piece_id: &str,
+        task_id: &str,
+        number: u32,
+        length: u64,
+        parent_id: &str,
+        tcp_addr: &str,
+    ) -> Result<metadata::Piece> {
+        let child_piece_e2e_start = Instant::now();
+        let Some(downloader) = self.urma_direct_downloader.as_ref() else {
+            return Err(Error::Unknown("urma downloader is disabled".to_string()));
+        };
+
+        let (mut reader, offset, digest) = match kind {
+            UrmaPieceKind::Piece => {
+                downloader
+                    .download_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+            UrmaPieceKind::PersistentPiece => {
+                downloader
+                    .download_persistent_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+            UrmaPieceKind::PersistentCachePiece => {
+                downloader
+                    .download_persistent_cache_piece_stream(tcp_addr, number, task_id)
+                    .await?
+            }
+        };
+
+        let finished = match kind {
+            UrmaPieceKind::Piece => {
+                self.storage
+                    .download_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+            UrmaPieceKind::PersistentPiece => {
+                self.storage
+                    .download_persistent_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+            UrmaPieceKind::PersistentCachePiece => {
+                self.storage
+                    .download_persistent_cache_piece_from_parent_finished_urma(
+                        piece_id,
+                        task_id,
+                        offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        &mut reader,
+                        self.config.storage.write_piece_timeout,
+                    )
+                    .await
+            }
+        };
+
+        // On a URMA attempt failure, keep the piece claim and metadata held by
+        // the current download thread. The caller falls back to TCP, which
+        // rewrites the whole piece range at `offset` and verifies the digest,
+        // so partial URMA writes are fully covered and need no reset here.
+        // Resetting via download_*_failed + download_*_started would release
+        // the piece notifier claim and let a concurrent requester steal the
+        // ownership before the TCP fallback starts. If the TCP fallback also
+        // fails, the caller's scopeguard runs the final download_*_failed().
+        let result = finished;
+        debug!(
+            piece_id,
+            piece_kind = ?kind,
+            length,
+            success = result.is_ok(),
+            child_piece_e2e_ns = child_piece_e2e_start.elapsed().as_nanos() as u64,
+            "finished dragonfly urma piece attempt"
+        );
+        result
     }
 
     /// Downloads a single piece from the source.
@@ -769,13 +929,47 @@ impl Piece {
 
         // Record the start time.
         let start_time = Instant::now();
+        #[cfg(feature = "urma")]
+        if self.config.download.protocol == "urma" {
+            if let (Some(ip), Some(port)) =
+                (parent.download_ip.as_deref(), parent.download_tcp_port)
+            {
+                let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+                match self
+                    .download_piece_from_parent_over_urma(
+                        UrmaPieceKind::PersistentPiece,
+                        piece_id,
+                        task_id,
+                        number,
+                        length,
+                        parent.id.as_str(),
+                        &addr,
+                    )
+                    .await
+                {
+                    Ok(piece) => {
+                        collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                        collect_download_piece_duration_metrics(
+                            &TrafficType::RemotePeer,
+                            start_time.elapsed(),
+                        );
+                        scopeguard::ScopeGuard::into_inner(guard);
+                        return Ok(piece);
+                    }
+                    Err(error) => {
+                        warn!(%error, "urma persistent download failed; falling back to tcp downloader");
+                    }
+                }
+            }
+        }
+
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
             parent.download_tcp_port,
             parent.download_quic_port,
         ) {
-            ("tcp", Some(ip), Some(port), _) => {
+            ("tcp" | "urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_persistent_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),
@@ -1131,13 +1325,47 @@ impl Piece {
 
         // Record the start time.
         let start_time = Instant::now();
+        #[cfg(feature = "urma")]
+        if self.config.download.protocol == "urma" {
+            if let (Some(ip), Some(port)) =
+                (parent.download_ip.as_deref(), parent.download_tcp_port)
+            {
+                let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
+                match self
+                    .download_piece_from_parent_over_urma(
+                        UrmaPieceKind::PersistentCachePiece,
+                        piece_id,
+                        task_id,
+                        number,
+                        length,
+                        parent.id.as_str(),
+                        &addr,
+                    )
+                    .await
+                {
+                    Ok(piece) => {
+                        collect_download_piece_traffic_metrics(&TrafficType::RemotePeer, length);
+                        collect_download_piece_duration_metrics(
+                            &TrafficType::RemotePeer,
+                            start_time.elapsed(),
+                        );
+                        scopeguard::ScopeGuard::into_inner(guard);
+                        return Ok(piece);
+                    }
+                    Err(error) => {
+                        warn!(%error, "urma persistent-cache download failed; falling back to tcp downloader");
+                    }
+                }
+            }
+        }
+
         let (mut stream, offset, digest) = match (
             self.config.download.protocol.as_str(),
             parent.download_ip,
             parent.download_tcp_port,
             parent.download_quic_port,
         ) {
-            ("tcp", Some(ip), Some(port), _) => {
+            ("tcp" | "urma", Some(ip), Some(port), _) => {
                 self.tcp_downloader
                     .download_persistent_cache_piece(
                         &format_socket_addr(IpAddr::from_str(&ip)?, port as u16),

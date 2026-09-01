@@ -15,6 +15,14 @@
  */
 
 use crate::io::RangeReader;
+#[cfg(feature = "urma")]
+use crate::rendezvous::ERROR_CODE_INCOMPATIBLE as URMA_ERROR_CODE_INCOMPATIBLE;
+#[cfg(feature = "urma")]
+use crate::urma::rendezvous::{
+    read_frame as read_urma_frame, write_frame as write_urma_frame,
+    CapabilityRegistry as UrmaCapabilityRegistry, Frame as UrmaFrame, RendezvousError as UrmaError,
+    MAGIC as URMA_MAGIC,
+};
 use crate::Storage;
 use bytes::{Bytes, BytesMut};
 use dragonfly_api::common::v2::TrafficType;
@@ -52,6 +60,19 @@ use vortex_protocol::{
 
 #[cfg(not(target_os = "linux"))]
 use tokio::io::copy_buf;
+
+#[cfg(feature = "urma")]
+fn urma_discovery_response(registry: Option<&UrmaCapabilityRegistry>) -> UrmaFrame {
+    registry
+        .and_then(UrmaCapabilityRegistry::get)
+        .map(UrmaFrame::Capability)
+        .unwrap_or_else(|| {
+            UrmaFrame::Error(UrmaError {
+                code: URMA_ERROR_CODE_INCOMPATIBLE,
+                message: "urma is not available on this peer".to_string(),
+            })
+        })
+}
 
 /// A TCP-based server for dfdaemon upload service.
 pub struct TCPServer {
@@ -91,10 +112,19 @@ impl TCPServer {
                 id_generator,
                 storage,
                 upload_bandwidth_limiter,
+                #[cfg(feature = "urma")]
+                urma_capabilities: None,
             },
             shutdown,
             _shutdown_complete: shutdown_complete_tx,
         }
+    }
+
+    /// Lets the normal TCP Piece endpoint answer lightweight URMA discovery probes.
+    #[cfg(feature = "urma")]
+    pub fn with_urma_capabilities(mut self, registry: UrmaCapabilityRegistry) -> Self {
+        self.handler.urma_capabilities = Some(registry);
+        self
     }
 
     /// Starts the storage tcp server.
@@ -184,6 +214,10 @@ pub struct TCPServerHandler {
 
     /// The rate limiter of the upload speed in bytes per second.
     upload_bandwidth_limiter: Arc<RateLimiter>,
+
+    /// Advertisement published only while the URMA listener is ready.
+    #[cfg(feature = "urma")]
+    urma_capabilities: Option<UrmaCapabilityRegistry>,
 }
 
 /// Implements the request handler.
@@ -196,6 +230,11 @@ impl TCPServerHandler {
     /// persistent cache piece downloads with proper request/response framing.
     #[instrument(skip_all, fields(host_id, remote_address, task_id, piece_id))]
     async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
+        #[cfg(feature = "urma")]
+        if self.is_urma_discovery(&stream).await? {
+            return self.handle_urma_discovery(stream).await;
+        }
+
         let (mut reader, mut writer) = stream.into_split();
         let header = self.read_header(&mut reader).await?;
         match header.tag() {
@@ -448,6 +487,53 @@ impl TCPServerHandler {
                 "unsupported tag: {:?}",
                 header.tag()
             ))),
+        }
+    }
+
+    /// Peeks for the URMA discriminator without consuming the Vortex header.
+    #[cfg(feature = "urma")]
+    async fn is_urma_discovery(&self, stream: &TcpStream) -> ClientResult<bool> {
+        let mut prefix = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let len = stream.peek(&mut prefix).await?;
+                if len == 0 {
+                    return Err(ClientError::Unknown(
+                        "connection closed before protocol header".to_string(),
+                    ));
+                }
+                if len == prefix.len() {
+                    return Ok(prefix == URMA_MAGIC.to_be_bytes());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await?
+    }
+
+    #[cfg(feature = "urma")]
+    async fn handle_urma_discovery(&self, stream: TcpStream) -> ClientResult<()> {
+        let (mut reader, mut writer) = stream.into_split();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_urma_frame(&mut reader),
+        )
+        .await??
+        {
+            UrmaFrame::Discover => {
+                let response = urma_discovery_response(self.urma_capabilities.as_ref());
+                write_urma_frame(&mut writer, &response).await
+            }
+            frame => {
+                write_urma_frame(
+                    &mut writer,
+                    &UrmaFrame::Error(UrmaError {
+                        code: URMA_ERROR_CODE_INCOMPATIBLE,
+                        message: format!("unexpected discovery frame: {frame:?}"),
+                    }),
+                )
+                .await
+            }
         }
     }
 

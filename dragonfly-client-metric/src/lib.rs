@@ -244,6 +244,63 @@ pub static UPLOAD_TRAFFIC: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// Process-wide URMA registered bytes split by reserved direction.
+pub static URMA_REGISTERED_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "urma_registered_bytes",
+            "Gauge of process-wide UMDK registered bytes.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["direction"],
+    )
+    .expect("metric can be created")
+});
+
+/// Optional or required URMA window allocations rejected by bounded resources.
+pub static URMA_BUDGET_PRESSURE_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "urma_budget_pressure_total",
+            "Counter of URMA registered-window budget pressure.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["direction", "stage"],
+    )
+    .expect("metric can be created")
+});
+
+/// Required URMA window admissions that waited for registered leases.
+pub static URMA_REQUIRED_ADMISSION_WAIT_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "urma_required_admission_wait_total",
+            "Counter of required URMA window admissions that waited for registered leases.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["direction"],
+    )
+    .expect("metric can be created")
+});
+
+/// Total time spent waiting for required URMA window admission.
+pub static URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        IntCounterVec::new(
+            Opts::new(
+                "urma_required_admission_wait_nanoseconds_total",
+                "Cumulative nanoseconds spent waiting for required URMA window admission.",
+            )
+            .namespace(dragonfly_client_config::SERVICE_NAME)
+            .subsystem(dragonfly_client_config::NAME),
+            &["direction"],
+        )
+        .expect("metric can be created")
+    });
+
 /// Used to record the download task duration.
 pub static DOWNLOAD_TASK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
@@ -658,6 +715,22 @@ fn register_custom_metrics() {
 
     REGISTRY
         .register(Box::new(UPLOAD_TRAFFIC.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REGISTERED_BYTES.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_BUDGET_PRESSURE_COUNT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REQUIRED_ADMISSION_WAIT_COUNT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS.clone()))
         .expect("metric can be registered");
 
     REGISTRY
@@ -1091,6 +1164,33 @@ pub fn collect_upload_piece_finished_metrics() {
 /// Collects the upload piece traffic metrics.
 pub fn collect_upload_piece_traffic_metrics(length: u64) {
     UPLOAD_TRAFFIC.with_label_values(&[]).inc_by(length);
+}
+
+/// Publishes the fixed process-wide URMA registration split.
+pub fn collect_urma_registered_bytes_metrics(tx_bytes: u64, rx_bytes: u64) {
+    URMA_REGISTERED_BYTES
+        .with_label_values(&["tx"])
+        .set(i64::try_from(tx_bytes).unwrap_or(i64::MAX));
+    URMA_REGISTERED_BYTES
+        .with_label_values(&["rx"])
+        .set(i64::try_from(rx_bytes).unwrap_or(i64::MAX));
+}
+
+/// Counts a bounded allocation failure without high-cardinality identifiers.
+pub fn collect_urma_budget_pressure_metrics(direction: &str, stage: &str) {
+    URMA_BUDGET_PRESSURE_COUNT
+        .with_label_values(&[direction, stage])
+        .inc();
+}
+
+/// Records one required admission that had to wait for registered leases.
+pub fn collect_urma_required_admission_wait_metrics(direction: &str, duration: Duration) {
+    URMA_REQUIRED_ADMISSION_WAIT_COUNT
+        .with_label_values(&[direction])
+        .inc();
+    URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS
+        .with_label_values(&[direction])
+        .inc_by(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
 }
 
 /// Collects the upload piece failure metrics.

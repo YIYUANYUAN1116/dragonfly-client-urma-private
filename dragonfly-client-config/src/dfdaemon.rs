@@ -40,7 +40,7 @@ use tonic::transport::{
     Certificate as TonicCertificate, ClientTlsConfig, Identity, ServerTlsConfig,
 };
 use tracing::{error, instrument};
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 /// The name of dfdaemon.
 pub const NAME: &str = "dfdaemon";
@@ -263,6 +263,42 @@ fn default_storage_server_tcp_port() -> u16 {
 #[inline]
 fn default_storage_server_quic_port() -> u16 {
     4006
+}
+
+fn default_storage_server_urma_port() -> u16 {
+    4008
+}
+
+fn default_storage_server_urma_eid_index() -> u32 {
+    0
+}
+
+fn default_storage_server_urma_max_registered_bytes() -> ByteSize {
+    ByteSize::mib(40)
+}
+
+fn default_storage_server_urma_tx_registered_bytes() -> ByteSize {
+    ByteSize::mib(8)
+}
+
+fn default_storage_server_urma_pipeline_depth() -> u32 {
+    2
+}
+
+fn default_storage_server_urma_max_inflight_chunks() -> u32 {
+    512
+}
+
+fn default_storage_server_urma_post_list_size() -> u32 {
+    1
+}
+
+fn default_storage_server_urma_max_concurrent_transfers() -> u32 {
+    64
+}
+
+fn default_storage_server_urma_transfer_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// Returns the default keep of the task's metadata and content when the dfdaemon restarts.
@@ -953,6 +989,10 @@ pub struct StorageServer {
     /// The port to the quic server.
     #[serde(default = "default_storage_server_quic_port")]
     pub quic_port: u16,
+
+    /// Optional Linux/UMDK bulk-piece transport. TCP remains the fallback.
+    #[validate]
+    pub urma: UrmaServer,
 }
 
 /// Implement Default for StorageServer.
@@ -963,6 +1003,115 @@ impl Default for StorageServer {
             tcp_port: default_storage_server_tcp_port(),
             tcp_fastopen: false,
             quic_port: default_storage_server_quic_port(),
+            urma: UrmaServer::default(),
+        }
+    }
+}
+
+/// Configuration shared by the URMA piece server and downloader.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[validate(schema(function = "validate_urma_server", skip_on_field_errors = true))]
+#[serde(default, rename_all = "camelCase")]
+pub struct UrmaServer {
+    pub enable: bool,
+
+    #[serde(default = "default_storage_server_urma_port")]
+    #[validate(range(min = 1))]
+    pub port: u16,
+
+    pub device: Option<String>,
+
+    #[serde(default = "default_storage_server_urma_eid_index")]
+    pub eid_index: u32,
+
+    #[validate(length(min = 1))]
+    pub fabric_tag: Option<String>,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_urma_max_registered_bytes"
+    )]
+    pub max_registered_bytes: ByteSize,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_storage_server_urma_tx_registered_bytes"
+    )]
+    pub tx_registered_bytes: ByteSize,
+
+    #[serde(default = "default_storage_server_urma_max_inflight_chunks")]
+    #[validate(range(min = 1, max = 4096))]
+    pub max_inflight_chunks: u32,
+
+    #[serde(default = "default_storage_server_urma_post_list_size")]
+    #[validate(range(min = 1, max = 64))]
+    pub post_list_size: u32,
+
+    #[serde(default = "default_storage_server_urma_pipeline_depth")]
+    #[validate(range(min = 1, max = 2))]
+    pub pipeline_depth: u32,
+
+    #[serde(default = "default_storage_server_urma_max_concurrent_transfers")]
+    #[validate(range(min = 1, max = 65535))]
+    pub max_concurrent_transfers: u32,
+
+    #[serde(
+        default = "default_storage_server_urma_transfer_timeout",
+        with = "humantime_serde"
+    )]
+    pub transfer_timeout: Duration,
+
+    #[serde(default)]
+    pub mmap_content: bool,
+}
+
+const URMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+const URMA_MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+const URMA_REGISTERED_SLOT_SIZE: u64 = 64 * 1024;
+const URMA_MAX_REGISTERED_BYTES: u64 = (u16::MAX as u64 + 1) * URMA_REGISTERED_SLOT_SIZE;
+
+fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), ValidationError> {
+    if urma.transfer_timeout < URMA_MIN_TRANSFER_TIMEOUT
+        || urma.transfer_timeout > URMA_MAX_TRANSFER_TIMEOUT
+    {
+        return Err(ValidationError::new(
+            "transferTimeout must be between 1s and 10m",
+        ));
+    }
+
+    let registered = urma.max_registered_bytes.as_u64();
+    let tx_registered = urma.tx_registered_bytes.as_u64();
+    if registered < 2 * URMA_REGISTERED_SLOT_SIZE || registered > URMA_MAX_REGISTERED_BYTES {
+        return Err(ValidationError::new(
+            "maxRegisteredBytes must be between 128KiB and 4GiB",
+        ));
+    }
+    if tx_registered < URMA_REGISTERED_SLOT_SIZE
+        || tx_registered > registered.saturating_sub(URMA_REGISTERED_SLOT_SIZE)
+    {
+        return Err(ValidationError::new(
+            "txRegisteredBytes must leave at least one 64KiB slot for both TX and RX",
+        ));
+    }
+    Ok(())
+}
+
+impl Default for UrmaServer {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            port: default_storage_server_urma_port(),
+            device: None,
+            eid_index: default_storage_server_urma_eid_index(),
+            fabric_tag: None,
+            max_registered_bytes: default_storage_server_urma_max_registered_bytes(),
+            tx_registered_bytes: default_storage_server_urma_tx_registered_bytes(),
+            max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
+            post_list_size: default_storage_server_urma_post_list_size(),
+            pipeline_depth: default_storage_server_urma_pipeline_depth(),
+            max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
+            transfer_timeout: default_storage_server_urma_transfer_timeout(),
+            mmap_content: false,
         }
     }
 }
@@ -2481,5 +2630,72 @@ key: /etc/ssl/private/client.pem
         assert_eq!(backend.put_chunk_size, ByteSize::mib(2));
         assert_eq!(backend.put_timeout, Duration::from_secs(60));
         assert!(!backend.enable_hickory_dns);
+    }
+}
+
+#[cfg(test)]
+mod urma_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_urma_server_is_safe() {
+        let urma = UrmaServer::default();
+        assert!(!urma.enable);
+        assert_eq!(urma.port, 4008);
+        assert!(urma.device.is_none());
+        assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));
+        assert_eq!(urma.tx_registered_bytes, ByteSize::mib(8));
+        assert_eq!(urma.max_inflight_chunks, 512);
+        assert_eq!(urma.post_list_size, 1);
+        assert_eq!(urma.pipeline_depth, 2);
+        assert_eq!(urma.max_concurrent_transfers, 64);
+        assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reject_invalid_urma_registered_budget_split() {
+        for urma in [
+            UrmaServer {
+                max_registered_bytes: ByteSize::kib(64),
+                ..Default::default()
+            },
+            UrmaServer {
+                tx_registered_bytes: ByteSize::b(0),
+                ..Default::default()
+            },
+            UrmaServer {
+                max_registered_bytes: ByteSize::mib(1),
+                tx_registered_bytes: ByteSize::mib(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(urma.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn reject_invalid_urma_limits() {
+        for pipeline_depth in [0, 3] {
+            assert!(UrmaServer {
+                pipeline_depth,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for post_list_size in [0, 65] {
+            assert!(UrmaServer {
+                post_list_size,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(UrmaServer {
+            max_concurrent_transfers: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 }

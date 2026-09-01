@@ -345,8 +345,12 @@ async fn main() -> Result<(), anyhow::Error> {
         shutdown_complete_tx.clone(),
     );
 
+    #[cfg(feature = "urma")]
+    let urma_capabilities =
+        dragonfly_client_storage::urma::rendezvous::CapabilityRegistry::default();
+
     // Initialize storage tcp server.
-    let mut storage_tcp_server = TCPServer::new(
+    let storage_tcp_server = TCPServer::new(
         config.clone(),
         SocketAddr::new(
             config.storage.server.ip.unwrap(),
@@ -358,6 +362,9 @@ async fn main() -> Result<(), anyhow::Error> {
         shutdown.clone(),
         shutdown_complete_tx.clone(),
     );
+    #[cfg(feature = "urma")]
+    let storage_tcp_server = storage_tcp_server.with_urma_capabilities(urma_capabilities.clone());
+    let mut storage_tcp_server = storage_tcp_server;
 
     // Initialize storage quic server.
     let mut storage_quic_server = QUICServer::new(
@@ -371,6 +378,45 @@ async fn main() -> Result<(), anyhow::Error> {
         shutdown.clone(),
         shutdown_complete_tx.clone(),
     );
+
+    // URMA is optional: native initialization or listener failure withdraws
+    // discovery but must not terminate healthy TCP/QUIC services.
+    let mut storage_urma_server_handle: tokio::task::JoinHandle<()> = {
+        #[cfg(feature = "urma")]
+        {
+            if config.storage.server.urma.enable {
+                let mut urma_shutdown = shutdown.clone();
+                let mut storage_urma_server =
+                    dragonfly_client_storage::server::urma::UrmaServer::new(
+                        config.clone(),
+                        SocketAddr::new(
+                            config.storage.server.ip.unwrap(),
+                            config.storage.server.urma.port,
+                        ),
+                        storage.clone(),
+                        upload_bandwidth_limiter.clone(),
+                        shutdown.clone(),
+                        shutdown_complete_tx.clone(),
+                    )
+                    .with_capability_registry(urma_capabilities.clone());
+                tokio::spawn(async move {
+                    if let Err(error) = storage_urma_server.run().await {
+                        error!("storage urma server disabled after failure: {error}");
+                        urma_shutdown.recv().await;
+                    }
+                })
+            } else {
+                tokio::spawn(std::future::pending())
+            }
+        }
+        #[cfg(not(feature = "urma"))]
+        {
+            if config.storage.server.urma.enable {
+                error!("storage.server.urma.enable is set but this build lacks the urma feature; urma server disabled");
+            }
+            tokio::spawn(std::future::pending())
+        }
+    };
 
     // Initialize proxy server.
     let proxy = Proxy::new(
@@ -517,6 +563,10 @@ async fn main() -> Result<(), anyhow::Error> {
         result = &mut storage_quic_handle => {
             result.context("storage quic server failed")??;
             info!("storage quic server exited");
+        },
+
+        _ = &mut storage_urma_server_handle => {
+            info!("storage urma server exited");
         },
 
         result = &mut dfdaemon_upload_grpc_handle => {
