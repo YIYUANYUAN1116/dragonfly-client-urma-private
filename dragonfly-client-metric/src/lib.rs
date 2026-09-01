@@ -149,6 +149,20 @@ lazy_static! {
             &["direction", "stage"]
         ).expect("metric can be created");
 
+    /// Required URMA window admissions that waited for registered leases.
+    pub static ref URMA_REQUIRED_ADMISSION_WAIT_COUNT: IntCounterVec =
+        IntCounterVec::new(
+            Opts::new("urma_required_admission_wait_total", "Counter of required URMA window admissions that waited for registered leases.").namespace(dragonfly_client_config::SERVICE_NAME).subsystem(dragonfly_client_config::NAME),
+            &["direction"]
+        ).expect("metric can be created");
+
+    /// Total time spent waiting for required URMA window admission.
+    pub static ref URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS: IntCounterVec =
+        IntCounterVec::new(
+            Opts::new("urma_required_admission_wait_nanoseconds_total", "Cumulative nanoseconds spent waiting for required URMA window admission.").namespace(dragonfly_client_config::SERVICE_NAME).subsystem(dragonfly_client_config::NAME),
+            &["direction"]
+        ).expect("metric can be created");
+
     /// Used to record the download task duration.
     pub static ref DOWNLOAD_TASK_DURATION: HistogramVec =
         HistogramVec::new(
@@ -384,6 +398,14 @@ fn register_custom_metrics() {
 
     REGISTRY
         .register(Box::new(URMA_BUDGET_PRESSURE_COUNT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REQUIRED_ADMISSION_WAIT_COUNT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS.clone()))
         .expect("metric can be registered");
 
     REGISTRY
@@ -827,6 +849,18 @@ pub fn collect_urma_budget_pressure_metrics(direction: &str, stage: &str) {
     URMA_BUDGET_PRESSURE_COUNT
         .with_label_values(&[direction, stage])
         .inc();
+}
+
+/// Records one required admission that had to wait for registered leases.
+/// Immediate admissions are deliberately omitted, so count and time describe
+/// actual contention rather than total transfer volume.
+pub fn collect_urma_required_admission_wait_metrics(direction: &str, duration: Duration) {
+    URMA_REQUIRED_ADMISSION_WAIT_COUNT
+        .with_label_values(&[direction])
+        .inc();
+    URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS
+        .with_label_values(&[direction])
+        .inc_by(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
 }
 
 /// Collects the upload piece failure metrics.

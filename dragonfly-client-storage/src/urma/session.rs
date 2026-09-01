@@ -15,7 +15,9 @@ use super::{
 };
 use crate::rendezvous::{ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
 use dragonfly_client_core::Error as ClientError;
-use dragonfly_client_metric::collect_urma_budget_pressure_metrics;
+use dragonfly_client_metric::{
+    collect_urma_budget_pressure_metrics, collect_urma_required_admission_wait_metrics,
+};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -348,23 +350,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 // Keep its admission visible process-wide so optional second
                 // windows on every lane yield while registered leases drain.
                 let _required_waiter = self.fabric.required_rx_waiter();
+                let admission_start = time::Instant::now();
                 let deadline = time::Instant::now() + timeout;
-                loop {
+                let mut waited = false;
+                let result = loop {
                     match self
                         .fabric
                         .post_receive_window_registered(lane_id, sequences.clone())
                         .await
                     {
-                        Err(Error::BufferUnavailable { .. }) if time::Instant::now() < deadline => {
-                            time::sleep(
-                                REQUIRED_RX_RETRY_INTERVAL
-                                    .min(deadline.saturating_duration_since(time::Instant::now())),
-                            )
-                            .await;
+                        Err(error @ Error::BufferUnavailable { .. }) => {
+                            waited = true;
+                            let remaining =
+                                deadline.saturating_duration_since(time::Instant::now());
+                            if remaining.is_zero() {
+                                break Err(error);
+                            }
+                            time::sleep(REQUIRED_RX_RETRY_INTERVAL.min(remaining)).await;
                         }
                         result => break result,
                     }
+                };
+                if waited {
+                    let wait = admission_start.elapsed();
+                    collect_urma_required_admission_wait_metrics("rx", wait);
+                    debug!(
+                        lane_id,
+                        required_rx_wait_count = 1u64,
+                        required_rx_wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+                        admitted = result.is_ok(),
+                        "URMA RX required admission wait finished"
+                    );
                 }
+                result
             } else {
                 self.fabric
                     .try_post_receive_window_registered(lane_id, sequences.clone())
