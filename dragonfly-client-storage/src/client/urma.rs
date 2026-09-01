@@ -33,7 +33,7 @@ use socket2::{SockRef, TcpKeepalive};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -43,10 +43,28 @@ use tracing::{debug, error, instrument, warn, Span};
 /// Cap of concurrent receive windows buffered between the transfer task and the
 /// storage writer, mirroring the TCP/QUIC client backpressure.
 
-const TRANSFER_HEALTHY: u8 = 0;
-const TRANSFER_ACTIVE: u8 = 1;
-const TRANSFER_SUCCEEDED: u8 = 2;
-const TRANSFER_FAILED: u8 = 3;
+#[derive(Default)]
+struct TransferOutcomes {
+    failed: AtomicBool,
+    successes: AtomicU64,
+}
+
+impl TransferOutcomes {
+    fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Release);
+    }
+
+    fn record_failure(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<bool> {
+        if self.failed.load(Ordering::Acquire) {
+            return Some(false);
+        }
+        (self.successes.swap(0, Ordering::AcqRel) != 0).then_some(true)
+    }
+}
 
 /// Validation-only failpoint. It is compiled out unless `urma-test-failpoints` is explicitly
 /// enabled, so a production `urma` build cannot be faulted through its environment.
@@ -80,7 +98,7 @@ fn fail_after_recv_windows() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_fail_after_recv_windows;
+    use super::{parse_fail_after_recv_windows, TransferOutcomes};
 
     #[test]
     fn receive_window_failpoint_requires_a_positive_integer() {
@@ -89,9 +107,23 @@ mod tests {
             assert_eq!(parse_fail_after_recv_windows(invalid), None);
         }
     }
+
+    #[test]
+    fn concurrent_transfer_outcomes_coalesce_success_and_keep_failure_sticky() {
+        let outcomes = TransferOutcomes::default();
+        assert_eq!(outcomes.take(), None);
+        outcomes.record_success();
+        outcomes.record_success();
+        assert_eq!(outcomes.take(), Some(true));
+        assert_eq!(outcomes.take(), None);
+        outcomes.record_success();
+        outcomes.record_failure();
+        assert_eq!(outcomes.take(), Some(false));
+        assert_eq!(outcomes.take(), Some(false));
+    }
 }
 
-type SessionSlot = Arc<tokio::sync::Mutex<Option<UrmaClientSession<TcpStream>>>>;
+type SessionSlot = Arc<tokio::sync::Mutex<Option<Arc<UrmaClientSession<TcpStream>>>>>;
 
 type WindowRecycleFuture = Pin<Box<dyn Future<Output = Result<usize, UrmaError>> + Send + 'static>>;
 type WindowRecycler =
@@ -319,13 +351,14 @@ pub struct UrmaClient {
     /// transfer_timeout bounds each posted receive window's completion wait.
     transfer_timeout: Duration,
 
-    /// session owns the one persistent control connection and RC lane used for
-    /// sequential Piece transfers to this parent.
+    /// session owns the persistent control connection and RC lane shared by
+    /// bounded concurrent Piece transfers to this parent.
     session: SessionSlot,
 
-    /// transfer_state lets the downloader observe failures that happen after
-    /// this method has returned the streaming body.
-    transfer_state: Arc<AtomicU8>,
+    /// Completed outcomes are aggregated because several Piece streams may be
+    /// active at once. A failure is sticky until this cached client is retired;
+    /// successes are drained as one healthy-parent observation.
+    transfer_outcomes: Arc<TransferOutcomes>,
 
     /// Number of real receive windows to complete before injecting a validation failure.
     fail_after_recv_windows: Option<u64>,
@@ -370,7 +403,7 @@ impl UrmaClient {
             control_timeout: transfer_timeout,
             transfer_timeout,
             session: Arc::new(tokio::sync::Mutex::new(None)),
-            transfer_state: Arc::new(AtomicU8::new(TRANSFER_HEALTHY)),
+            transfer_outcomes: Arc::new(TransferOutcomes::default()),
             fail_after_recv_windows,
         }
     }
@@ -385,26 +418,7 @@ impl UrmaClient {
     /// take_transfer_outcome reports a completed background transfer once.
     /// `Some(false)` means the cached peer session must be retired.
     pub fn take_transfer_outcome(&self) -> Option<bool> {
-        loop {
-            let current = self.transfer_state.load(Ordering::Acquire);
-            let outcome = match current {
-                TRANSFER_SUCCEEDED => true,
-                TRANSFER_FAILED => false,
-                _ => return None,
-            };
-            if self
-                .transfer_state
-                .compare_exchange(
-                    current,
-                    TRANSFER_HEALTHY,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(outcome);
-            }
-        }
+        self.transfer_outcomes.take()
     }
 
     /// Downloads a piece through the transport-neutral compatibility stream.
@@ -525,19 +539,18 @@ impl UrmaClient {
         task_id: &str,
     ) -> ClientResult<(UrmaStreamReader, u64, String)> {
         let client_piece_total_start = Instant::now();
-        // The owned guard is moved into the transfer task. This serializes
-        // Piece requests on the persistent lane without exposing Session above
-        // the storage adapter.
+        // Serialize only lazy lane creation. Piece transfers release this
+        // guard before rendezvous and then share the persistent lane.
         let session_queue_start = Instant::now();
-        let mut session_slot = self.session.clone().lock_owned().await;
+        let mut session_slot = self.session.lock().await;
         let session_queue_wait_ns = session_queue_start.elapsed().as_nanos() as u64;
-        if self.transfer_state.load(Ordering::Acquire) == TRANSFER_FAILED {
+        if self.transfer_outcomes.failed.load(Ordering::Acquire) {
             return Err(ClientError::Unknown(
                 "previous urma transfer failed; retire the cached peer session".into(),
             ));
         }
-        let (mut session, reused_session) = match session_slot.take() {
-            Some(session) => (session, true),
+        let (session, reused_session) = match session_slot.as_ref() {
+            Some(session) => (session.clone(), true),
             None => {
                 let stream = TcpStream::connect(&self.addr).await?;
                 let socket = SockRef::from(&stream);
@@ -555,15 +568,19 @@ impl UrmaClient {
                     self.capability.clone(),
                     &self.remote_capability,
                     self.control_timeout,
+                    self.config.storage.server.urma.max_concurrent_transfers as usize,
                 )
                 .await
                 .map_err(urma_error)?;
+                let session = Arc::new(session);
+                *session_slot = Some(session.clone());
                 (session, false)
             }
         };
+        drop(session_slot);
         debug!(
             parent_addr = self.addr,
-            lane_id = session.lane_id().unwrap_or_default(),
+            lane_id = session.lane_id(),
             reused_session,
             piece_kind = ?kind,
             piece_number = number,
@@ -584,14 +601,11 @@ impl UrmaClient {
             max_inflight_chunks: self.lane_config.recv_depth,
         };
         let request_ready_start = Instant::now();
-        let metadata = match session.request_piece(request).await {
-            Ok(metadata) => metadata,
-            // A transient BUSY rejection leaves the session (and its lane)
-            // healthy: put it back for the next Piece and report Busy so the
-            // caller falls back to TCP without retiring the cached client.
+        let (mut transfer, metadata) = match session.request_piece(request).await {
+            Ok(transfer) => transfer,
+            // Local or peer lane admission BUSY leaves the shared lane healthy
+            // and falls back only this Piece to TCP.
             Err(UrmaError::PeerRejected { code, message }) if code == ERROR_CODE_BUSY => {
-                *session_slot = Some(session);
-                drop(session_slot);
                 return Err(ClientError::Busy(format!(
                     "urma peer busy ({code}): {message}"
                 )));
@@ -612,14 +626,13 @@ impl UrmaClient {
         let reader = UrmaStreamReader::new(window_rx, self.fabric.clone());
         let transfer_timeout = self.transfer_timeout;
         let piece_timeout = self.config.download.piece_timeout;
-        let transfer_state = self.transfer_state.clone();
+        let transfer_outcomes = self.transfer_outcomes.clone();
         let fail_after_recv_windows = self.fail_after_recv_windows;
         let configured_pipeline_depth = self.lane_config.pipeline_depth;
         let max_window_chunks = self.lane_config.recv_depth;
         let log_task_id = task_id.to_string();
-        transfer_state.store(TRANSFER_ACTIVE, Ordering::Release);
         tokio::spawn(async move {
-            let mut transfer = Box::pin(async {
+            let mut transfer_future = Box::pin(async {
                 let mut completed_windows = 0u64;
                 let mut received_bytes = 0u64;
                 let mut rx_window_wait_ns = 0u64;
@@ -627,7 +640,7 @@ impl UrmaClient {
                 let mut done_wait_ns = 0u64;
                 loop {
                     let rx_window_wait_start = Instant::now();
-                    let window = session
+                    let window = transfer
                         .receive_next_window_registered(transfer_timeout)
                         .await?;
                     rx_window_wait_ns += rx_window_wait_start.elapsed().as_nanos() as u64;
@@ -637,17 +650,16 @@ impl UrmaClient {
                         // Publish a non-final completed window first so Storage contains a real
                         // partial Piece when the normal error/fallback path resets it. The final
                         // window stays behind the existing Done gate.
-                        if !session.piece_complete() {
+                        if !transfer.piece_complete() {
                             let publish_start = Instant::now();
                             let published = window_tx.send(Ok(window)).await;
                             window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
                             if published.is_err() {
-                                transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
                                 return Ok(());
                             }
                         }
                         warn!(
-                            lane_id = session.lane_id().unwrap_or_default(),
+                            lane_id = session.lane_id(),
                             completed_windows,
                             configured_pipeline_depth,
                             max_window_chunks,
@@ -658,17 +670,15 @@ impl UrmaClient {
                             "injected failure after {completed_windows} completed receive windows"
                         )));
                     }
-                    if session.piece_complete() {
+                    if transfer.piece_complete() {
                         // Storage stops polling after it receives the expected
                         // byte count. Hold the final bytes until Done has been
                         // validated so a terminal protocol failure cannot be
                         // hidden behind a successful length/digest check.
                         let done_wait_start = Instant::now();
-                        session.finish_piece().await?;
+                        transfer.finish_piece().await?;
                         done_wait_ns += done_wait_start.elapsed().as_nanos() as u64;
-                        *session_slot = Some(session);
-                        drop(session_slot);
-                        transfer_state.store(TRANSFER_SUCCEEDED, Ordering::Release);
+                        transfer_outcomes.record_success();
                         let publish_start = Instant::now();
                         let _ = window_tx.send(Ok(window)).await;
                         window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
@@ -692,14 +702,13 @@ impl UrmaClient {
                     window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
                     if published.is_err() {
                         // This is local cancellation, not evidence that the
-                        // parent is unhealthy. Dropping Session aborts the lane.
-                        transfer_state.store(TRANSFER_HEALTHY, Ordering::Release);
+                        // parent or shared lane is unhealthy.
                         return Ok(());
                     }
                 }
             });
             let error = match tokio::select! {
-                result = &mut transfer => result.map_err(|error| error.to_string()),
+                result = &mut transfer_future => result.map_err(|error| error.to_string()),
                 _ = time::sleep(piece_timeout) => {
                     Err("complete urma piece transfer timed out".to_string())
                 }
@@ -707,14 +716,12 @@ impl UrmaClient {
                 Ok(()) => return,
                 Err(error) => error,
             };
-            // Publish failure while the transfer future still owns the Session
-            // slot guard. A queued Piece therefore cannot race through with a
-            // freshly reconnected lane before observing the failure.
-            transfer_state.store(TRANSFER_FAILED, Ordering::Release);
-            drop(transfer);
+            // A transport failure is sticky for the cached client and aborts
+            // the shared lane, waking every sibling transfer fail-closed.
+            transfer_outcomes.record_failure();
+            drop(transfer_future);
+            let _ = transfer.abort_transfer(error.clone()).await;
             let _ = window_tx.send(Err(io::Error::other(error))).await;
-            // Session and its active lane are dropped here and abort through
-            // the lifecycle command path. The empty slot forces reconnect.
         });
 
         Ok((reader, result_offset, result_digest))

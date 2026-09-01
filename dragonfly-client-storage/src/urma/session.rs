@@ -22,6 +22,10 @@ use dragonfly_client_metric::{
 use std::{
     collections::VecDeque,
     marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -209,19 +213,41 @@ struct PendingReceiveWindow {
     permit: OwnedSemaphorePermit,
 }
 
-/// Downloader-side peer session. `finish_piece` returns it to Idle so the
-/// same control connection and Jetty can carry the next Piece.
-pub(crate) struct UrmaClientSession<S> {
+struct ClientLane {
     control: LaneControl,
-    transfer_control: Option<TransferControl>,
-    stream_type: PhantomData<S>,
     fabric: UrmaFabricHandle,
-    lane_id: Option<u16>,
+    lane_id: u16,
     max_message_size: u64,
     max_receive_inflight: u32,
     receive_pipeline_depth: usize,
     control_timeout: Duration,
-    next_transfer_id: TransferId,
+    next_transfer_id: AtomicU32,
+    failed: AtomicBool,
+}
+
+impl Drop for ClientLane {
+    fn drop(&mut self) {
+        debug!(
+            role = "client",
+            lane_id = self.lane_id,
+            "dropping urma peer lane"
+        );
+        self.control.abort("URMA client lane owner was dropped");
+        let _ = self.fabric.try_abort_lane(self.lane_id);
+    }
+}
+
+/// Downloader-side handle to one persistent control connection and Jetty.
+/// Piece-local state lives in [`UrmaClientTransfer`], so this handle can be
+/// shared by concurrent downloads to the same parent.
+pub(crate) struct UrmaClientSession<S> {
+    lane: Arc<ClientLane>,
+    stream_type: PhantomData<S>,
+}
+
+pub(crate) struct UrmaClientTransfer {
+    lane: Arc<ClientLane>,
+    transfer_control: Option<TransferControl>,
     piece: Option<ClientPiece>,
 }
 
@@ -233,6 +259,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         local_capability: UrmaCapability,
         remote_capability: &UrmaCapability,
         control_timeout: Duration,
+        max_concurrent_transfers: usize,
     ) -> Result<Self> {
         local_capability
             .compatible(remote_capability)
@@ -266,63 +293,69 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         }
         info!(role = "client", lane_id, "urma peer lane established");
         Ok(Self {
-            control: LaneControl::spawn(stream, 1)?,
-            transfer_control: None,
+            lane: Arc::new(ClientLane {
+                control: LaneControl::spawn(stream, max_concurrent_transfers)?,
+                fabric,
+                lane_id,
+                max_message_size,
+                max_receive_inflight: lane_config.recv_depth,
+                receive_pipeline_depth: lane_config.pipeline_depth as usize,
+                control_timeout,
+                next_transfer_id: AtomicU32::new(1),
+                failed: AtomicBool::new(false),
+            }),
             stream_type: PhantomData,
-            fabric,
-            lane_id: Some(lane_id),
-            max_message_size,
-            max_receive_inflight: lane_config.recv_depth,
-            receive_pipeline_depth: lane_config.pipeline_depth as usize,
-            control_timeout,
-            next_transfer_id: 1,
-            piece: None,
         })
     }
 
     pub(crate) async fn request_piece(
-        &mut self,
+        &self,
         request: CommonPieceRequest,
-    ) -> Result<PieceMetadata> {
-        if self.piece.is_some() {
-            return Err(Error::Protocol("an URMA Piece is already active".into()));
+    ) -> Result<(UrmaClientTransfer, PieceMetadata)> {
+        if self.lane.failed.load(Ordering::Acquire) {
+            return Err(Error::Protocol("URMA client lane is failed".into()));
         }
         if request.task_id.is_empty()
             || request.chunk_size == 0
-            || request.chunk_size > self.max_message_size
+            || request.chunk_size > self.lane.max_message_size
             || request.max_inflight_chunks == 0
-            || request.max_inflight_chunks > self.max_receive_inflight
+            || request.max_inflight_chunks > self.lane.max_receive_inflight
         {
             return Err(Error::Protocol("invalid URMA Piece request".into()));
         }
-        let transfer_id = self.next_transfer_id;
-        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        let transfer_id = self
+            .lane
+            .next_transfer_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.wrapping_add(1).max(1))
+            })
+            .unwrap();
         debug!(
             role = "client",
-            lane_id = self.open_lane()?,
+            lane_id = self.lane.lane_id,
             transfer_id,
             piece_kind = ?request.kind,
             piece_number = request.piece_number,
             "urma piece request on peer lane"
         );
-        let control = self.control.register(transfer_id)?;
+        let control = self.lane.control.register(transfer_id)?;
         if let Err(error) = send_transfer_control(
             &control,
             Frame::Request {
                 transfer_id,
                 request: request.clone(),
             },
-            self.control_timeout,
+            self.lane.control_timeout,
             "send Piece Request",
         )
         .await
         {
-            return self.abort(error).await;
+            return self.abort_lane(error).await;
         }
         let mut control = control;
         let metadata = match receive_transfer_control(
             &mut control,
-            self.control_timeout,
+            self.lane.control_timeout,
             "receive Piece Ready",
         )
         .await
@@ -344,34 +377,58 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                     message: err.message,
                 });
             }
-            Ok(frame) => return self.abort(unexpected(frame, "Piece request")).await,
-            Err(error) => return self.abort(error).await,
+            Ok(frame) => return self.abort_lane(unexpected(frame, "Piece request")).await,
+            Err(error) => return self.abort_lane(error).await,
         };
         let shape = match TransferShape::negotiate(
             &request,
             metadata,
-            self.max_message_size,
-            self.max_receive_inflight,
+            self.lane.max_message_size,
+            self.lane.max_receive_inflight,
         ) {
             Ok(shape) => shape,
-            Err(error) => return self.abort(error).await,
+            Err(error) => return self.abort_lane(error).await,
         };
         let metadata = shape.metadata.clone();
-        self.transfer_control = Some(control);
-        self.piece = Some(ClientPiece {
-            transfer_id,
-            shape,
-            next_post_chunk: 0,
-            next_deliver_chunk: 0,
-            pending: VecDeque::with_capacity(self.receive_pipeline_depth),
-            window_permits: std::sync::Arc::new(Semaphore::new(self.receive_pipeline_depth)),
-            pipeline_depth: self.receive_pipeline_depth,
-        });
-        Ok(metadata)
+        let pipeline_depth = self.lane.receive_pipeline_depth;
+        Ok((
+            UrmaClientTransfer {
+                lane: self.lane.clone(),
+                transfer_control: Some(control),
+                piece: Some(ClientPiece {
+                    transfer_id,
+                    shape,
+                    next_post_chunk: 0,
+                    next_deliver_chunk: 0,
+                    pending: VecDeque::with_capacity(pipeline_depth),
+                    window_permits: Arc::new(Semaphore::new(pipeline_depth)),
+                    pipeline_depth,
+                }),
+            },
+            metadata,
+        ))
+    }
+
+    pub(crate) fn lane_id(&self) -> u16 {
+        self.lane.lane_id
+    }
+
+    async fn abort_lane<T>(&self, error: Error) -> Result<T> {
+        self.lane.failed.store(true, Ordering::Release);
+        self.lane.control.abort(error.to_string());
+        warn!(role = "client", lane_id = self.lane.lane_id, %error, "aborting urma peer lane");
+        let _ = self.lane.fabric.abort_lane(self.lane.lane_id).await;
+        Err(error)
+    }
+}
+
+impl UrmaClientTransfer {
+    pub(crate) async fn abort_transfer(&mut self, message: impl Into<String>) -> Result<()> {
+        self.abort(Error::Protocol(message.into())).await
     }
 
     async fn fill_receive_pipeline(&mut self, timeout: Duration) -> Result<()> {
-        let lane_id = self.open_lane()?;
+        let lane_id = self.lane.lane_id;
         loop {
             let (window, expected_len, pending_count, permits) = {
                 let piece = self
@@ -409,12 +466,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 // A Piece cannot make progress without its first RX window.
                 // Keep its admission visible process-wide so optional second
                 // windows on every lane yield while registered leases drain.
-                let _required_waiter = self.fabric.required_rx_waiter();
+                let _required_waiter = self.lane.fabric.required_rx_waiter();
                 let admission_start = time::Instant::now();
                 let deadline = time::Instant::now() + timeout;
                 let mut waited = false;
                 let result = loop {
                     match self
+                        .lane
                         .fabric
                         .post_receive_window_registered(lane_id, sequences.clone())
                         .await
@@ -444,7 +502,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 }
                 result
             } else {
-                self.fabric
+                self.lane
+                    .fabric
                     .try_post_receive_window_registered(lane_id, sequences.clone())
                     .await
             };
@@ -476,7 +535,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                     transfer_id: self.piece.as_ref().expect("active Piece").transfer_id,
                     window,
                 },
-                self.control_timeout,
+                self.lane.control_timeout,
                 "send RecvPosted",
             )
             .await
@@ -499,7 +558,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         &mut self,
         timeout: Duration,
     ) -> Result<RegisteredRxWindowLease> {
-        let lane_id = self.open_lane()?;
+        let lane_id = self.lane.lane_id;
         self.fill_receive_pipeline(timeout).await?;
         let pending = self
             .piece
@@ -576,11 +635,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
             .transfer_control
             .as_mut()
             .ok_or_else(|| Error::Protocol("no active URMA Piece control".into()))?;
-        match receive_transfer_control(control, self.control_timeout, "receive Piece Done").await {
+        match receive_transfer_control(control, self.lane.control_timeout, "receive Piece Done")
+            .await
+        {
             Ok(Frame::Done { transfer_id }) if transfer_id == piece.transfer_id => {
                 debug!(
                     role = "client",
-                    lane_id = self.open_lane()?,
+                    lane_id = self.lane.lane_id,
                     transfer_id,
                     "urma piece finished on peer lane"
                 );
@@ -596,48 +657,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         }
     }
 
-    pub(crate) async fn close(mut self) -> Result<()> {
-        if self.piece.is_some() {
-            return self
-                .abort(Error::Protocol(
-                    "cannot close with an active URMA Piece".into(),
-                ))
-                .await;
-        }
-        let lane_id = self.lane_id.take().expect("open peer lane");
-        info!(role = "client", lane_id, "closing urma peer lane");
-        self.fabric.close_lane(lane_id).await
-    }
-
-    pub(crate) fn lane_id(&self) -> Option<u16> {
-        self.lane_id
-    }
-
-    fn open_lane(&self) -> Result<u16> {
-        self.lane_id
-            .ok_or_else(|| Error::Protocol("URMA client session is closed".into()))
-    }
-
     async fn abort<T>(&mut self, error: Error) -> Result<T> {
         if let Some(piece) = self.piece.as_mut() {
             piece.pending.clear();
         }
         self.transfer_control.take();
-        self.control.abort(error.to_string());
-        if let Some(lane_id) = self.lane_id.take() {
-            warn!(role = "client", lane_id, %error, "aborting urma peer lane");
-            let _ = self.fabric.abort_lane(lane_id).await;
-        }
+        self.lane.failed.store(true, Ordering::Release);
+        self.lane.control.abort(error.to_string());
+        warn!(role = "client", lane_id = self.lane.lane_id, %error, "aborting urma peer lane");
+        let _ = self.lane.fabric.abort_lane(self.lane.lane_id).await;
         Err(error)
-    }
-}
-
-impl<S> Drop for UrmaClientSession<S> {
-    fn drop(&mut self) {
-        if let Some(lane_id) = self.lane_id.take() {
-            debug!(role = "client", lane_id, "dropping active urma peer lane");
-            let _ = self.fabric.try_abort_lane(lane_id);
-        }
     }
 }
 

@@ -266,11 +266,14 @@ impl LaneControl {
         if transfer_id == 0 {
             return Err(protocol_error("transfer_id 0 is reserved for the lane"));
         }
-        let permit = self
-            .admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| protocol_error("URMA lane transfer admission is full"))?;
+        let permit =
+            self.admission
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::PeerRejected {
+                    code: crate::rendezvous::ERROR_CODE_BUSY,
+                    message: "URMA lane transfer admission is full".into(),
+                })?;
         register_transfer(
             transfer_id,
             self.writer.clone(),
