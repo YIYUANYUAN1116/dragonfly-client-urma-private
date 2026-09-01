@@ -27,6 +27,8 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+const REQUIRED_RX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
 fn control_error(error: ClientError) -> Error {
     Error::Protocol(format!("URMA rendezvous failed: {error}"))
 }
@@ -310,7 +312,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         Ok(metadata)
     }
 
-    async fn fill_receive_pipeline(&mut self) -> Result<()> {
+    async fn fill_receive_pipeline(&mut self, timeout: Duration) -> Result<()> {
         let lane_id = self.open_lane()?;
         loop {
             let (window, expected_len, pending_count, permits) = {
@@ -342,9 +344,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 ..window.start_chunk + u64::from(window.chunk_count))
                 .collect::<Vec<_>>();
             let post = if pending_count == 0 {
-                self.fabric
-                    .post_receive_window_registered(lane_id, sequences.clone())
-                    .await
+                // A Piece cannot make progress without its first RX window.
+                // Keep its admission visible process-wide so optional second
+                // windows on every lane yield while registered leases drain.
+                let _required_waiter = self.fabric.required_rx_waiter();
+                let deadline = time::Instant::now() + timeout;
+                loop {
+                    match self
+                        .fabric
+                        .post_receive_window_registered(lane_id, sequences.clone())
+                        .await
+                    {
+                        Err(Error::BufferUnavailable { .. }) if time::Instant::now() < deadline => {
+                            time::sleep(
+                                REQUIRED_RX_RETRY_INTERVAL
+                                    .min(deadline.saturating_duration_since(time::Instant::now())),
+                            )
+                            .await;
+                        }
+                        result => break result,
+                    }
+                }
             } else {
                 self.fabric
                     .try_post_receive_window_registered(lane_id, sequences.clone())
@@ -397,7 +417,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         timeout: Duration,
     ) -> Result<RegisteredRxWindowLease> {
         let lane_id = self.open_lane()?;
-        self.fill_receive_pipeline().await?;
+        self.fill_receive_pipeline(timeout).await?;
         let pending = self
             .piece
             .as_mut()

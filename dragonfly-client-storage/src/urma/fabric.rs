@@ -18,7 +18,10 @@ use super::{
 };
 use std::thread::{self, JoinHandle};
 use std::{
-    sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak,
+    },
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -32,6 +35,29 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 /// Pure polling is required because Phase A deliberately has no JFCE. Keep the
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
+
+#[derive(Clone, Default)]
+struct RequiredRxWaiters(Arc<AtomicUsize>);
+
+impl RequiredRxWaiters {
+    fn enter(&self) -> RequiredRxWaiter {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        RequiredRxWaiter(Arc::clone(&self.0))
+    }
+
+    fn has_waiters(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+}
+
+struct RequiredRxWaiter(Arc<AtomicUsize>);
+
+impl Drop for RequiredRxWaiter {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0, "required RX waiter count underflow");
+    }
+}
 
 fn window_chunks_for_slots(slots: usize, pipeline_depth: u32) -> u32 {
     let depth = usize::try_from(pipeline_depth).unwrap_or(usize::MAX).max(1);
@@ -204,6 +230,7 @@ impl UrmaFabric {
                     runtime_config,
                     transport_type,
                     max_message_size,
+                    required_rx_waiters: RequiredRxWaiters::default(),
                     shutdown: AsyncMutex::new(()),
                     join: Mutex::new(Some(join)),
                 }),
@@ -355,6 +382,10 @@ impl UrmaFabricHandle {
             .await
     }
 
+    pub(crate) fn required_rx_waiter(&self) -> impl Drop {
+        self.inner.required_rx_waiters.enter()
+    }
+
     pub(crate) async fn try_post_receive_window_registered(
         &self,
         lane_id: u16,
@@ -374,6 +405,13 @@ impl UrmaFabricHandle {
             return Err(Error::InvalidConfiguration(
                 "registered RX window cannot be empty".into(),
             ));
+        }
+        if try_admission && self.inner.required_rx_waiters.has_waiters() {
+            return Err(Error::BufferUnavailable {
+                kind: "RX",
+                requested: sequences.len(),
+                available: 0,
+            });
         }
         let command_tx = self.command_sender()?;
         let mut completion_txs: Vec<RegisteredRxCompletionTx> = Vec::with_capacity(sequences.len());
@@ -613,6 +651,7 @@ struct FabricInner {
     runtime_config: RuntimeConfig,
     transport_type: u32,
     max_message_size: u64,
+    required_rx_waiters: RequiredRxWaiters,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -997,6 +1036,21 @@ mod tests {
     fn zero_command_capacity_is_rejected_before_spawning() {
         let result = UrmaFabric::start_with_capacity(RuntimeConfig::new("urma0", 0), 0);
         assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn required_rx_waiter_is_counted_and_released_on_drop() {
+        let waiters = RequiredRxWaiters::default();
+        assert!(!waiters.has_waiters());
+
+        let first = waiters.enter();
+        let second = waiters.enter();
+        assert!(waiters.has_waiters());
+
+        drop(first);
+        assert!(waiters.has_waiters());
+        drop(second);
+        assert!(!waiters.has_waiters());
     }
 
     #[test]
