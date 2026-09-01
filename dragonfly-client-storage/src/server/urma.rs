@@ -24,7 +24,7 @@ use crate::urma::rendezvous::{
     UrmaAdvertisement, UrmaCapability, SESSION_TRANSFER_ID,
 };
 use crate::urma::server_session_idle_timeout;
-use crate::urma::session::{RegisteredSendTiming, UrmaServerSession};
+use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
 use crate::urma::TxWindowLease;
 use crate::Storage;
@@ -254,6 +254,7 @@ impl UrmaServer {
             urma_config.transfer_timeout,
             self.config.download.piece_timeout,
             urma_config.mmap_content,
+            urma_config.max_concurrent_transfers as usize,
         ));
         let admission = Arc::new(Semaphore::new(
             urma_config.max_concurrent_transfers as usize,
@@ -382,6 +383,8 @@ struct UrmaServerHandler {
     transfer_timeout: Duration,
     piece_timeout: Duration,
     mmap_content: bool,
+    max_concurrent_transfers: usize,
+    transfer_admission: Arc<Semaphore>,
     required_tx_waiters: AtomicUsize,
 }
 
@@ -397,6 +400,7 @@ impl UrmaServerHandler {
         transfer_timeout: Duration,
         piece_timeout: Duration,
         mmap_content: bool,
+        max_concurrent_transfers: usize,
     ) -> Self {
         Self {
             storage,
@@ -409,38 +413,51 @@ impl UrmaServerHandler {
             transfer_timeout,
             piece_timeout,
             mmap_content,
+            max_concurrent_transfers,
+            transfer_admission: Arc::new(Semaphore::new(max_concurrent_transfers)),
             required_tx_waiters: AtomicUsize::new(0),
         }
     }
 
-    /// Accepts one peer lane and serves sequential Piece requests until the
-    /// peer disconnects or a conservative Phase A error retires the session.
+    /// Accepts one peer lane and runs bounded concurrent Piece uploads. The
+    /// lane dispatcher owns control I/O; each task owns one transfer state.
     #[instrument(skip_all, fields(remote_address))]
-    async fn handle(&self, stream: TcpStream, remote_address: String) -> ClientResult<()> {
+    async fn handle(
+        self: Arc<Self>,
+        stream: TcpStream,
+        remote_address: String,
+    ) -> ClientResult<()> {
         Span::current().record("remote_address", remote_address.as_str());
-        let mut session = UrmaServerSession::accept(
+        let session = UrmaServerSession::accept(
             stream,
             self.fabric.clone(),
             self.lane_config,
             &self.capability,
             self.control_timeout,
+            self.max_concurrent_transfers,
         )
         .await
         .map_err(client_error)?;
 
+        let mut transfers = JoinSet::new();
         loop {
-            let Some(request) = session
-                .receive_request(self.session_idle_timeout)
-                .await
-                .map_err(client_error)?
-            else {
-                debug!(
-                    lane_id = session.lane_id().unwrap_or_default(),
-                    idle_timeout = ?self.session_idle_timeout,
-                    "urma peer session idle timeout"
-                );
-                session.close().await.map_err(client_error)?;
-                return Ok(());
+            let incoming = session.receive_request(self.session_idle_timeout).await;
+            let Some((transfer, request)) = incoming.map_err(client_error)? else {
+                if transfers.is_empty() {
+                    debug!(
+                        lane_id = session.lane_id(),
+                        idle_timeout = ?self.session_idle_timeout,
+                        "urma peer session idle timeout"
+                    );
+                    session.close().await.map_err(client_error)?;
+                    return Ok(());
+                }
+                while let Some(completed) = transfers.join_next().await {
+                    if let Err(error) = completed {
+                        warn!(%error, "urma Piece upload task failed");
+                    }
+                }
+                continue;
             };
             let piece_id = self
                 .storage
@@ -449,39 +466,69 @@ impl UrmaServerHandler {
             info!(
                 task_id = %request.task_id,
                 piece_id = %piece_id,
-                lane_id = session.lane_id().unwrap_or_default(),
+                lane_id = session.lane_id(),
+                transfer_id = transfer.transfer_id(),
                 piece_kind = ?request.kind,
                 piece_number = request.piece_number,
                 "start upload piece content over urma"
             );
-            match time::timeout(
-                self.piece_timeout,
-                self.handle_piece(&mut session, &request, &piece_id),
-            )
-            .await
-            {
-                Ok(Ok(Some(length))) => {
-                    collect_upload_piece_finished_metrics();
-                    collect_upload_piece_traffic_metrics(length);
+            let handler = self.clone();
+            transfers
+                .spawn(async move { handler.serve_transfer(transfer, request, piece_id).await });
+
+            while let Some(completed) = transfers.try_join_next() {
+                match completed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        debug!(%error, "urma Piece upload ended with a Piece-local error");
+                    }
+                    Err(error) => warn!(%error, "urma Piece upload task failed"),
                 }
-                // Transient BUSY rejection: the peer lane stays alive, so keep
-                // serving further Piece requests on this connection.
-                Ok(Ok(None)) => {
-                    collect_upload_piece_failure_metrics();
-                }
-                Ok(Err(error)) => {
-                    collect_upload_piece_failure_metrics();
-                    return Err(error);
-                }
-                Err(error) => {
-                    collect_upload_piece_failure_metrics();
-                    let message = format!(
-                        "urma Piece transfer timed out after {:?}",
-                        self.piece_timeout
-                    );
-                    let _ = session.reject_piece(ERROR_CODE_INTERNAL, &message).await;
-                    return Err(error.into());
-                }
+            }
+        }
+    }
+
+    async fn serve_transfer(
+        self: Arc<Self>,
+        mut transfer: UrmaServerTransfer,
+        request: CommonPieceRequest,
+        piece_id: String,
+    ) -> ClientResult<()> {
+        let Ok(_permit) = self.transfer_admission.clone().try_acquire_owned() else {
+            collect_upload_piece_failure_metrics();
+            transfer
+                .reject_piece_transient(ERROR_CODE_BUSY, "URMA process transfer admission is full")
+                .await
+                .map_err(client_error)?;
+            return Ok(());
+        };
+        match time::timeout(
+            self.piece_timeout,
+            self.handle_piece(&mut transfer, &request, &piece_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(length))) => {
+                collect_upload_piece_finished_metrics();
+                collect_upload_piece_traffic_metrics(length);
+                Ok(())
+            }
+            Ok(Ok(None)) => {
+                collect_upload_piece_failure_metrics();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                collect_upload_piece_failure_metrics();
+                Err(error)
+            }
+            Err(error) => {
+                collect_upload_piece_failure_metrics();
+                let message = format!(
+                    "urma Piece transfer timed out after {:?}",
+                    self.piece_timeout
+                );
+                let _ = transfer.abort_transfer(message).await;
+                Err(error.into())
             }
         }
     }
@@ -495,7 +542,7 @@ impl UrmaServerHandler {
     #[instrument(skip_all, fields(task_id = %request.task_id, piece_id = %piece_id))]
     async fn handle_piece(
         &self,
-        session: &mut UrmaServerSession<TcpStream>,
+        session: &mut UrmaServerTransfer,
         request: &CommonPieceRequest,
         piece_id: &str,
     ) -> ClientResult<Option<u64>> {
@@ -851,7 +898,7 @@ impl UrmaServerHandler {
         let piece_total_ns = piece_total_start.elapsed().as_nanos() as u64;
         let tx_ring_depth = if tx_overlap_windows > 0 { 2 } else { 1 };
         debug!(
-            lane_id = session.lane_id().unwrap_or_default(),
+            lane_id = session.lane_id(),
             piece_id,
             tx_source,
             tx_windows,
