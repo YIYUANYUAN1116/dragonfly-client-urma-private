@@ -8,6 +8,7 @@ use std::time::Duration;
 
 mod buffer;
 mod completion;
+pub(crate) mod control;
 mod error;
 pub mod fabric;
 mod ffi;

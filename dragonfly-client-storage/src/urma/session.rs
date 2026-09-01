@@ -6,6 +6,7 @@
 
 use super::{
     buffer::{RegisteredRxWindowLease, TxWindowLease},
+    control::{LaneControl, TransferControl},
     fabric::{UrmaFabricHandle, UrmaLaneConfig, UrmaRegisteredRxOpHandle},
     rendezvous::{
         read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
@@ -20,6 +21,7 @@ use dragonfly_client_metric::{
 };
 use std::{
     collections::VecDeque,
+    marker::PhantomData,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -86,6 +88,27 @@ async fn write_control<S: AsyncWrite + Unpin>(
         .await
         .map_err(|_| Error::ControlTimeout { operation })?
         .map_err(control_error)
+}
+
+async fn receive_transfer_control(
+    control: &mut TransferControl,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<Frame> {
+    time::timeout(timeout, control.receive())
+        .await
+        .map_err(|_| Error::ControlTimeout { operation })?
+}
+
+async fn send_transfer_control(
+    control: &TransferControl,
+    frame: Frame,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<()> {
+    time::timeout(timeout, control.send(frame))
+        .await
+        .map_err(|_| Error::ControlTimeout { operation })?
 }
 
 #[derive(Clone, Debug)]
@@ -189,7 +212,9 @@ struct PendingReceiveWindow {
 /// Downloader-side peer session. `finish_piece` returns it to Idle so the
 /// same control connection and Jetty can carry the next Piece.
 pub(crate) struct UrmaClientSession<S> {
-    stream: S,
+    control: LaneControl,
+    transfer_control: Option<TransferControl>,
+    stream_type: PhantomData<S>,
     fabric: UrmaFabricHandle,
     lane_id: Option<u16>,
     max_message_size: u64,
@@ -200,7 +225,7 @@ pub(crate) struct UrmaClientSession<S> {
     piece: Option<ClientPiece>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
     pub(crate) async fn connect(
         mut stream: S,
         fabric: UrmaFabricHandle,
@@ -241,7 +266,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         }
         info!(role = "client", lane_id, "urma peer lane established");
         Ok(Self {
-            stream,
+            control: LaneControl::spawn(stream, 1)?,
+            transfer_control: None,
+            stream_type: PhantomData,
             fabric,
             lane_id: Some(lane_id),
             max_message_size,
@@ -278,9 +305,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             piece_number = request.piece_number,
             "urma piece request on peer lane"
         );
-        if let Err(error) = write_control(
-            &mut self.stream,
-            &Frame::Request {
+        let control = self.control.register(transfer_id)?;
+        if let Err(error) = send_transfer_control(
+            &control,
+            Frame::Request {
                 transfer_id,
                 request: request.clone(),
             },
@@ -291,8 +319,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         {
             return self.abort(error).await;
         }
-        let metadata = match read_control(
-            &mut self.stream,
+        let mut control = control;
+        let metadata = match receive_transfer_control(
+            &mut control,
             self.control_timeout,
             "receive Piece Ready",
         )
@@ -309,6 +338,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 transfer_id: response_id,
                 error: err,
             }) if response_id == transfer_id && err.code == ERROR_CODE_BUSY => {
+                control.finish();
                 return Err(Error::PeerRejected {
                     code: err.code,
                     message: err.message,
@@ -327,6 +357,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
             Err(error) => return self.abort(error).await,
         };
         let metadata = shape.metadata.clone();
+        self.transfer_control = Some(control);
         self.piece = Some(ClientPiece {
             transfer_id,
             shape,
@@ -437,9 +468,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                 }
                 Err(error) => return self.abort(error).await,
             };
-            if let Err(error) = write_control(
-                &mut self.stream,
-                &Frame::RecvPosted {
+            if let Err(error) = send_transfer_control(
+                self.transfer_control
+                    .as_ref()
+                    .expect("active Piece control"),
+                Frame::RecvPosted {
                     transfer_id: self.piece.as_ref().expect("active Piece").transfer_id,
                     window,
                 },
@@ -539,7 +572,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         if piece.next_deliver_chunk != piece.shape.chunk_count || !piece.pending.is_empty() {
             return Err(Error::Protocol("URMA Piece is not fully received".into()));
         }
-        match read_control(&mut self.stream, self.control_timeout, "receive Piece Done").await {
+        let control = self
+            .transfer_control
+            .as_mut()
+            .ok_or_else(|| Error::Protocol("no active URMA Piece control".into()))?;
+        match receive_transfer_control(control, self.control_timeout, "receive Piece Done").await {
             Ok(Frame::Done { transfer_id }) if transfer_id == piece.transfer_id => {
                 debug!(
                     role = "client",
@@ -548,6 +585,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
                     "urma piece finished on peer lane"
                 );
                 self.piece = None;
+                self.transfer_control
+                    .take()
+                    .expect("active Piece control")
+                    .finish();
                 Ok(())
             }
             Ok(frame) => self.abort(unexpected(frame, "Piece finish")).await,
@@ -581,6 +622,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaClientSession<S> {
         if let Some(piece) = self.piece.as_mut() {
             piece.pending.clear();
         }
+        self.transfer_control.take();
+        self.control.abort(error.to_string());
         if let Some(lane_id) = self.lane_id.take() {
             warn!(role = "client", lane_id, %error, "aborting urma peer lane");
             let _ = self.fabric.abort_lane(lane_id).await;
@@ -608,7 +651,9 @@ struct ServerPiece {
 /// Uploader-side peer session. Storage reads `receive_request`, supplies
 /// metadata via `ready`, then feeds one bounded window at a time.
 pub(crate) struct UrmaServerSession<S> {
-    stream: S,
+    control: LaneControl,
+    transfer_control: Option<TransferControl>,
+    stream_type: PhantomData<S>,
     fabric: UrmaFabricHandle,
     lane_id: Option<u16>,
     max_message_size: u64,
@@ -617,7 +662,7 @@ pub(crate) struct UrmaServerSession<S> {
     piece: Option<ServerPiece>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
     pub(crate) async fn accept(
         mut stream: S,
         fabric: UrmaFabricHandle,
@@ -662,7 +707,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         }
         info!(role = "server", lane_id, "urma peer lane established");
         Ok(Self {
-            stream,
+            control: LaneControl::spawn(stream, 1)?,
+            transfer_control: None,
+            stream_type: PhantomData,
             fabric,
             lane_id: Some(lane_id),
             max_message_size,
@@ -682,23 +729,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         if self.piece.is_some() {
             return Err(Error::Protocol("an URMA Piece is already active".into()));
         }
-        let (transfer_id, request) = match read_idle_control(&mut self.stream, idle_timeout).await {
-            Ok(Some(Frame::Request {
-                transfer_id,
-                request,
-            })) if transfer_id != 0 => (transfer_id, request),
-            Ok(Some(frame)) => return self.abort(unexpected(frame, "Piece request")).await,
-            Ok(None) => return Ok(None),
-            Err(error) => return self.abort(error).await,
+        let incoming = match time::timeout(idle_timeout, self.control.accept()).await {
+            Ok(Ok(incoming)) => incoming,
+            Ok(Err(error)) => return self.abort(error).await,
+            Err(_) => return Ok(None),
         };
+        let transfer_id = incoming.control.transfer_id();
+        let request = incoming.request;
+        self.transfer_control = Some(incoming.control);
         if request.task_id.is_empty()
             || request.chunk_size == 0
             || request.chunk_size > self.max_message_size
             || request.max_inflight_chunks == 0
         {
             let error = Error::Protocol("invalid URMA Piece request".into());
-            let _ = write_error(
-                &mut self.stream,
+            let _ = send_piece_error(
+                self.transfer_control
+                    .as_ref()
+                    .expect("pending Piece control"),
                 transfer_id,
                 ERROR_CODE_INTERNAL,
                 &error.to_string(),
@@ -741,9 +789,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             Ok(shape) => shape,
             Err(error) => return self.abort_peer(error).await,
         };
-        if let Err(error) = write_control(
-            &mut self.stream,
-            &Frame::Ready {
+        if let Err(error) = send_transfer_control(
+            self.transfer_control
+                .as_ref()
+                .expect("pending Piece control"),
+            Frame::Ready {
                 transfer_id: piece.transfer_id,
                 metadata,
             },
@@ -777,8 +827,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             .ok_or_else(|| Error::Protocol("URMA Piece is not ready".into()))?;
         let expected = shape.window(piece.next_chunk)?;
         let recv_posted_start = Instant::now();
-        let window = match read_control(
-            &mut self.stream,
+        let window = match receive_transfer_control(
+            self.transfer_control
+                .as_mut()
+                .expect("active Piece control"),
             self.control_timeout,
             "receive RecvPosted",
         )
@@ -863,9 +915,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
                 .abort_peer(Error::Protocol("URMA Piece is not fully sent".into()))
                 .await;
         }
-        if let Err(error) = write_control(
-            &mut self.stream,
-            &Frame::Done {
+        if let Err(error) = send_transfer_control(
+            self.transfer_control
+                .as_ref()
+                .expect("active Piece control"),
+            Frame::Done {
                 transfer_id: piece.transfer_id,
             },
             self.control_timeout,
@@ -882,6 +936,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             "urma piece finished on peer lane"
         );
         self.piece = None;
+        self.transfer_control
+            .take()
+            .expect("active Piece control")
+            .finish();
         Ok(())
     }
 
@@ -893,8 +951,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             return Err(Error::Protocol("no pending URMA Piece to reject".into()));
         }
         let transfer_id = self.piece.as_ref().expect("pending Piece").transfer_id;
-        let write_result = write_error(
-            &mut self.stream,
+        let write_result = send_piece_error(
+            self.transfer_control
+                .as_ref()
+                .expect("pending Piece control"),
             transfer_id,
             code,
             message,
@@ -902,6 +962,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         )
         .await;
         self.piece = None;
+        self.transfer_control.take();
+        self.control.abort(message.to_string());
         let abort_result = match self.lane_id.take() {
             Some(lane_id) => self.fabric.abort_lane(lane_id).await,
             None => Ok(()),
@@ -919,8 +981,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
             return Err(Error::Protocol("no pending URMA Piece to reject".into()));
         }
         let transfer_id = self.piece.as_ref().expect("pending Piece").transfer_id;
-        let write_result = write_error(
-            &mut self.stream,
+        let write_result = send_piece_error(
+            self.transfer_control
+                .as_ref()
+                .expect("pending Piece control"),
             transfer_id,
             code,
             message,
@@ -928,6 +992,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
         )
         .await;
         self.piece = None;
+        self.transfer_control
+            .take()
+            .expect("pending Piece control")
+            .finish();
         write_result
     }
 
@@ -954,6 +1022,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
     }
 
     async fn abort<T>(&mut self, error: Error) -> Result<T> {
+        self.transfer_control.take();
+        self.control.abort(error.to_string());
         if let Some(lane_id) = self.lane_id.take() {
             warn!(role = "server", lane_id, %error, "aborting urma peer lane");
             let _ = self.fabric.abort_lane(lane_id).await;
@@ -962,14 +1032,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> UrmaServerSession<S> {
     }
 
     async fn abort_peer<T>(&mut self, error: Error) -> Result<T> {
-        let _ = write_error(
-            &mut self.stream,
-            self.piece.as_ref().map_or(0, |piece| piece.transfer_id),
-            ERROR_CODE_INTERNAL,
-            &error.to_string(),
-            self.control_timeout,
-        )
-        .await;
+        if let (Some(piece), Some(control)) = (&self.piece, &self.transfer_control) {
+            let _ = send_piece_error(
+                control,
+                piece.transfer_id,
+                ERROR_CODE_INTERNAL,
+                &error.to_string(),
+                self.control_timeout,
+            )
+            .await;
+        }
+        self.control.abort(error.to_string());
         self.abort(error).await
     }
 }
@@ -1005,6 +1078,29 @@ async fn write_error<S: AsyncWrite + Unpin>(
     .await
 }
 
+async fn send_piece_error(
+    control: &TransferControl,
+    transfer_id: TransferId,
+    code: u32,
+    message: &str,
+    timeout: Duration,
+) -> Result<()> {
+    send_transfer_control(
+        control,
+        Frame::Error {
+            transfer_id,
+            error: RendezvousError {
+                code,
+                message: message.to_string(),
+            },
+        },
+        timeout,
+        "send Error",
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn read_idle_control<S: AsyncRead + Unpin>(
     stream: &mut S,
     idle_timeout: Duration,

@@ -136,6 +136,17 @@ pub(crate) enum Frame {
 }
 
 impl Frame {
+    pub(crate) fn transfer_id(&self) -> Option<TransferId> {
+        match self {
+            Self::Request { transfer_id, .. }
+            | Self::Ready { transfer_id, .. }
+            | Self::RecvPosted { transfer_id, .. }
+            | Self::Done { transfer_id }
+            | Self::Error { transfer_id, .. } => Some(*transfer_id),
+            Self::Connect(_) | Self::Connected(_) | Self::Discover | Self::Capability(_) => None,
+        }
+    }
+
     fn frame_type(&self) -> u8 {
         match self {
             Self::Connect(_) => 1,
