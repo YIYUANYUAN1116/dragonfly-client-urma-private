@@ -21,7 +21,7 @@ use crate::rendezvous::ERROR_CODE_INCOMPATIBLE as URMA_ERROR_CODE_INCOMPATIBLE;
 use crate::urma::rendezvous::{
     read_frame as read_urma_frame, write_frame as write_urma_frame,
     CapabilityRegistry as UrmaCapabilityRegistry, Frame as UrmaFrame, RendezvousError as UrmaError,
-    MAGIC as URMA_MAGIC,
+    MAGIC as URMA_MAGIC, SESSION_TRANSFER_ID as URMA_SESSION_TRANSFER_ID,
 };
 use crate::Storage;
 use bytes::{Bytes, BytesMut};
@@ -66,11 +66,12 @@ fn urma_discovery_response(registry: Option<&UrmaCapabilityRegistry>) -> UrmaFra
     registry
         .and_then(UrmaCapabilityRegistry::get)
         .map(UrmaFrame::Capability)
-        .unwrap_or_else(|| {
-            UrmaFrame::Error(UrmaError {
+        .unwrap_or_else(|| UrmaFrame::Error {
+            transfer_id: URMA_SESSION_TRANSFER_ID,
+            error: UrmaError {
                 code: URMA_ERROR_CODE_INCOMPATIBLE,
                 message: "urma is not available on this peer".to_string(),
-            })
+            },
         })
 }
 
@@ -527,10 +528,13 @@ impl TCPServerHandler {
             frame => {
                 write_urma_frame(
                     &mut writer,
-                    &UrmaFrame::Error(UrmaError {
-                        code: URMA_ERROR_CODE_INCOMPATIBLE,
-                        message: format!("unexpected discovery frame: {frame:?}"),
-                    }),
+                    &UrmaFrame::Error {
+                        transfer_id: URMA_SESSION_TRANSFER_ID,
+                        error: UrmaError {
+                            code: URMA_ERROR_CODE_INCOMPATIBLE,
+                            message: format!("unexpected discovery frame: {frame:?}"),
+                        },
+                    },
                 )
                 .await
             }

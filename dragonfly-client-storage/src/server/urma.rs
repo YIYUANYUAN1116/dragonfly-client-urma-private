@@ -21,7 +21,7 @@ use crate::rendezvous::{
 use crate::urma::fabric::{FabricReadiness, UrmaFabric, UrmaFabricHandle, UrmaLaneConfig};
 use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
-    UrmaAdvertisement, UrmaCapability,
+    UrmaAdvertisement, UrmaCapability, SESSION_TRANSFER_ID,
 };
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession};
@@ -305,10 +305,13 @@ impl UrmaServer {
                                 timeout,
                                 write_frame(
                                     &mut stream,
-                                    &Frame::Error(RendezvousError {
-                                        code: ERROR_CODE_BUSY,
-                                        message: "urma connection admission is full".to_string(),
-                                    }),
+                                    &Frame::Error {
+                                        transfer_id: SESSION_TRANSFER_ID,
+                                        error: RendezvousError {
+                                            code: ERROR_CODE_BUSY,
+                                            message: "urma connection admission is full".to_string(),
+                                        },
+                                    },
                                 ),
                             )
                             .await;

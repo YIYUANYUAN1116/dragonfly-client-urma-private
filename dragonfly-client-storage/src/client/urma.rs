@@ -254,10 +254,10 @@ pub async fn discover(addr: &str, timeout: Duration) -> ClientResult<UrmaAdverti
             Frame::Capability(_) => Err(ClientError::Unsupported(
                 "parent advertised an invalid urma rendezvous port".to_string(),
             )),
-            Frame::Error(err) if err.code == ERROR_CODE_INCOMPATIBLE => {
+            Frame::Error { error: err, .. } if err.code == ERROR_CODE_INCOMPATIBLE => {
                 Err(ClientError::Unsupported(err.message))
             }
-            Frame::Error(err) => Err(ClientError::Unknown(format!(
+            Frame::Error { error: err, .. } => Err(ClientError::Unknown(format!(
                 "urma discovery error {}: {}",
                 err.code, err.message
             ))),

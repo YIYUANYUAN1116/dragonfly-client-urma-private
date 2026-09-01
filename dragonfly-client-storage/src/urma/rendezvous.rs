@@ -16,8 +16,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// "DFUR" distinguishes URMA control traffic from the existing RDMA wire.
 pub(crate) const MAGIC: u32 = 0x4446_5552;
-pub(crate) const VERSION: u8 = 1;
+// Version 2 scopes every Piece control frame to a logical transfer. This is
+// the wire prerequisite for multiplexing several Pieces over one peer lane;
+// version 1 implicitly allowed only one active Piece per lane.
+pub(crate) const VERSION: u8 = 2;
 const MAX_DESCRIPTOR_LENGTH: usize = 64 * 1024;
+
+pub(crate) type TransferId = u32;
+pub(crate) const SESSION_TRANSFER_ID: TransferId = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrmaCapability {
@@ -106,11 +112,25 @@ pub(crate) struct LaneConnected {
 pub(crate) enum Frame {
     Connect(LaneConnect),
     Connected(LaneConnected),
-    Request(CommonPieceRequest),
-    Ready(PieceMetadata),
-    RecvPosted(ReceiveWindow),
-    Done,
-    Error(RendezvousError),
+    Request {
+        transfer_id: TransferId,
+        request: CommonPieceRequest,
+    },
+    Ready {
+        transfer_id: TransferId,
+        metadata: PieceMetadata,
+    },
+    RecvPosted {
+        transfer_id: TransferId,
+        window: ReceiveWindow,
+    },
+    Done {
+        transfer_id: TransferId,
+    },
+    Error {
+        transfer_id: TransferId,
+        error: RendezvousError,
+    },
     Discover,
     Capability(UrmaAdvertisement),
 }
@@ -120,11 +140,11 @@ impl Frame {
         match self {
             Self::Connect(_) => 1,
             Self::Connected(_) => 2,
-            Self::Request(_) => 3,
-            Self::Ready(_) => 4,
-            Self::RecvPosted(_) => 5,
-            Self::Done => 6,
-            Self::Error(_) => 7,
+            Self::Request { .. } => 3,
+            Self::Ready { .. } => 4,
+            Self::RecvPosted { .. } => 5,
+            Self::Done { .. } => 6,
+            Self::Error { .. } => 7,
             Self::Discover => 8,
             Self::Capability(_) => 9,
         }
@@ -137,7 +157,7 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut payload = Vec::new();
     match frame {
-        Frame::Discover | Frame::Done => {}
+        Frame::Discover => {}
         Frame::Capability(advertisement) => {
             advertisement.capability.encode(&mut payload);
             payload.extend_from_slice(&advertisement.port.to_be_bytes());
@@ -149,10 +169,32 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
         Frame::Connected(connected) => {
             put_bytes(&mut payload, &connected.server_descriptor);
         }
-        Frame::Request(request) => request.encode(&mut payload),
-        Frame::Ready(metadata) => metadata.encode(&mut payload),
-        Frame::RecvPosted(window) => window.encode(&mut payload),
-        Frame::Error(error) => error.encode(&mut payload),
+        Frame::Request {
+            transfer_id,
+            request,
+        } => {
+            payload.extend_from_slice(&transfer_id.to_be_bytes());
+            request.encode(&mut payload);
+        }
+        Frame::Ready {
+            transfer_id,
+            metadata,
+        } => {
+            payload.extend_from_slice(&transfer_id.to_be_bytes());
+            metadata.encode(&mut payload);
+        }
+        Frame::RecvPosted {
+            transfer_id,
+            window,
+        } => {
+            payload.extend_from_slice(&transfer_id.to_be_bytes());
+            window.encode(&mut payload);
+        }
+        Frame::Done { transfer_id } => payload.extend_from_slice(&transfer_id.to_be_bytes()),
+        Frame::Error { transfer_id, error } => {
+            payload.extend_from_slice(&transfer_id.to_be_bytes());
+            error.encode(&mut payload);
+        }
     }
     write_envelope(
         writer,
@@ -176,15 +218,30 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<F
         2 => Frame::Connected(LaneConnected {
             server_descriptor: reader.bytes(MAX_DESCRIPTOR_LENGTH)?,
         }),
-        3 => Frame::Request(CommonPieceRequest::decode(&mut reader)?),
-        4 => Frame::Ready(PieceMetadata::decode(&mut reader)?),
+        3 => Frame::Request {
+            transfer_id: reader.u32()?,
+            request: CommonPieceRequest::decode(&mut reader)?,
+        },
+        4 => Frame::Ready {
+            transfer_id: reader.u32()?,
+            metadata: PieceMetadata::decode(&mut reader)?,
+        },
         5 => {
+            let transfer_id = reader.u32()?;
             let window = ReceiveWindow::decode(&mut reader)?;
             window.validate(window.start_chunk, u64::MAX)?;
-            Frame::RecvPosted(window)
+            Frame::RecvPosted {
+                transfer_id,
+                window,
+            }
         }
-        6 => Frame::Done,
-        7 => Frame::Error(RendezvousError::decode(&mut reader)?),
+        6 => Frame::Done {
+            transfer_id: reader.u32()?,
+        },
+        7 => Frame::Error {
+            transfer_id: reader.u32()?,
+            error: RendezvousError::decode(&mut reader)?,
+        },
         8 => Frame::Discover,
         9 => Frame::Capability(UrmaAdvertisement {
             capability: UrmaCapability::decode(&mut reader)?,
@@ -246,56 +303,105 @@ mod tests {
         });
         assert_eq!(round_trip(connected.clone()).await, connected);
 
-        let request = Frame::Request(CommonPieceRequest {
-            kind: PieceKind::PersistentPiece,
-            task_id: "task-a".into(),
-            piece_number: 7,
-            chunk_size: 64 * 1024,
-            max_inflight_chunks: 8,
-        });
+        let request = Frame::Request {
+            transfer_id: 17,
+            request: CommonPieceRequest {
+                kind: PieceKind::PersistentPiece,
+                task_id: "task-a".into(),
+                piece_number: 7,
+                chunk_size: 64 * 1024,
+                max_inflight_chunks: 8,
+            },
+        };
         assert_eq!(round_trip(request.clone()).await, request);
 
-        let ready = Frame::Ready(PieceMetadata {
-            offset: 11,
-            length: 1024,
-            digest: "crc32:42".into(),
-            chunk_size: 512,
-            max_inflight_chunks: 2,
-        });
+        let ready = Frame::Ready {
+            transfer_id: 17,
+            metadata: PieceMetadata {
+                offset: 11,
+                length: 1024,
+                digest: "crc32:42".into(),
+                chunk_size: 512,
+                max_inflight_chunks: 2,
+            },
+        };
         assert_eq!(round_trip(ready.clone()).await, ready);
 
-        let posted = Frame::RecvPosted(ReceiveWindow {
-            start_chunk: 0,
-            chunk_count: 2,
-        });
+        let posted = Frame::RecvPosted {
+            transfer_id: 17,
+            window: ReceiveWindow {
+                start_chunk: 0,
+                chunk_count: 2,
+            },
+        };
         assert_eq!(round_trip(posted.clone()).await, posted);
     }
 
     #[tokio::test]
     async fn one_lane_can_carry_multiple_piece_requests() {
         let (mut client, mut server) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
-        let first = Frame::Request(CommonPieceRequest {
-            kind: PieceKind::Piece,
-            task_id: "task-a".into(),
-            piece_number: 1,
-            chunk_size: 4096,
-            max_inflight_chunks: 2,
-        });
-        let second = Frame::Request(CommonPieceRequest {
-            kind: PieceKind::Piece,
-            task_id: "task-a".into(),
-            piece_number: 2,
-            chunk_size: 4096,
-            max_inflight_chunks: 2,
-        });
+        let first = Frame::Request {
+            transfer_id: 1,
+            request: CommonPieceRequest {
+                kind: PieceKind::Piece,
+                task_id: "task-a".into(),
+                piece_number: 1,
+                chunk_size: 4096,
+                max_inflight_chunks: 2,
+            },
+        };
+        let second = Frame::Request {
+            transfer_id: 2,
+            request: CommonPieceRequest {
+                kind: PieceKind::Piece,
+                task_id: "task-a".into(),
+                piece_number: 2,
+                chunk_size: 4096,
+                max_inflight_chunks: 2,
+            },
+        };
 
         write_frame(&mut client, &first).await.unwrap();
-        write_frame(&mut client, &Frame::Done).await.unwrap();
+        write_frame(&mut client, &Frame::Done { transfer_id: 1 })
+            .await
+            .unwrap();
         write_frame(&mut client, &second).await.unwrap();
 
         assert_eq!(read_frame(&mut server).await.unwrap(), first);
-        assert_eq!(read_frame(&mut server).await.unwrap(), Frame::Done);
+        assert_eq!(
+            read_frame(&mut server).await.unwrap(),
+            Frame::Done { transfer_id: 1 }
+        );
         assert_eq!(read_frame(&mut server).await.unwrap(), second);
+    }
+
+    #[tokio::test]
+    async fn transfer_ids_preserve_interleaved_piece_identity() {
+        let (mut client, mut server) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
+        let frames = [
+            Frame::Done { transfer_id: 2 },
+            Frame::RecvPosted {
+                transfer_id: 1,
+                window: ReceiveWindow {
+                    start_chunk: 4,
+                    chunk_count: 2,
+                },
+            },
+            Frame::Error {
+                transfer_id: 2,
+                error: RendezvousError {
+                    code: 9,
+                    message: "piece-local failure".into(),
+                },
+            },
+        ];
+
+        for frame in &frames {
+            write_frame(&mut client, frame).await.unwrap();
+        }
+        for expected in frames {
+            assert_eq!(read_frame(&mut server).await.unwrap(), expected);
+        }
     }
 
     #[test]
