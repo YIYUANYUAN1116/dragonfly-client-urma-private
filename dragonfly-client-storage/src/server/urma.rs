@@ -38,7 +38,10 @@ use dragonfly_client_metric::{
 use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -48,6 +51,25 @@ use tokio::time;
 use tracing::{debug, error, info, instrument, warn, Span};
 
 use dragonfly_client_util::shutdown;
+
+const REQUIRED_TX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+struct RequiredTxWaiter<'a> {
+    waiters: &'a AtomicUsize,
+}
+
+impl<'a> RequiredTxWaiter<'a> {
+    fn new(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters }
+    }
+}
+
+impl Drop for RequiredTxWaiter<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 fn client_error(error: UrmaError) -> ClientError {
     ClientError::Unknown(error.to_string())
@@ -357,6 +379,7 @@ struct UrmaServerHandler {
     transfer_timeout: Duration,
     piece_timeout: Duration,
     mmap_content: bool,
+    required_tx_waiters: AtomicUsize,
 }
 
 impl UrmaServerHandler {
@@ -383,6 +406,7 @@ impl UrmaServerHandler {
             transfer_timeout,
             piece_timeout,
             mmap_content,
+            required_tx_waiters: AtomicUsize::new(0),
         }
     }
 
@@ -420,6 +444,8 @@ impl UrmaServerHandler {
                 .piece_id(&request.task_id, request.piece_number);
             collect_upload_piece_started_metrics();
             info!(
+                task_id = %request.task_id,
+                piece_id = %piece_id,
                 lane_id = session.lane_id().unwrap_or_default(),
                 piece_kind = ?request.kind,
                 piece_number = request.piece_number,
@@ -552,22 +578,42 @@ impl UrmaServerHandler {
 
         let first_lengths =
             tx_window_chunk_lengths(piece.length, chunk_size, max_inflight_chunks, 0)?;
-        let acquired = time::timeout(
-            self.transfer_timeout,
-            self.fabric.acquire_tx_window_chunks(first_lengths),
-        )
-        .await;
+        // Required windows wait for an existing owner to recycle its lease.
+        // The allocator itself is intentionally non-blocking, so a timeout
+        // around one call only bounded command latency and returned
+        // BufferUnavailable immediately. While a required waiter exists,
+        // optional second-ring allocations stand down to prevent starvation.
+        let acquired = {
+            let _waiter = RequiredTxWaiter::new(&self.required_tx_waiters);
+            let deadline = time::Instant::now() + self.transfer_timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                if remaining.is_zero() {
+                    break None;
+                }
+                match time::timeout(
+                    remaining,
+                    self.fabric.acquire_tx_window_chunks(first_lengths.clone()),
+                )
+                .await
+                {
+                    Ok(Err(UrmaError::BufferUnavailable { .. })) => {
+                        time::sleep(REQUIRED_TX_RETRY_INTERVAL.min(remaining)).await;
+                    }
+                    Ok(result) => break Some(result),
+                    Err(_) => break None,
+                }
+            }
+        };
         let mut current = match acquired {
-            Ok(Ok(lease)) => lease,
-            Ok(Err(error)) => {
+            Some(Ok(lease)) => lease,
+            Some(Err(error)) => {
                 if matches!(error, UrmaError::BufferUnavailable { .. }) {
                     collect_urma_budget_pressure_metrics("tx", "required");
-                    // Transient budget pressure: nothing was posted on the
-                    // lane yet, so reject with BUSY and keep the peer session
-                    // usable. The client falls back for this Piece only.
-                    let _ = session
+                    session
                         .reject_piece_transient(ERROR_CODE_BUSY, &error.to_string())
-                        .await;
+                        .await
+                        .map_err(client_error)?;
                     return Ok(None);
                 }
                 let _ = session
@@ -575,15 +621,16 @@ impl UrmaServerHandler {
                     .await;
                 return Err(client_error(error));
             }
-            Err(_) => {
+            None => {
                 let message = format!(
                     "URMA TX registration unavailable after {:?}",
                     self.transfer_timeout
                 );
                 collect_urma_budget_pressure_metrics("tx", "required");
-                let _ = session
+                session
                     .reject_piece_transient(ERROR_CODE_BUSY, &message)
-                    .await;
+                    .await
+                    .map_err(client_error)?;
                 return Ok(None);
             }
         };
@@ -602,7 +649,10 @@ impl UrmaServerHandler {
         // this transfer to a one-window pipeline without changing allocator
         // structure or blocking every admitted peer behind the ring.
         let first_window_len = current.len() as u64;
-        let mut spare = if self.lane_config.pipeline_depth > 1 && first_window_len < piece.length {
+        let mut spare = if self.lane_config.pipeline_depth > 1
+            && first_window_len < piece.length
+            && self.required_tx_waiters.load(Ordering::Acquire) == 0
+        {
             let next_lengths = tx_window_chunk_lengths(
                 piece.length,
                 chunk_size,
@@ -635,6 +685,17 @@ impl UrmaServerHandler {
                 }
             }
         } else {
+            if self.lane_config.pipeline_depth > 1
+                && first_window_len < piece.length
+                && self.required_tx_waiters.load(Ordering::Acquire) != 0
+            {
+                collect_urma_budget_pressure_metrics("tx", "optional");
+                debug!(
+                    tx_ring_depth = 1,
+                    required_tx_waiters = self.required_tx_waiters.load(Ordering::Acquire),
+                    "URMA TX second lease yielded to required waiter"
+                );
+            }
             None
         };
         let ready_start = Instant::now();
@@ -666,6 +727,20 @@ impl UrmaServerHandler {
             let next_offset = sent
                 .checked_add(window_len)
                 .ok_or(ClientError::InvalidParameter)?;
+            if self.required_tx_waiters.load(Ordering::Acquire) != 0 {
+                if let Some(lease) = spare.take() {
+                    self.fabric
+                        .recycle_tx_window(lease)
+                        .await
+                        .map_err(client_error)?;
+                    collect_urma_budget_pressure_metrics("tx", "optional");
+                    debug!(
+                        tx_ring_depth = 1,
+                        required_tx_waiters = self.required_tx_waiters.load(Ordering::Acquire),
+                        "URMA TX released second lease for required waiter"
+                    );
+                }
+            }
             if next_offset < piece.length {
                 let next_lengths = tx_window_chunk_lengths(
                     piece.length,
@@ -888,6 +963,21 @@ mod tests {
         assert_eq!(tx_window_chunk_lengths(13, 4, 2, 0).unwrap(), vec![4, 4]);
         assert_eq!(tx_window_chunk_lengths(13, 4, 2, 8).unwrap(), vec![4, 1]);
         assert!(tx_window_chunk_lengths(13, 4, 2, 13).is_err());
+    }
+
+    #[test]
+    fn required_tx_waiter_is_removed_when_its_scope_ends() {
+        let waiters = AtomicUsize::new(0);
+        {
+            let _first = RequiredTxWaiter::new(&waiters);
+            assert_eq!(waiters.load(Ordering::Acquire), 1);
+            {
+                let _second = RequiredTxWaiter::new(&waiters);
+                assert_eq!(waiters.load(Ordering::Acquire), 2);
+            }
+            assert_eq!(waiters.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(waiters.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
