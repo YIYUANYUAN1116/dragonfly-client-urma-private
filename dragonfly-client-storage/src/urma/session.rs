@@ -21,11 +21,11 @@ use dragonfly_client_metric::{
     collect_urma_budget_pressure_metrics, collect_urma_required_admission_wait_metrics,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     marker::PhantomData,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -227,7 +227,83 @@ struct PendingReceiveWindow {
     expected_len: usize,
     operations: Vec<UrmaRegisteredRxOpHandle>,
     permit: OwnedSemaphorePermit,
-    _native_receive_permit: OwnedSemaphorePermit,
+    _native_receive_permit: NativeReceiveWindowPermit,
+}
+
+#[derive(Default)]
+struct NativeReceiveAdmissionState {
+    active_windows: usize,
+    active_windows_by_transfer: HashMap<TransferId, usize>,
+}
+
+struct NativeReceiveWindowPermit {
+    _permit: OwnedSemaphorePermit,
+    state: Arc<Mutex<NativeReceiveAdmissionState>>,
+    lane_id: u16,
+    transfer_id: TransferId,
+    window_start_chunk: u64,
+}
+
+impl NativeReceiveWindowPermit {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        state: Arc<Mutex<NativeReceiveAdmissionState>>,
+        lane_id: u16,
+        transfer_id: TransferId,
+        window: ReceiveWindow,
+    ) -> Self {
+        let (active_windows, active_transfers) = {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.active_windows += 1;
+            *state
+                .active_windows_by_transfer
+                .entry(transfer_id)
+                .or_default() += 1;
+            (state.active_windows, state.active_windows_by_transfer.len())
+        };
+        debug!(
+            role = "client",
+            lane_id,
+            transfer_id,
+            window_start_chunk = window.start_chunk,
+            window_chunk_count = window.chunk_count,
+            active_native_rx_windows = active_windows,
+            active_native_rx_transfers = active_transfers,
+            "URMA native RX window admitted"
+        );
+        Self {
+            _permit: permit,
+            state,
+            lane_id,
+            transfer_id,
+            window_start_chunk: window.start_chunk,
+        }
+    }
+}
+
+impl Drop for NativeReceiveWindowPermit {
+    fn drop(&mut self) {
+        let (active_windows, active_transfers) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.active_windows = state.active_windows.saturating_sub(1);
+            if let Some(count) = state.active_windows_by_transfer.get_mut(&self.transfer_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.active_windows_by_transfer.remove(&self.transfer_id);
+                }
+            }
+            (state.active_windows, state.active_windows_by_transfer.len())
+        };
+        debug!(
+            role = "client",
+            lane_id = self.lane_id,
+            transfer_id = self.transfer_id,
+            window_start_chunk = self.window_start_chunk,
+            active_native_rx_windows = active_windows,
+            active_native_rx_transfers = active_transfers,
+            "URMA native RX window released"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -343,6 +419,7 @@ struct ClientLane {
     next_transfer_id: AtomicU32,
     failed: AtomicBool,
     native_receive_permits: Arc<Semaphore>,
+    native_receive_admission_state: Arc<Mutex<NativeReceiveAdmissionState>>,
 }
 
 impl Drop for ClientLane {
@@ -424,6 +501,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 next_transfer_id: AtomicU32::new(1),
                 failed: AtomicBool::new(false),
                 native_receive_permits: Arc::new(Semaphore::new(lane_config.recv_depth as usize)),
+                native_receive_admission_state: Arc::new(Mutex::new(
+                    NativeReceiveAdmissionState::default(),
+                )),
             }),
             stream_type: PhantomData,
         })
@@ -584,7 +664,7 @@ impl UrmaClientTransfer {
                     failures: vec!["URMA RX window pipeline is closed".into()],
                 })?,
             };
-            let native_receive_permit = if pending_count == 0 {
+            let native_receive_credit = if pending_count == 0 {
                 let requested = window.chunk_count;
                 let available_before = self.lane.native_receive_permits.available_permits();
                 let admission_start = time::Instant::now();
@@ -720,6 +800,13 @@ impl UrmaClientTransfer {
                 }
                 Err(error) => return self.abort(error).await,
             };
+            let native_receive_permit = NativeReceiveWindowPermit::new(
+                native_receive_credit,
+                Arc::clone(&self.lane.native_receive_admission_state),
+                lane_id,
+                transfer_id,
+                window,
+            );
             if let Err(error) = send_transfer_control(
                 self.transfer_control
                     .as_ref()
@@ -1508,6 +1595,54 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(routing.reordered_chunk_count, 1);
         assert_eq!(routing.cross_transfer_chunk_count, 1);
+    }
+
+    #[test]
+    fn native_rx_admission_tracks_distinct_concurrent_transfers() {
+        let permits = Arc::new(Semaphore::new(3));
+        let state = Arc::new(Mutex::new(NativeReceiveAdmissionState::default()));
+        let first = NativeReceiveWindowPermit::new(
+            permits.clone().try_acquire_owned().unwrap(),
+            Arc::clone(&state),
+            4,
+            7,
+            ReceiveWindow {
+                start_chunk: 0,
+                chunk_count: 1,
+            },
+        );
+        let same_transfer = NativeReceiveWindowPermit::new(
+            permits.clone().try_acquire_owned().unwrap(),
+            Arc::clone(&state),
+            4,
+            7,
+            ReceiveWindow {
+                start_chunk: 1,
+                chunk_count: 1,
+            },
+        );
+        let other_transfer = NativeReceiveWindowPermit::new(
+            permits.try_acquire_owned().unwrap(),
+            Arc::clone(&state),
+            4,
+            8,
+            ReceiveWindow {
+                start_chunk: 0,
+                chunk_count: 1,
+            },
+        );
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.active_windows, 3);
+            assert_eq!(state.active_windows_by_transfer.len(), 2);
+        }
+
+        drop(other_transfer);
+        drop(same_transfer);
+        drop(first);
+        let state = state.lock().unwrap();
+        assert_eq!(state.active_windows, 0);
+        assert!(state.active_windows_by_transfer.is_empty());
     }
 
     #[test]
