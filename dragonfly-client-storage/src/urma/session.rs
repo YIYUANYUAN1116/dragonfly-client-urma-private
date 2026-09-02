@@ -227,6 +227,7 @@ struct PendingReceiveWindow {
     expected_len: usize,
     operations: Vec<UrmaRegisteredRxOpHandle>,
     permit: OwnedSemaphorePermit,
+    _native_receive_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -341,6 +342,7 @@ struct ClientLane {
     control_timeout: Duration,
     next_transfer_id: AtomicU32,
     failed: AtomicBool,
+    native_receive_permits: Arc<Semaphore>,
 }
 
 impl Drop for ClientLane {
@@ -421,6 +423,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 control_timeout,
                 next_transfer_id: AtomicU32::new(1),
                 failed: AtomicBool::new(false),
+                native_receive_permits: Arc::new(Semaphore::new(lane_config.recv_depth as usize)),
             }),
             stream_type: PhantomData,
         })
@@ -581,6 +584,70 @@ impl UrmaClientTransfer {
                     failures: vec!["URMA RX window pipeline is closed".into()],
                 })?,
             };
+            let native_receive_permit = if pending_count == 0 {
+                let requested = window.chunk_count;
+                let available_before = self.lane.native_receive_permits.available_permits();
+                let admission_start = time::Instant::now();
+                let result = time::timeout(
+                    timeout,
+                    self.lane
+                        .native_receive_permits
+                        .clone()
+                        .acquire_many_owned(requested),
+                )
+                .await;
+                if available_before < requested as usize {
+                    let wait = admission_start.elapsed();
+                    collect_urma_required_admission_wait_metrics("rx", wait);
+                    debug!(
+                        lane_id,
+                        required_rx_wait_count = 1u64,
+                        required_rx_wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+                        admitted = matches!(&result, Ok(Ok(_))),
+                        "URMA native RX required admission wait finished"
+                    );
+                }
+                match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return self
+                            .abort(Error::Shutdown {
+                                failures: vec!["URMA native RX admission is closed".into()],
+                            })
+                            .await;
+                    }
+                    Err(_) => {
+                        collect_urma_budget_pressure_metrics("rx", "required");
+                        return self
+                            .abort(Error::OperationTimeout {
+                                sequence: Some(transfer_sequence(
+                                    self.piece.as_ref().expect("active Piece").transfer_id,
+                                    window.start_chunk,
+                                )?),
+                            })
+                            .await;
+                    }
+                }
+            } else {
+                match self
+                    .lane
+                    .native_receive_permits
+                    .clone()
+                    .try_acquire_many_owned(window.chunk_count)
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        debug!(
+                            lane_id,
+                            requested = window.chunk_count,
+                            available = self.lane.native_receive_permits.available_permits(),
+                            "URMA RX second window unavailable at native JFR admission; continuing with one-window pipeline"
+                        );
+                        collect_urma_budget_pressure_metrics("rx", "optional");
+                        return Ok(());
+                    }
+                }
+            };
             let transfer_id = self.piece.as_ref().expect("active Piece").transfer_id;
             let chunks = (window.start_chunk..window.start_chunk + u64::from(window.chunk_count))
                 .collect::<Vec<_>>();
@@ -675,6 +742,7 @@ impl UrmaClientTransfer {
                 expected_len,
                 operations: handles,
                 permit,
+                _native_receive_permit: native_receive_permit,
             });
         }
     }
