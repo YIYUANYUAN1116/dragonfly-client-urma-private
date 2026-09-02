@@ -213,6 +213,9 @@ struct ClientPiece {
     shape: TransferShape,
     next_post_chunk: u64,
     next_deliver_chunk: u64,
+    receive_window_count: u64,
+    send_imm_chunk_count: u64,
+    reordered_chunk_count: u64,
     pending: VecDeque<PendingReceiveWindow>,
     window_permits: std::sync::Arc<Semaphore>,
     pipeline_depth: usize,
@@ -232,7 +235,7 @@ fn reorder_receive_window_completions(
     shape: &TransferShape,
     window: ReceiveWindow,
     completions: Vec<RegisteredRxCompletion>,
-) -> Result<Vec<RegisteredRxWindowLease>> {
+) -> Result<(Vec<RegisteredRxWindowLease>, u64)> {
     shape.window_len(window)?;
     let count = window.chunk_count as usize;
     if completions.len() != count {
@@ -247,6 +250,7 @@ fn reorder_receive_window_completions(
         .ok_or_else(|| Error::Protocol("URMA receive window chunk range overflow".into()))?;
     let mut leases_by_chunk = (0..count).map(|_| None).collect::<Vec<_>>();
     let mut posted_chunks = vec![false; count];
+    let mut reordered_chunk_count = 0u64;
 
     for completion in completions {
         if completion.lane_id != lane_id {
@@ -302,16 +306,7 @@ fn reorder_receive_window_completions(
                 "duplicate URMA SEND_IMM chunk: transfer_id={transfer_id} chunk={received_chunk}"
             )));
         }
-        debug!(
-            lane_id,
-            transfer_id,
-            chunk = received_chunk,
-            rx_slot = completion.slot.index(),
-            posted_sequence,
-            received_imm_data = completion.imm_data,
-            reordered = posted_sequence != completion.imm_data,
-            "validated URMA Piece chunk SEND_IMM identity"
-        );
+        reordered_chunk_count += u64::from(posted_sequence != completion.imm_data);
         leases_by_chunk[received_index] = Some(completion.lease);
     }
 
@@ -331,10 +326,22 @@ fn reorder_receive_window_completions(
         )));
     }
 
-    Ok(leases_by_chunk
-        .into_iter()
-        .map(|lease| lease.expect("missing identities checked"))
-        .collect())
+    debug!(
+        lane_id,
+        transfer_id,
+        window_start_chunk = window.start_chunk,
+        window_chunk_count = window.chunk_count,
+        reordered_chunk_count,
+        "validated URMA Piece receive window SEND_IMM identities"
+    );
+
+    Ok((
+        leases_by_chunk
+            .into_iter()
+            .map(|lease| lease.expect("missing identities checked"))
+            .collect(),
+        reordered_chunk_count,
+    ))
 }
 
 struct ClientLane {
@@ -526,6 +533,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                     shape,
                     next_post_chunk: 0,
                     next_deliver_chunk: 0,
+                    receive_window_count: 0,
+                    send_imm_chunk_count: 0,
+                    reordered_chunk_count: 0,
                     pending: VecDeque::with_capacity(pipeline_depth),
                     window_permits: Arc::new(Semaphore::new(pipeline_depth)),
                     pipeline_depth,
@@ -712,7 +722,7 @@ impl UrmaClientTransfer {
                 Err(error) => return self.abort(error).await,
             }
         }
-        let leases = match reorder_receive_window_completions(
+        let (leases, reordered_chunk_count) = match reorder_receive_window_completions(
             lane_id,
             transfer_id,
             &self.piece.as_ref().expect("active Piece").shape,
@@ -737,10 +747,11 @@ impl UrmaClientTransfer {
             }
             Err(error) => return self.abort(error).await,
         };
-        self.piece
-            .as_mut()
-            .expect("active Piece")
-            .next_deliver_chunk += u64::from(pending.window.chunk_count);
+        let piece = self.piece.as_mut().expect("active Piece");
+        piece.next_deliver_chunk += u64::from(pending.window.chunk_count);
+        piece.receive_window_count += 1;
+        piece.send_imm_chunk_count += u64::from(pending.window.chunk_count);
+        piece.reordered_chunk_count += reordered_chunk_count;
         Ok(lease)
     }
 
@@ -770,6 +781,9 @@ impl UrmaClientTransfer {
                     role = "client",
                     lane_id = self.lane.lane_id,
                     transfer_id,
+                    receive_window_count = piece.receive_window_count,
+                    send_imm_chunk_count = piece.send_imm_chunk_count,
+                    reordered_chunk_count = piece.reordered_chunk_count,
                     "urma piece finished on peer lane"
                 );
                 self.piece = None;
@@ -1417,8 +1431,10 @@ mod tests {
             rx_completion(10, 7, 2, 7, 1, vec![1; 4]),
         ];
 
-        let leases = reorder_receive_window_completions(4, 7, &shape, window, completions).unwrap();
+        let (leases, reordered_chunk_count) =
+            reorder_receive_window_completions(4, 7, &shape, window, completions).unwrap();
         let merged = RegisteredRxWindowLease::merge(leases).unwrap();
+        assert_eq!(reordered_chunk_count, 3);
         assert_eq!(merged.len(), 10);
         assert_eq!(
             merged.parts().collect::<Vec<_>>(),
