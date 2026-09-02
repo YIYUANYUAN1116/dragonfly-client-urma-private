@@ -6,6 +6,7 @@
 
 use super::{
     buffer::{RegisteredRxWindowLease, TxWindowLease},
+    completion::RegisteredRxCompletion,
     control::{LaneControl, TransferControl},
     fabric::{UrmaFabricHandle, UrmaLaneConfig, UrmaRegisteredRxOpHandle},
     rendezvous::{
@@ -44,6 +45,17 @@ fn transfer_sequence(transfer_id: TransferId, chunk: u64) -> Result<u64> {
         )));
     }
     Ok((u64::from(transfer_id) << 32) | chunk)
+}
+
+fn decode_transfer_sequence(sequence: u64) -> Result<(TransferId, u64)> {
+    let transfer_id = (sequence >> 32) as TransferId;
+    let chunk = sequence & u64::from(u32::MAX);
+    if transfer_id == 0 {
+        return Err(Error::Protocol(format!(
+            "invalid URMA SEND_IMM identity: sequence={sequence} transfer_id=0"
+        )));
+    }
+    Ok((transfer_id, chunk))
 }
 
 fn control_error(error: ClientError) -> Error {
@@ -209,9 +221,120 @@ struct ClientPiece {
 struct PendingReceiveWindow {
     window: ReceiveWindow,
     expected_len: usize,
-    operations: Vec<(u64, UrmaRegisteredRxOpHandle)>,
+    operations: Vec<UrmaRegisteredRxOpHandle>,
     permit: OwnedSemaphorePermit,
     _lane_gate: Option<OwnedMutexGuard<()>>,
+}
+
+fn reorder_receive_window_completions(
+    lane_id: u16,
+    transfer_id: TransferId,
+    shape: &TransferShape,
+    window: ReceiveWindow,
+    completions: Vec<RegisteredRxCompletion>,
+) -> Result<Vec<RegisteredRxWindowLease>> {
+    shape.window_len(window)?;
+    let count = window.chunk_count as usize;
+    if completions.len() != count {
+        return Err(Error::Protocol(format!(
+            "URMA receive window completion count mismatch: expected={count} received={}",
+            completions.len()
+        )));
+    }
+    let end_chunk = window
+        .start_chunk
+        .checked_add(u64::from(window.chunk_count))
+        .ok_or_else(|| Error::Protocol("URMA receive window chunk range overflow".into()))?;
+    let mut leases_by_chunk = (0..count).map(|_| None).collect::<Vec<_>>();
+    let mut posted_chunks = vec![false; count];
+
+    for completion in completions {
+        if completion.lane_id != lane_id {
+            return Err(Error::Protocol(format!(
+                "URMA receive completion changed lane: expected={lane_id} received={}",
+                completion.lane_id
+            )));
+        }
+        let posted_sequence = completion.posted_sequence.ok_or_else(|| {
+            Error::Protocol("registered URMA receive completion has no posted sequence".into())
+        })?;
+        let (posted_transfer_id, posted_chunk) = decode_transfer_sequence(posted_sequence)?;
+        if posted_transfer_id != transfer_id
+            || posted_chunk < window.start_chunk
+            || posted_chunk >= end_chunk
+        {
+            return Err(Error::Protocol(format!(
+                "posted URMA receive identity is outside the active window: expected_transfer={transfer_id} window={window:?} posted_transfer={posted_transfer_id} posted_chunk={posted_chunk}"
+            )));
+        }
+        let posted_index = usize::try_from(posted_chunk - window.start_chunk)
+            .map_err(|_| Error::Protocol("posted URMA chunk index exceeds usize".into()))?;
+        if std::mem::replace(&mut posted_chunks[posted_index], true) {
+            return Err(Error::Protocol(format!(
+                "duplicate posted URMA receive identity: transfer_id={transfer_id} chunk={posted_chunk}"
+            )));
+        }
+
+        let (received_transfer_id, received_chunk) = decode_transfer_sequence(completion.imm_data)?;
+        if received_transfer_id != transfer_id {
+            return Err(Error::Protocol(format!(
+                "URMA SEND_IMM transfer mismatch: expected={transfer_id} received={received_transfer_id} sequence={}",
+                completion.imm_data
+            )));
+        }
+        if received_chunk < window.start_chunk || received_chunk >= end_chunk {
+            return Err(Error::Protocol(format!(
+                "URMA SEND_IMM chunk is outside the active window: transfer_id={transfer_id} window={window:?} received_chunk={received_chunk}"
+            )));
+        }
+        let expected_len = shape.chunk_len(received_chunk)?;
+        if completion.lease.len() != expected_len {
+            return Err(Error::Protocol(format!(
+                "URMA SEND_IMM chunk length mismatch: transfer_id={transfer_id} chunk={received_chunk} expected={expected_len} received={} rx_slot={}",
+                completion.lease.len(),
+                completion.slot.index()
+            )));
+        }
+        let received_index = usize::try_from(received_chunk - window.start_chunk)
+            .map_err(|_| Error::Protocol("received URMA chunk index exceeds usize".into()))?;
+        if leases_by_chunk[received_index].is_some() {
+            return Err(Error::Protocol(format!(
+                "duplicate URMA SEND_IMM chunk: transfer_id={transfer_id} chunk={received_chunk}"
+            )));
+        }
+        debug!(
+            lane_id,
+            transfer_id,
+            chunk = received_chunk,
+            rx_slot = completion.slot.index(),
+            posted_sequence,
+            received_imm_data = completion.imm_data,
+            reordered = posted_sequence != completion.imm_data,
+            "validated URMA Piece chunk SEND_IMM identity"
+        );
+        leases_by_chunk[received_index] = Some(completion.lease);
+    }
+
+    let missing_posted = posted_chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, present)| (!present).then_some(window.start_chunk + index as u64))
+        .collect::<Vec<_>>();
+    let missing_received = leases_by_chunk
+        .iter()
+        .enumerate()
+        .filter_map(|(index, lease)| lease.is_none().then_some(window.start_chunk + index as u64))
+        .collect::<Vec<_>>();
+    if !missing_posted.is_empty() || !missing_received.is_empty() {
+        return Err(Error::Protocol(format!(
+            "URMA receive window identities are incomplete: transfer_id={transfer_id} missing_posted={missing_posted:?} missing_received={missing_received:?}"
+        )));
+    }
+
+    Ok(leases_by_chunk
+        .into_iter()
+        .map(|lease| lease.expect("missing identities checked"))
+        .collect())
 }
 
 struct ClientLane {
@@ -451,11 +574,12 @@ impl UrmaClientTransfer {
                     piece.window_permits.clone(),
                 )
             };
-            // RC SEND consumes posted RECVs in lane order; it has no remote
-            // transfer tag. Until the server grows an ordered send-ticket
-            // scheduler, concurrent Pieces may have only one native receive
-            // window outstanding on a shared lane. This preserves correctness
-            // without disabling concurrent rendezvous/storage work.
+            // Real-provider evidence shows that RC SENDs need not match the
+            // lane's posted RECVs in software posting order. SEND_IMM repairs
+            // ordering inside one window, but until the lane has a global
+            // identity dispatcher, keep at most one native receive window
+            // outstanding so data from concurrent Pieces cannot cross window
+            // ownership boundaries.
             if self.lane.data_gate.is_some() && pending_count != 0 {
                 return Ok(());
             }
@@ -557,13 +681,12 @@ impl UrmaClientTransfer {
             {
                 return self.abort(error).await;
             }
-            let operations = chunks.into_iter().zip(handles).collect();
             let piece = self.piece.as_mut().expect("active Piece");
             piece.next_post_chunk += u64::from(window.chunk_count);
             piece.pending.push_back(PendingReceiveWindow {
                 window,
                 expected_len,
-                operations,
+                operations: handles,
                 permit,
                 _lane_gate: lane_gate,
             });
@@ -582,48 +705,23 @@ impl UrmaClientTransfer {
             .and_then(|piece| piece.pending.pop_front())
             .ok_or_else(|| Error::Protocol("no pending URMA receive window".into()))?;
         let transfer_id = self.piece.as_ref().expect("active Piece").transfer_id;
-        let mut leases = Vec::with_capacity(pending.operations.len());
-        for (chunk, operation) in pending.operations {
-            let expected_len = self
-                .piece
-                .as_ref()
-                .expect("active Piece")
-                .shape
-                .chunk_len(chunk)?;
-            let expected_sequence = transfer_sequence(transfer_id, chunk)?;
+        let mut completions = Vec::with_capacity(pending.operations.len());
+        for operation in pending.operations {
             match operation.wait_timeout(timeout).await {
-                Ok(completion)
-                    if completion.lane_id == lane_id
-                        && completion.sequence == Some(expected_sequence)
-                        && completion.imm_data == expected_sequence
-                        && completion.lease.len() == expected_len =>
-                {
-                    debug!(
-                        lane_id,
-                        transfer_id,
-                        chunk,
-                        rx_slot = completion.slot.index(),
-                        expected_sequence,
-                        received_imm_data = completion.imm_data,
-                        "validated URMA Piece chunk SEND_IMM identity"
-                    );
-                    leases.push(completion.lease);
-                }
-                Ok(completion) => {
-                    return self
-                        .abort(Error::Protocol(format!(
-                            "invalid registered URMA receive completion for chunk {chunk}: lane={} sequence={:?} expected_sequence={expected_sequence} imm_data={} rx_slot={} length={}",
-                            completion.lane_id,
-                            completion.sequence,
-                            completion.imm_data,
-                            completion.slot.index(),
-                            completion.lease.len()
-                        )))
-                        .await;
-                }
+                Ok(completion) => completions.push(completion),
                 Err(error) => return self.abort(error).await,
             }
         }
+        let leases = match reorder_receive_window_completions(
+            lane_id,
+            transfer_id,
+            &self.piece.as_ref().expect("active Piece").shape,
+            pending.window,
+            completions,
+        ) {
+            Ok(leases) => leases,
+            Err(error) => return self.abort(error).await,
+        };
         let lease = match RegisteredRxWindowLease::merge(leases) {
             Ok(lease) if lease.len() == pending.expected_len => {
                 lease.with_pipeline_permit(pending.permit)
@@ -1224,6 +1322,7 @@ async fn read_idle_control<S: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use crate::rendezvous::PieceKind;
+    use crate::urma::buffer::SlotId;
 
     fn request() -> CommonPieceRequest {
         CommonPieceRequest {
@@ -1232,6 +1331,36 @@ mod tests {
             piece_number: 1,
             chunk_size: 4,
             max_inflight_chunks: 2,
+        }
+    }
+
+    fn reorder_shape() -> TransferShape {
+        TransferShape {
+            metadata: PieceMetadata {
+                offset: 0,
+                length: 10,
+                digest: "crc32:1".into(),
+                chunk_size: 4,
+                max_inflight_chunks: 3,
+            },
+            chunk_count: 3,
+        }
+    }
+
+    fn rx_completion(
+        slot: usize,
+        posted_transfer: TransferId,
+        posted_chunk: u64,
+        received_transfer: TransferId,
+        received_chunk: u64,
+        bytes: Vec<u8>,
+    ) -> RegisteredRxCompletion {
+        RegisteredRxCompletion {
+            lane_id: 4,
+            posted_sequence: Some(transfer_sequence(posted_transfer, posted_chunk).unwrap()),
+            imm_data: transfer_sequence(received_transfer, received_chunk).unwrap(),
+            slot: SlotId::new(slot, 1).unwrap(),
+            lease: RegisteredRxWindowLease::from_test_untracked_parts(vec![bytes]),
         }
     }
 
@@ -1272,6 +1401,86 @@ mod tests {
         );
         assert!(transfer_sequence(0, 0).is_err());
         assert!(transfer_sequence(1, u64::from(u32::MAX) + 1).is_err());
+    }
+
+    #[test]
+    fn send_imm_reorders_receive_leases_by_actual_chunk_identity() {
+        let shape = reorder_shape();
+        let window = ReceiveWindow {
+            start_chunk: 0,
+            chunk_count: 3,
+        };
+        let completions = vec![
+            // The short tail lands in the full-capacity WR posted for chunk 0.
+            rx_completion(8, 7, 0, 7, 2, vec![2; 2]),
+            rx_completion(9, 7, 1, 7, 0, vec![0; 4]),
+            rx_completion(10, 7, 2, 7, 1, vec![1; 4]),
+        ];
+
+        let leases = reorder_receive_window_completions(4, 7, &shape, window, completions).unwrap();
+        let merged = RegisteredRxWindowLease::merge(leases).unwrap();
+        assert_eq!(merged.len(), 10);
+        assert_eq!(
+            merged.parts().collect::<Vec<_>>(),
+            vec![&[0, 0, 0, 0][..], &[1, 1, 1, 1][..], &[2, 2][..]]
+        );
+    }
+
+    #[test]
+    fn send_imm_reordering_rejects_wrong_transfer_duplicate_and_out_of_window_chunk() {
+        let shape = reorder_shape();
+        let one = ReceiveWindow {
+            start_chunk: 0,
+            chunk_count: 1,
+        };
+        assert!(reorder_receive_window_completions(
+            4,
+            7,
+            &shape,
+            one,
+            vec![rx_completion(8, 7, 0, 8, 0, vec![0; 4])],
+        )
+        .is_err());
+        assert!(reorder_receive_window_completions(
+            4,
+            7,
+            &shape,
+            one,
+            vec![rx_completion(8, 7, 0, 7, 1, vec![1; 4])],
+        )
+        .is_err());
+
+        let two = ReceiveWindow {
+            start_chunk: 0,
+            chunk_count: 2,
+        };
+        assert!(reorder_receive_window_completions(
+            4,
+            7,
+            &shape,
+            two,
+            vec![rx_completion(8, 7, 0, 7, 0, vec![0; 4])],
+        )
+        .is_err());
+        assert!(reorder_receive_window_completions(
+            4,
+            7,
+            &shape,
+            two,
+            vec![
+                rx_completion(8, 7, 0, 7, 0, vec![0; 4]),
+                rx_completion(9, 7, 1, 7, 0, vec![0; 4]),
+            ],
+        )
+        .is_err());
+        assert!(reorder_receive_window_completions(
+            4,
+            7,
+            &shape,
+            one,
+            vec![rx_completion(8, 7, 0, 7, 0, vec![0; 3])],
+        )
+        .is_err());
     }
 
     #[test]
