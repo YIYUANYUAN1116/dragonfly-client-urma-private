@@ -590,20 +590,33 @@ impl UrmaClientTransfer {
                 .expect("active Piece")
                 .shape
                 .chunk_len(chunk)?;
+            let expected_sequence = transfer_sequence(transfer_id, chunk)?;
             match operation.wait_timeout(timeout).await {
                 Ok(completion)
                     if completion.lane_id == lane_id
-                        && completion.sequence == Some(transfer_sequence(transfer_id, chunk)?)
+                        && completion.sequence == Some(expected_sequence)
+                        && completion.imm_data == expected_sequence
                         && completion.lease.len() == expected_len =>
                 {
+                    debug!(
+                        lane_id,
+                        transfer_id,
+                        chunk,
+                        rx_slot = completion.slot.index(),
+                        expected_sequence,
+                        received_imm_data = completion.imm_data,
+                        "validated URMA Piece chunk SEND_IMM identity"
+                    );
                     leases.push(completion.lease);
                 }
                 Ok(completion) => {
                     return self
                         .abort(Error::Protocol(format!(
-                            "invalid registered URMA receive completion for chunk {chunk}: lane={} sequence={:?} length={}",
+                            "invalid registered URMA receive completion for chunk {chunk}: lane={} sequence={:?} expected_sequence={expected_sequence} imm_data={} rx_slot={} length={}",
                             completion.lane_id,
                             completion.sequence,
+                            completion.imm_data,
+                            completion.slot.index(),
                             completion.lease.len()
                         )))
                         .await;

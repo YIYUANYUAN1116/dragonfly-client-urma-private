@@ -65,13 +65,19 @@ typedef struct dfurma_completion {
     int32_t status;
     uint32_t opcode;
     uint64_t user_ctx;
+    uint64_t imm_data;
     uint32_t completion_len;
     uint32_t local_id;
     uint8_t is_recv;
     uint8_t is_jetty;
     uint8_t user_ctx_valid;
+    uint8_t imm_data_valid;
     uint8_t event_kind;
+    uint8_t reserved[3];
 } dfurma_completion_t;
+
+/* Stable receive CQE opcode values, checked against UMDK by shim.c. */
+#define DFURMA_CR_OPC_SEND_WITH_IMM 1U
 
 enum dfurma_completion_event_kind {
     DFURMA_COMPLETION_WR = 0,
@@ -84,6 +90,7 @@ typedef struct dfurma_post_entry {
     uint64_t offset;
     uint32_t length;
     uint64_t user_ctx;
+    uint64_t imm_data;
 } dfurma_post_entry_t;
 
 /* Bounds shim stack storage and the maximum native doorbell batch. */
@@ -152,6 +159,10 @@ int dfurma_post_send(dfurma_jetty_t *jetty,
                      dfurma_segment_t *segment, uint64_t offset,
                      uint32_t length, uint64_t user_ctx,
                      dfurma_wr_t **out);
+int dfurma_post_send_imm(dfurma_jetty_t *jetty,
+                         dfurma_segment_t *segment, uint64_t offset,
+                         uint32_t length, uint64_t user_ctx,
+                         uint64_t imm_data, dfurma_wr_t **out);
 int dfurma_post_recv(dfurma_jetty_t *jetty,
                      dfurma_segment_t *segment, uint64_t offset,
                      uint32_t length, uint64_t user_ctx,
@@ -165,6 +176,11 @@ int dfurma_post_send_list(dfurma_jetty_t *jetty,
                           dfurma_segment_t *segment,
                           const dfurma_post_entry_t *entries, uint32_t count,
                           dfurma_wr_t **out, uint32_t *posted);
+int dfurma_post_send_imm_list(dfurma_jetty_t *jetty,
+                              dfurma_segment_t *segment,
+                              const dfurma_post_entry_t *entries,
+                              uint32_t count, dfurma_wr_t **out,
+                              uint32_t *posted);
 int dfurma_post_recv_list(dfurma_jetty_t *jetty,
                           dfurma_segment_t *segment,
                           const dfurma_post_entry_t *entries, uint32_t count,

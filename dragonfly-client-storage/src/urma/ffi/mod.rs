@@ -14,6 +14,8 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
 }
 
+pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {
     pub transport_type: i32,
@@ -45,6 +47,7 @@ pub(crate) struct PostEntry {
     pub(crate) offset: u64,
     pub(crate) length: u32,
     pub(crate) user_ctx: u64,
+    pub(crate) imm_data: Option<u64>,
 }
 
 pub(crate) struct PostBatch {
@@ -64,11 +67,13 @@ pub(crate) struct CompletionRecord {
     pub status: i32,
     pub opcode: u32,
     pub user_ctx: u64,
+    pub imm_data: u64,
     pub completion_len: u32,
     pub local_id: u32,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
+    pub imm_data_valid: bool,
     pub event_kind: CompletionEventKind,
 }
 
@@ -226,11 +231,13 @@ impl JfcHandle {
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
+                imm_data: record.imm_data,
                 completion_len: record.completion_len,
                 local_id: record.local_id,
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
+                imm_data_valid: record.imm_data_valid != 0,
                 event_kind: match record.event_kind {
                     0 => CompletionEventKind::WorkRequest,
                     1 => CompletionEventKind::SuspendDone,
@@ -430,6 +437,7 @@ impl JettyHandle {
         status_result(unsafe { sys::dfurma_jetty_mark_error(jetty.as_ptr()) })
     }
 
+    #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
     pub(crate) fn post_send(
         &mut self,
         segment: &SegmentHandle,
@@ -437,7 +445,18 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, true)
+        self.post(segment, offset, length, user_ctx, true, None)
+    }
+
+    pub(crate) fn post_send_imm(
+        &mut self,
+        segment: &SegmentHandle,
+        offset: u64,
+        length: u32,
+        user_ctx: u64,
+        imm_data: u64,
+    ) -> Result<WrHandle, FfiError> {
+        self.post(segment, offset, length, user_ctx, true, Some(imm_data))
     }
 
     pub(crate) fn post_recv(
@@ -447,7 +466,7 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, false)
+        self.post(segment, offset, length, user_ctx, false, None)
     }
 
     pub(crate) fn local_ids(&self) -> Result<(u32, u32), FfiError> {
@@ -461,12 +480,26 @@ impl JettyHandle {
         Ok((jetty_id, jfr_id))
     }
 
+    #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
     pub(crate) fn post_send_list(
         &mut self,
         segment: &SegmentHandle,
         entries: &[PostEntry],
     ) -> Result<PostBatch, FfiError> {
-        self.post_list(segment, entries, true)
+        self.post_list(segment, entries, true, false)
+    }
+
+    pub(crate) fn post_send_imm_list(
+        &mut self,
+        segment: &SegmentHandle,
+        entries: &[PostEntry],
+    ) -> Result<PostBatch, FfiError> {
+        if entries.iter().any(|entry| entry.imm_data.is_none()) {
+            return Err(FfiError::Contract(
+                "SEND_IMM post-list entry lacks immediate data",
+            ));
+        }
+        self.post_list(segment, entries, true, true)
     }
 
     pub(crate) fn post_recv_list(
@@ -474,7 +507,7 @@ impl JettyHandle {
         segment: &SegmentHandle,
         entries: &[PostEntry],
     ) -> Result<PostBatch, FfiError> {
-        self.post_list(segment, entries, false)
+        self.post_list(segment, entries, false, false)
     }
 
     fn post_list(
@@ -482,6 +515,7 @@ impl JettyHandle {
         segment: &SegmentHandle,
         entries: &[PostEntry],
         send: bool,
+        with_imm: bool,
     ) -> Result<PostBatch, FfiError> {
         if entries.is_empty() || entries.len() > sys::DFURMA_MAX_POST_LIST as usize {
             return Err(FfiError::Contract("invalid linked WR post-list length"));
@@ -494,6 +528,7 @@ impl JettyHandle {
                 offset: entry.offset,
                 length: entry.length,
                 user_ctx: entry.user_ctx,
+                imm_data: entry.imm_data.unwrap_or_default(),
             })
             .collect();
         let mut raw_handles = vec![std::ptr::null_mut(); entries.len()];
@@ -501,7 +536,16 @@ impl JettyHandle {
         // SAFETY: All input/output slices remain live for the synchronous shim
         // call. The shim validates every segment range before posting the list.
         let status = unsafe {
-            if send {
+            if with_imm {
+                sys::dfurma_post_send_imm_list(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    raw_entries.as_ptr(),
+                    raw_entries.len() as u32,
+                    raw_handles.as_mut_ptr(),
+                    &mut posted,
+                )
+            } else if send {
                 sys::dfurma_post_send_list(
                     jetty.as_ptr(),
                     segment.as_ptr(),
@@ -546,6 +590,7 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
         send: bool,
+        imm_data: Option<u64>,
     ) -> Result<WrHandle, FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
@@ -553,7 +598,17 @@ impl JettyHandle {
         // SAFETY: Jetty and Segment are live, range validation is repeated by
         // the shim, and raw is a valid out pointer.
         let status = unsafe {
-            if send {
+            if let Some(imm_data) = imm_data {
+                sys::dfurma_post_send_imm(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    offset,
+                    length,
+                    user_ctx,
+                    imm_data,
+                    &mut raw,
+                )
+            } else if send {
                 sys::dfurma_post_send(
                     jetty.as_ptr(),
                     segment.as_ptr(),

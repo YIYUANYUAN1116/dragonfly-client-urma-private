@@ -307,16 +307,17 @@ impl UrmaJetty {
         (self.local_jetty_id, self.local_jfr_id)
     }
 
-    fn post_send(
+    fn post_send_imm(
         &mut self,
         segment: &ffi::SegmentHandle,
         offset: u64,
         length: u32,
         user_ctx: u64,
+        imm_data: u64,
     ) -> Result<ffi::WrHandle> {
         self.handle
-            .post_send(segment, offset, length, user_ctx)
-            .map_err(|error| native_error("post_jetty_send_wr", error))
+            .post_send_imm(segment, offset, length, user_ctx, imm_data)
+            .map_err(|error| native_error("post_jetty_send_imm_wr", error))
     }
 
     fn post_recv(
@@ -337,19 +338,23 @@ impl UrmaJetty {
         entries: &[ffi::PostEntry],
     ) -> Result<ffi::PostBatch> {
         if let [entry] = entries {
+            let imm_data = entry.imm_data.ok_or_else(|| {
+                Error::InvalidConfiguration("registered TX entry lacks SEND_IMM identity".into())
+            })?;
             return Ok(ffi::PostBatch {
-                handles: vec![self.post_send(
+                handles: vec![self.post_send_imm(
                     segment,
                     entry.offset,
                     entry.length,
                     entry.user_ctx,
+                    imm_data,
                 )?],
                 error: None,
             });
         }
         self.handle
-            .post_send_list(segment, entries)
-            .map_err(|error| native_error("post_jetty_send_wr_list", error))
+            .post_send_imm_list(segment, entries)
+            .map_err(|error| native_error("post_jetty_send_imm_wr_list", error))
     }
 
     fn post_recv_batch(
@@ -546,6 +551,7 @@ impl UrmaLane {
                         offset,
                         length,
                         user_ctx,
+                        imm_data: None,
                     });
                 }
                 Ok(())
@@ -634,13 +640,14 @@ impl UrmaLane {
             let batch: Vec<_> = pending.drain(..batch_len).collect();
             let mut entries = Vec::with_capacity(batch_len);
             let prepare: Result<()> = (|| {
-                for ((slot, offset, length), _) in &batch {
+                for ((slot, offset, length), sequence) in &batch {
                     let user_ctx = self.token(OperationType::Send, *slot).encode()?;
                     pool.mark_tx_lease_posted(*slot)?;
                     entries.push(ffi::PostEntry {
                         offset: *offset,
                         length: *length,
                         user_ctx,
+                        imm_data: Some(*sequence),
                     });
                 }
                 Ok(())

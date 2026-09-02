@@ -28,6 +28,8 @@ pub(crate) struct CompletionStats {
 pub(crate) struct RegisteredRxCompletion {
     pub(crate) lane_id: u16,
     pub(crate) sequence: Option<u64>,
+    pub(crate) imm_data: u64,
+    pub(crate) slot: crate::urma::buffer::SlotId,
     pub(crate) lease: RegisteredRxWindowLease,
 }
 
@@ -138,6 +140,28 @@ enum CompletionTarget {
 enum RoutedCompletion {
     RegisteredRx(RegisteredRxCompletion),
     RegisteredTx,
+}
+
+fn validate_recv_immediate(
+    record: ffi::CompletionRecord,
+    expected_sequence: Option<u64>,
+) -> Result<u64> {
+    if record.opcode != ffi::CR_OPCODE_SEND_WITH_IMM || !record.imm_data_valid {
+        return Err(Error::Protocol(format!(
+            "URMA receive CQE lacks SEND_WITH_IMM identity: opcode={} imm_data_valid={}",
+            record.opcode, record.imm_data_valid
+        )));
+    }
+    let expected_sequence = expected_sequence.ok_or_else(|| {
+        Error::Protocol("URMA SEND_WITH_IMM completion has no expected sequence".into())
+    })?;
+    if record.imm_data != expected_sequence {
+        return Err(Error::Protocol(format!(
+            "URMA SEND_IMM identity mismatch: expected={expected_sequence} received={}",
+            record.imm_data
+        )));
+    }
+    Ok(record.imm_data)
 }
 
 impl CompletionTarget {
@@ -518,15 +542,15 @@ impl CompletionRouter {
                     OperationType::Recv => {
                         self.outstanding_recv -= 1;
                         self.stats.recv_cqe += 1;
-                        if record.opcode != 0 {
-                            self.stats.cqe_error += 1;
-                            pool.complete_error(token.slot, token.operation)?;
-                            pool.release(token.slot)?;
-                            return Err(Error::Protocol(format!(
-                                "unexpected receive CQE opcode {}",
-                                record.opcode
-                            )));
-                        }
+                        let imm_data = match validate_recv_immediate(record, outstanding.sequence) {
+                            Ok(imm_data) => imm_data,
+                            Err(error) => {
+                                self.stats.cqe_error += 1;
+                                pool.complete_error(token.slot, token.operation)?;
+                                pool.release(token.slot)?;
+                                return Err(error);
+                            }
+                        };
                         if matches!(
                             outstanding.completion,
                             Some(CompletionTarget::RegisteredRx(_))
@@ -547,9 +571,18 @@ impl CompletionRouter {
                                     return Err(error);
                                 }
                             };
+                            tracing::debug!(
+                                lane_id = token.lane_id,
+                                rx_slot = token.slot.index(),
+                                expected_sequence = outstanding.sequence,
+                                received_imm_data = imm_data,
+                                "validated URMA SEND_IMM receive completion"
+                            );
                             Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
                                 lane_id: token.lane_id,
                                 sequence: outstanding.sequence,
+                                imm_data,
+                                slot: token.slot,
                                 lease,
                             }))
                         } else {
@@ -749,6 +782,8 @@ mod tests {
             RegisteredRxCompletion {
                 lane_id: 4,
                 sequence: Some(12),
+                imm_data: 12,
+                slot: SlotId::new(2, 5).unwrap(),
                 lease,
             },
         )));
@@ -756,6 +791,8 @@ mod tests {
         let completion = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(completion.lane_id, 4);
         assert_eq!(completion.sequence, Some(12));
+        assert_eq!(completion.imm_data, 12);
+        assert_eq!(completion.slot, SlotId::new(2, 5).unwrap());
         assert_eq!(completion.lease.parts().next().unwrap(), &[7, 8, 9]);
         drop(completion);
         assert_eq!(*returned.lock().unwrap(), Some(recycle));
@@ -1028,5 +1065,45 @@ mod tests {
             )
             .expect("matching native Jetty identity must route");
         assert_eq!(router.outstanding(), 0);
+    }
+
+    #[test]
+    fn send_imm_receive_identity_requires_exact_64_bit_match() {
+        let identity = 0xfedc_ba98_7654_3210;
+        let record = ffi::CompletionRecord {
+            opcode: ffi::CR_OPCODE_SEND_WITH_IMM,
+            imm_data: identity,
+            imm_data_valid: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_recv_immediate(record, Some(identity)),
+            Ok(identity)
+        );
+
+        let mismatch = validate_recv_immediate(record, Some(identity ^ (1u64 << 48)))
+            .expect_err("high-bit mismatch must fail closed");
+        assert!(matches!(mismatch, Error::Protocol(_)));
+        assert!(validate_recv_immediate(record, None).is_err());
+    }
+
+    #[test]
+    fn ordinary_send_or_invalid_immediate_flag_is_rejected() {
+        let ordinary_send = ffi::CompletionRecord {
+            // shim.c statically verifies UMDK's ordinary SEND CQE opcode is 0.
+            opcode: 0,
+            imm_data: 7,
+            imm_data_valid: false,
+            ..Default::default()
+        };
+        assert!(validate_recv_immediate(ordinary_send, Some(7)).is_err());
+
+        let invalid_flag = ffi::CompletionRecord {
+            opcode: ffi::CR_OPCODE_SEND_WITH_IMM,
+            imm_data: 7,
+            imm_data_valid: false,
+            ..Default::default()
+        };
+        assert!(validate_recv_immediate(invalid_flag, Some(7)).is_err());
     }
 }
