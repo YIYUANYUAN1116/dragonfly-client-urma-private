@@ -210,6 +210,7 @@ pub(crate) struct CompletionRouter {
     outstanding_by_lane: HashMap<u16, usize>,
     retirement_by_lane: HashMap<u16, LaneRetirement>,
     lane_by_jetty_id: HashMap<u32, u16>,
+    registered_rx_by_identity: HashMap<(u16, u64), RegisteredRxCompletionTx>,
     stats: CompletionStats,
 }
 
@@ -229,6 +230,7 @@ impl CompletionRouter {
             outstanding_by_lane: HashMap::new(),
             retirement_by_lane: HashMap::new(),
             lane_by_jetty_id: HashMap::new(),
+            registered_rx_by_identity: HashMap::new(),
             stats: CompletionStats::default(),
         })
     }
@@ -280,6 +282,15 @@ impl CompletionRouter {
     }
 
     pub(crate) fn unregister_lane(&mut self, lane_id: u16) -> Result<()> {
+        if self
+            .registered_rx_by_identity
+            .keys()
+            .any(|(registered_lane_id, _)| *registered_lane_id == lane_id)
+        {
+            return Err(Error::Protocol(format!(
+                "cannot unregister lane {lane_id} with registered RX identities"
+            )));
+        }
         let retirement = self.retirement_by_lane.remove(&lane_id).ok_or_else(|| {
             Error::Protocol(format!(
                 "lane {lane_id} has no completion lifecycle registration"
@@ -308,6 +319,18 @@ impl CompletionRouter {
                 "registered RX completion requires a RECV WR".into(),
             ));
         }
+        let sequence = sequence.ok_or_else(|| {
+            Error::InvalidConfiguration(
+                "registered RX completion requires a SEND_IMM identity".into(),
+            )
+        })?;
+        let identity = (token.lane_id, sequence);
+        if self.registered_rx_by_identity.contains_key(&identity) {
+            return Err(Error::Protocol(format!(
+                "duplicate registered RX identity: lane_id={} sequence={sequence}",
+                token.lane_id
+            )));
+        }
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -318,9 +341,10 @@ impl CompletionRouter {
         self.outstanding[slot] = Some(OutstandingWr {
             user_ctx,
             handle,
-            sequence,
-            completion: Some(CompletionTarget::RegisteredRx(completion)),
+            sequence: Some(sequence),
+            completion: None,
         });
+        self.registered_rx_by_identity.insert(identity, completion);
         self.outstanding_total += 1;
         self.outstanding_recv += 1;
         *self.outstanding_by_lane.entry(token.lane_id).or_default() += 1;
@@ -329,6 +353,30 @@ impl CompletionRouter {
             .stats
             .max_outstanding
             .max(self.outstanding_total as u64);
+        Ok(())
+    }
+
+    pub(crate) fn validate_registered_rx_identities(
+        &self,
+        lane_id: u16,
+        sequences: &[u64],
+    ) -> Result<()> {
+        let mut identities = std::collections::HashSet::with_capacity(sequences.len());
+        for &sequence in sequences {
+            if !identities.insert(sequence) {
+                return Err(Error::Protocol(format!(
+                    "duplicate RX identity in registered window: lane_id={lane_id} sequence={sequence}"
+                )));
+            }
+            if self
+                .registered_rx_by_identity
+                .contains_key(&(lane_id, sequence))
+            {
+                return Err(Error::Protocol(format!(
+                    "registered RX identity is already active: lane_id={lane_id} sequence={sequence}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -368,6 +416,20 @@ impl CompletionRouter {
             .max_outstanding
             .max(self.outstanding_total as u64);
         Ok(())
+    }
+
+    fn take_registered_rx(
+        &mut self,
+        lane_id: u16,
+        imm_data: u64,
+    ) -> Result<RegisteredRxCompletionTx> {
+        self.registered_rx_by_identity
+            .remove(&(lane_id, imm_data))
+            .ok_or_else(|| {
+                Error::Protocol(format!(
+                    "URMA SEND_IMM completion has no registered RX identity: lane_id={lane_id} sequence={imm_data}"
+                ))
+            })
     }
 
     pub(crate) fn poll_once(
@@ -542,47 +604,38 @@ impl CompletionRouter {
                                 return Err(error);
                             }
                         };
-                        if matches!(
-                            outstanding.completion,
-                            Some(CompletionTarget::RegisteredRx(_))
-                        ) {
-                            if let Err(error) =
-                                pool.complete_recv_leased(token.slot, record.completion_len)
-                            {
+                        let completion = match self.take_registered_rx(token.lane_id, imm_data) {
+                            Ok(completion) => completion,
+                            Err(error) => {
                                 pool.complete_error(token.slot, token.operation)?;
                                 pool.release(token.slot)?;
                                 return Err(error);
                             }
-                            let lease = match pool
-                                .lease_completed_rx_window(&[(token.slot, record.completion_len)])
-                            {
-                                Ok(lease) => lease,
-                                Err(error) => {
-                                    pool.release(token.slot)?;
-                                    return Err(error);
-                                }
-                            };
-                            tracing::debug!(
-                                lane_id = token.lane_id,
-                                rx_slot = token.slot.index(),
-                                posted_sequence = outstanding.sequence,
-                                received_imm_data = imm_data,
-                                "received URMA SEND_IMM completion for semantic routing"
-                            );
-                            Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
-                                lane_id: token.lane_id,
-                                posted_sequence: outstanding.sequence,
-                                imm_data,
-                                slot: token.slot,
-                                lease,
-                            }))
-                        } else {
+                        };
+                        outstanding.completion = Some(CompletionTarget::RegisteredRx(completion));
+                        if let Err(error) =
+                            pool.complete_recv_leased(token.slot, record.completion_len)
+                        {
                             pool.complete_error(token.slot, token.operation)?;
                             pool.release(token.slot)?;
-                            Err(Error::Protocol(
-                                "owned RX completion path is disabled".into(),
-                            ))
+                            return Err(error);
                         }
+                        let lease = match pool
+                            .lease_completed_rx_window(&[(token.slot, record.completion_len)])
+                        {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                pool.release(token.slot)?;
+                                return Err(error);
+                            }
+                        };
+                        Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
+                            lane_id: token.lane_id,
+                            posted_sequence: outstanding.sequence,
+                            imm_data,
+                            slot: token.slot,
+                            lease,
+                        }))
                     }
                 })()
             };
@@ -680,6 +733,9 @@ impl CompletionRouter {
     /// releasing native WR or buffer ownership. Later CQEs still retire those
     /// resources through the normal route path.
     pub(crate) fn fail_pending(&mut self, error: &Error) {
+        for (_, completion) in self.registered_rx_by_identity.drain() {
+            let _ = completion.send(Err(error.clone()));
+        }
         for outstanding in self.outstanding.iter_mut().flatten() {
             if let Some(completion) = outstanding.completion.take() {
                 completion.fail(error.clone());
@@ -787,6 +843,124 @@ mod tests {
         assert_eq!(completion.lease.parts().next().unwrap(), &[7, 8, 9]);
         drop(completion);
         assert_eq!(*returned.lock().unwrap(), Some(recycle));
+    }
+
+    #[test]
+    fn registered_rx_identity_routes_across_posted_wr_ownership() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        let sequence_a = (7u64 << 32) | 3;
+        let sequence_b = (8u64 << 32) | 5;
+        let context_a = WrToken {
+            lane_id: 1,
+            generation: 1,
+            operation: OperationType::Recv,
+            slot: SlotId::new(0, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let context_b = WrToken {
+            lane_id: 1,
+            generation: 1,
+            operation: OperationType::Recv,
+            slot: SlotId::new(1, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let (completion_a, receiver_a) = oneshot::channel();
+        let (completion_b, receiver_b) = oneshot::channel();
+        router
+            .track_registered_rx(
+                context_a,
+                ffi::WrHandle::without_native(),
+                Some(sequence_a),
+                completion_a,
+            )
+            .unwrap();
+        router
+            .track_registered_rx(
+                context_b,
+                ffi::WrHandle::without_native(),
+                Some(sequence_b),
+                completion_b,
+            )
+            .unwrap();
+
+        // Provider matching crosses the two logical transfers: the CQE for
+        // posted WR A carries B's SEND_IMM identity, and vice versa. Logical
+        // ownership follows SEND_IMM while the actual slot remains attached
+        // to the WR that completed.
+        assert!(router
+            .take_registered_rx(1, sequence_b)
+            .unwrap()
+            .send(Ok(RegisteredRxCompletion {
+                lane_id: 1,
+                posted_sequence: Some(sequence_a),
+                imm_data: sequence_b,
+                slot: SlotId::new(0, 1).unwrap(),
+                lease: RegisteredRxWindowLease::from_test_untracked_parts(vec![vec![2; 4]]),
+            }))
+            .is_ok());
+        assert!(router
+            .take_registered_rx(1, sequence_a)
+            .unwrap()
+            .send(Ok(RegisteredRxCompletion {
+                lane_id: 1,
+                posted_sequence: Some(sequence_b),
+                imm_data: sequence_a,
+                slot: SlotId::new(1, 1).unwrap(),
+                lease: RegisteredRxWindowLease::from_test_untracked_parts(vec![vec![1; 4]]),
+            }))
+            .is_ok());
+
+        let routed_a = receiver_a.blocking_recv().unwrap().unwrap();
+        let routed_b = receiver_b.blocking_recv().unwrap().unwrap();
+        assert_eq!(routed_a.imm_data, sequence_a);
+        assert_eq!(routed_a.posted_sequence, Some(sequence_b));
+        assert_eq!(routed_a.slot, SlotId::new(1, 1).unwrap());
+        assert_eq!(routed_b.imm_data, sequence_b);
+        assert_eq!(routed_b.posted_sequence, Some(sequence_a));
+        assert_eq!(routed_b.slot, SlotId::new(0, 1).unwrap());
+        assert!(router.take_registered_rx(1, sequence_a).is_err());
+    }
+
+    #[test]
+    fn registered_rx_identity_preflight_is_lane_scoped_and_fails_pending() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        let sequence = (7u64 << 32) | 3;
+        assert!(router
+            .validate_registered_rx_identities(1, &[sequence, sequence])
+            .is_err());
+
+        let context = WrToken {
+            lane_id: 1,
+            generation: 1,
+            operation: OperationType::Recv,
+            slot: SlotId::new(0, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let (completion, receiver) = oneshot::channel();
+        router
+            .track_registered_rx(
+                context,
+                ffi::WrHandle::without_native(),
+                Some(sequence),
+                completion,
+            )
+            .unwrap();
+        assert!(router
+            .validate_registered_rx_identities(1, &[sequence])
+            .is_err());
+        assert!(router
+            .validate_registered_rx_identities(2, &[sequence])
+            .is_ok());
+
+        router.fail_pending(&Error::Protocol("fabric failed".into()));
+        assert!(matches!(
+            receiver.blocking_recv().unwrap(),
+            Err(Error::Protocol(_))
+        ));
+        assert!(router.take_registered_rx(1, sequence).is_err());
     }
 
     #[test]
@@ -982,7 +1156,7 @@ mod tests {
             .track_registered_rx(
                 recv_ctx,
                 ffi::WrHandle::without_native(),
-                None,
+                Some(1),
                 oneshot::channel().0,
             )
             .unwrap();

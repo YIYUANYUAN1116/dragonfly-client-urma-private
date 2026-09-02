@@ -527,6 +527,10 @@ impl UrmaLane {
                 "registered RX window requires matching non-empty sequences and completions".into(),
             ));
         }
+        // Reject duplicate logical ownership before any native WR is posted.
+        // Once a RECV is visible to the provider, its SEND_IMM identity must
+        // already have exactly one lane-global waiter.
+        completions.validate_registered_rx_identities(self.id, &sequences)?;
         // Reserve the entire logical window before posting any native WR. A
         // second pipeline window can therefore degrade cleanly when the global
         // RX budget cannot satisfy it; no unmatched partial window is left on
