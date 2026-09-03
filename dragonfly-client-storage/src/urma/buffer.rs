@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Instant,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -384,6 +385,7 @@ pub(crate) struct TxWindowLease {
     spans: Vec<RegisteredSpan>,
     layouts: Vec<TxLeaseLayout>,
     length: usize,
+    pool_acquire_ns: u64,
     core: LeaseCore,
     #[cfg(test)]
     _test_backing: Box<[u8]>,
@@ -422,6 +424,10 @@ impl TxWindowLease {
 
     pub(crate) fn chunk_count(&self) -> usize {
         self.layouts.len()
+    }
+
+    pub(crate) fn pool_acquire_ns(&self) -> u64 {
+        self.pool_acquire_ns
     }
 
     /// Narrows a reusable full-size window for a final short window. B4 never
@@ -479,6 +485,7 @@ impl TxWindowLease {
             spans,
             layouts,
             length: total,
+            pool_acquire_ns: 0,
             core: LeaseCore {
                 recycle: Some(recycle),
                 notifier,
@@ -925,6 +932,7 @@ mod native {
             &mut self,
             chunk_lengths: &[usize],
         ) -> Result<TxWindowLease> {
+            let acquire_start = Instant::now();
             if chunk_lengths.is_empty() || chunk_lengths.contains(&0) {
                 return Err(Error::InvalidConfiguration(
                     "TX window lease requires non-empty chunks".into(),
@@ -1031,6 +1039,8 @@ mod native {
                 spans,
                 layouts,
                 length,
+                pool_acquire_ns: u64::try_from(acquire_start.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX),
                 core: LeaseCore {
                     recycle: Some(recycle),
                     notifier: self.recycle_notifier.clone(),
@@ -1343,6 +1353,7 @@ mod tests {
                 length: backing.len() as u32,
             }],
             length: backing.len(),
+            pool_acquire_ns: 0,
             core: LeaseCore {
                 recycle: Some(recycle),
                 notifier,
@@ -1384,6 +1395,7 @@ mod tests {
                 })
                 .collect(),
             length: 12,
+            pool_acquire_ns: 0,
             core: LeaseCore {
                 recycle: Some(recycle),
                 notifier,

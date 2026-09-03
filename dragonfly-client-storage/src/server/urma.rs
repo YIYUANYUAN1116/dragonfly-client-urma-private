@@ -798,9 +798,11 @@ impl UrmaServerHandler {
         let mut tx_second_lease_fallback = false;
         let mut tx_fill_ns = 0u64;
         let mut tx_send_wait_ns = 0u64;
+        let mut tx_required_acquire_attempts = 0u64;
 
         let first_lengths =
             tx_window_chunk_lengths(piece.length, chunk_size, max_inflight_chunks, 0)?;
+        let tx_required_acquire_start = Instant::now();
         // Required windows wait for an existing owner to recycle its lease.
         // The allocator itself is intentionally non-blocking, so a timeout
         // around one call only bounded command latency and returned
@@ -814,6 +816,7 @@ impl UrmaServerHandler {
                 if remaining.is_zero() {
                     break None;
                 }
+                tx_required_acquire_attempts += 1;
                 match time::timeout(
                     remaining,
                     self.fabric.acquire_tx_window_chunks(first_lengths.clone()),
@@ -828,6 +831,7 @@ impl UrmaServerHandler {
                 }
             }
         };
+        let tx_required_acquire_ns = tx_required_acquire_start.elapsed().as_nanos() as u64;
         let mut current = match acquired {
             Some(Ok(lease)) => lease,
             Some(Err(error)) => {
@@ -857,6 +861,7 @@ impl UrmaServerHandler {
                 return Ok(None);
             }
         };
+        let tx_required_pool_acquire_ns = current.pool_acquire_ns();
         let fill_start = Instant::now();
         if let Err(error) = source.fill(0, &mut current).await {
             let _ = session
@@ -872,6 +877,9 @@ impl UrmaServerHandler {
         // this transfer to a one-window pipeline without changing allocator
         // structure or blocking every admitted peer behind the ring.
         let first_window_len = current.len() as u64;
+        let mut tx_optional_acquire_attempts = 0u64;
+        let mut tx_optional_acquire_ns = 0u64;
+        let mut tx_optional_pool_acquire_ns = 0u64;
         let mut spare = if self.lane_config.pipeline_depth > 1
             && first_window_len < piece.length
             && self.required_tx_waiters.load(Ordering::Acquire) == 0
@@ -883,8 +891,13 @@ impl UrmaServerHandler {
                 first_window_len,
             )?;
             let next_window_chunks = next_lengths.len();
-            match self.fabric.try_acquire_tx_window_chunks(next_lengths).await {
+            tx_optional_acquire_attempts += 1;
+            let acquire_start = Instant::now();
+            let acquire = self.fabric.try_acquire_tx_window_chunks(next_lengths).await;
+            tx_optional_acquire_ns += acquire_start.elapsed().as_nanos() as u64;
+            match acquire {
                 Ok(lease) => {
+                    tx_optional_pool_acquire_ns = lease.pool_acquire_ns();
                     debug!(
                         tx_ring_depth = 2,
                         window_chunks = next_window_chunks,
@@ -1094,6 +1107,12 @@ impl UrmaServerHandler {
             tx_initial_fill_ns,
             tx_fill_ns,
             tx_send_wait_ns,
+            tx_required_acquire_attempts,
+            tx_required_acquire_ns,
+            tx_required_pool_acquire_ns,
+            tx_optional_acquire_attempts,
+            tx_optional_acquire_ns,
+            tx_optional_pool_acquire_ns,
             tx_recv_posted_wait_ns,
             tx_grant_credit_ns,
             tx_wr_post_ns,
