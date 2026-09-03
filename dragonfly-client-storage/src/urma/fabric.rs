@@ -222,7 +222,7 @@ impl UrmaFabric {
             })?;
 
         match startup_rx.recv() {
-            Ok(Ok((transport_type, max_message_size))) => Ok(UrmaFabricHandle {
+            Ok(Ok((transport_type, max_message_size, max_jfr_depth))) => Ok(UrmaFabricHandle {
                 inner: Arc::new(FabricInner {
                     command_tx: Mutex::new(Some(command_tx)),
                     command_slots,
@@ -230,6 +230,7 @@ impl UrmaFabric {
                     runtime_config,
                     transport_type,
                     max_message_size,
+                    max_jfr_depth,
                     required_rx_waiters: RequiredRxWaiters::default(),
                     shutdown: AsyncMutex::new(()),
                     join: Mutex::new(Some(join)),
@@ -345,9 +346,12 @@ impl UrmaFabricHandle {
         window_chunks_for_slots(slots, pipeline_depth)
     }
 
-    pub(crate) fn max_rx_window_chunks(&self, pipeline_depth: u32) -> u32 {
-        let slots = self.inner.runtime_config.buffer_pool.rx_slot_count;
-        window_chunks_for_slots(slots, pipeline_depth)
+    /// Maximum number of native RECV WRs one lane can keep outstanding,
+    /// bounded by both the provider JFR capability and registered RX slots.
+    pub(crate) fn max_native_receive_depth(&self) -> u32 {
+        self.inner.max_jfr_depth.min(
+            u32::try_from(self.inner.runtime_config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX),
+        )
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -651,6 +655,7 @@ struct FabricInner {
     runtime_config: RuntimeConfig,
     transport_type: u32,
     max_message_size: u64,
+    max_jfr_depth: u32,
     required_rx_waiters: RequiredRxWaiters,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -759,7 +764,7 @@ fn run_owner(
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
-    startup_tx: std_mpsc::SyncSender<Result<(u32, u64)>>,
+    startup_tx: std_mpsc::SyncSender<Result<(u32, u64, u32)>>,
 ) {
     let recycle_notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
         let _ = recycle_command_tx.send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
@@ -775,7 +780,11 @@ fn run_owner(
         }
     };
 
-    let probe = (runtime.transport_type(), runtime.max_message_size());
+    let probe = (
+        runtime.transport_type(),
+        runtime.max_message_size(),
+        runtime.max_jfr_depth(),
+    );
     readiness_tx.send_replace(FabricReadiness::Ready);
     if startup_tx.send(Ok(probe)).is_err() {
         let _ = shutdown_runtime(runtime, &readiness_tx);

@@ -457,10 +457,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         remote_capability: &UrmaCapability,
         control_timeout: Duration,
         max_concurrent_transfers: usize,
+        max_receive_inflight: u32,
     ) -> Result<Self> {
         local_capability
             .compatible(remote_capability)
             .map_err(Error::Protocol)?;
+        if max_receive_inflight == 0 || max_receive_inflight > lane_config.recv_depth {
+            return Err(Error::InvalidConfiguration(format!(
+                "URMA per-Piece receive inflight {max_receive_inflight} exceeds lane receive depth {}",
+                lane_config.recv_depth
+            )));
+        }
         let max_message_size = local_capability
             .max_message_size
             .min(remote_capability.max_message_size);
@@ -495,7 +502,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 fabric,
                 lane_id,
                 max_message_size,
-                max_receive_inflight: lane_config.recv_depth,
+                max_receive_inflight,
                 receive_pipeline_depth: lane_config.pipeline_depth as usize,
                 control_timeout,
                 next_transfer_id: AtomicU32::new(1),

@@ -440,6 +440,10 @@ mod native {
             self.max_payload_size
         }
 
+        pub(crate) fn max_jfr_depth(&self) -> u32 {
+            self.capability.max_jfr_depth
+        }
+
         pub(crate) fn close_lane(&mut self, lane_id: u16) -> Result<()> {
             // Close is asynchronous at the provider boundary. The lane stays
             // owned by Runtime until `reap_drained_lanes` observes both gates.

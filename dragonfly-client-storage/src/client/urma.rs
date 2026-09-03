@@ -70,6 +70,32 @@ impl TransferOutcomes {
 /// enabled, so a production `urma` build cannot be faulted through its environment.
 const FAIL_AFTER_RECV_WINDOWS_ENV: &str = "DF_URMA_FAIL_AFTER_RECV_WINDOWS";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceiveDepths {
+    window_chunks: u32,
+    lane_depth: u32,
+}
+
+fn receive_depths(
+    configured_window_chunks: u32,
+    pipeline_depth: u32,
+    max_concurrent_transfers: u32,
+    native_capacity: u32,
+) -> ReceiveDepths {
+    let pipeline_depth = pipeline_depth.max(1);
+    let native_capacity = native_capacity.max(1);
+    let window_chunks = configured_window_chunks
+        .max(1)
+        .min((native_capacity / pipeline_depth).max(1));
+    let desired_lane_depth = window_chunks
+        .saturating_mul(pipeline_depth)
+        .saturating_mul(max_concurrent_transfers.max(1));
+    ReceiveDepths {
+        window_chunks,
+        lane_depth: desired_lane_depth.min(native_capacity).max(window_chunks),
+    }
+}
+
 #[cfg(any(feature = "urma-test-failpoints", test))]
 fn parse_fail_after_recv_windows(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|windows| *windows > 0)
@@ -98,7 +124,7 @@ fn fail_after_recv_windows() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fail_after_recv_windows, TransferOutcomes};
+    use super::{parse_fail_after_recv_windows, receive_depths, ReceiveDepths, TransferOutcomes};
 
     #[test]
     fn receive_window_failpoint_requires_a_positive_integer() {
@@ -106,6 +132,31 @@ mod tests {
         for invalid in ["", "0", "-1", "not-a-number"] {
             assert_eq!(parse_fail_after_recv_windows(invalid), None);
         }
+    }
+
+    #[test]
+    fn receive_depths_separate_piece_window_from_lane_capacity() {
+        assert_eq!(
+            receive_depths(32, 2, 16, 512),
+            ReceiveDepths {
+                window_chunks: 32,
+                lane_depth: 512,
+            }
+        );
+        assert_eq!(
+            receive_depths(32, 2, 1, 512),
+            ReceiveDepths {
+                window_chunks: 32,
+                lane_depth: 64,
+            }
+        );
+        assert_eq!(
+            receive_depths(32, 2, 16, 32),
+            ReceiveDepths {
+                window_chunks: 16,
+                lane_depth: 32,
+            }
+        );
     }
 
     #[test]
@@ -336,8 +387,12 @@ pub struct UrmaClient {
     /// capability is the local side of capability negotiation.
     capability: UrmaCapability,
 
-    /// lane_config sizes the Jetty created for each transfer.
+    /// lane_config sizes the persistent Jetty shared by Piece transfers.
     lane_config: UrmaLaneConfig,
+
+    /// Maximum number of chunks in one logical Piece receive window. This is
+    /// independent of the aggregate native JFR depth in `lane_config`.
+    max_receive_inflight: u32,
 
     /// remote_capability is the parent's advertised capability from `discover`.
     remote_capability: UrmaCapability,
@@ -376,15 +431,23 @@ impl UrmaClient {
         addr: String,
     ) -> Self {
         let transfer_timeout = config.storage.server.urma.transfer_timeout;
+        let depths = receive_depths(
+            config.storage.server.urma.max_inflight_chunks,
+            config.storage.server.urma.pipeline_depth,
+            config.storage.server.urma.max_concurrent_transfers,
+            fabric.max_native_receive_depth(),
+        );
         let mut lane_config = UrmaLaneConfig::default();
-        lane_config.recv_depth = config
-            .storage
-            .server
-            .urma
-            .max_inflight_chunks
-            .min(fabric.max_rx_window_chunks(config.storage.server.urma.pipeline_depth));
+        lane_config.recv_depth = depths.lane_depth;
         lane_config.post_list_size = config.storage.server.urma.post_list_size;
         lane_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
+        debug!(
+            native_recv_depth = depths.lane_depth,
+            piece_window_chunks = depths.window_chunks,
+            max_concurrent_transfers = config.storage.server.urma.max_concurrent_transfers,
+            pipeline_depth = config.storage.server.urma.pipeline_depth,
+            "configured URMA client receive depths"
+        );
         let fail_after_recv_windows = fail_after_recv_windows();
         if let Some(windows) = fail_after_recv_windows {
             warn!(
@@ -398,6 +461,7 @@ impl UrmaClient {
             fabric,
             capability,
             lane_config,
+            max_receive_inflight: depths.window_chunks,
             remote_capability,
             addr,
             control_timeout: transfer_timeout,
@@ -569,6 +633,7 @@ impl UrmaClient {
                     &self.remote_capability,
                     self.control_timeout,
                     self.config.storage.server.urma.max_concurrent_transfers as usize,
+                    self.max_receive_inflight,
                 )
                 .await
                 .map_err(urma_error)?;
@@ -598,7 +663,7 @@ impl UrmaClient {
             task_id: task_id.to_string(),
             piece_number: number,
             chunk_size: max_message_size,
-            max_inflight_chunks: self.lane_config.recv_depth,
+            max_inflight_chunks: self.max_receive_inflight,
         };
         let request_ready_start = Instant::now();
         let (mut transfer, metadata) = match session.request_piece(request).await {
@@ -629,7 +694,7 @@ impl UrmaClient {
         let transfer_outcomes = self.transfer_outcomes.clone();
         let fail_after_recv_windows = self.fail_after_recv_windows;
         let configured_pipeline_depth = self.lane_config.pipeline_depth;
-        let max_window_chunks = self.lane_config.recv_depth;
+        let max_window_chunks = self.max_receive_inflight;
         let log_task_id = task_id.to_string();
         tokio::spawn(async move {
             let mut transfer_future = Box::pin(async {
