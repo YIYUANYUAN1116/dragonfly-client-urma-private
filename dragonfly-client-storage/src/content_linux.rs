@@ -25,6 +25,8 @@ use dragonfly_client_util::fs::fd::{FDCache, DEFAULT_FD_CACHE_CAPACITY};
 use dragonfly_client_util::fs::{fadvise_dontneed, fadvise_willneed, fallocate};
 use futures::Stream;
 use std::cmp::max;
+#[cfg(any(feature = "urma", test))]
+use std::io::{self, IoSlice};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +38,48 @@ use tokio::io::AsyncRead;
 use tracing::debug;
 use tracing::{error, info, instrument, warn};
 use walkdir::WalkDir;
+
+/// Writes every registered RX span at one positional file offset. Linux may
+/// complete a pwritev only partially, including in the middle of an iovec, so
+/// keep advancing both the iovec view and the file offset until all bytes have
+/// been accepted.
+#[cfg(any(feature = "urma", test))]
+fn write_all_vectored_at(
+    file: &std::fs::File,
+    mut buffers: &mut [IoSlice<'_>],
+    mut offset: u64,
+) -> io::Result<u64> {
+    // Match Linux IOV_MAX and the existing stream write path. A configured
+    // receive window may grow beyond this, in which case it is split across
+    // the minimum number of pwritev calls.
+    const MAX_WRITE_IOVECS: usize = 1024;
+
+    let mut calls = 0u64;
+    while !buffers.is_empty() {
+        calls = calls
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("URMA pwritev call count overflow"))?;
+        let submitted = &buffers[..buffers.len().min(MAX_WRITE_IOVECS)];
+        let written = match rustix::io::pwritev(file, submitted, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write URMA receive window",
+                ));
+            }
+            Ok(written) => written,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        offset = offset
+            .checked_add(u64::try_from(written).map_err(|_| {
+                io::Error::other("URMA positional vectored write length exceeds u64")
+            })?)
+            .ok_or_else(|| io::Error::other("URMA positional write offset overflow"))?;
+        IoSlice::advance_slices(&mut buffers, written);
+    }
+    Ok(calls)
+}
 
 /// The content of a piece.
 pub struct Content {
@@ -512,7 +556,6 @@ impl Content {
         reader: &mut crate::client::urma::UrmaStreamReader,
         window_timeout: std::time::Duration,
     ) -> Result<super::io::WriteRangeResponse> {
-        use std::os::unix::fs::FileExt;
         use tokio::time::timeout;
 
         let storage_total_start = Instant::now();
@@ -529,6 +572,7 @@ impl Content {
         let mut rx_window_wait_ns = 0u64;
         let mut digest_ns = 0u64;
         let mut pwrite_ns = 0u64;
+        let mut pwrite_calls = 0u64;
         let mut recycle_ns = 0u64;
 
         loop {
@@ -574,15 +618,9 @@ impl Content {
                 let file = file.clone();
                 tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
-                    let mut part_offset = position;
-                    for part in window.parts() {
-                        file.write_all_at(part, part_offset)?;
-                        part_offset =
-                            part_offset.checked_add(part.len() as u64).ok_or_else(|| {
-                                std::io::Error::other("URMA positional write offset overflow")
-                            })?;
-                    }
-                    Ok::<u64, std::io::Error>(start.elapsed().as_nanos() as u64)
+                    let mut buffers = window.parts().map(IoSlice::new).collect::<Vec<_>>();
+                    let calls = write_all_vectored_at(&file, &mut buffers, position)?;
+                    Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, calls))
                 })
             };
 
@@ -597,9 +635,11 @@ impl Content {
                 digest.map_err(|error| Error::Unknown(format!("digest panicked: {error}")))?;
             hasher = next_hasher;
             digest_ns += window_digest_ns;
-            pwrite_ns += write
+            let (window_pwrite_ns, window_pwrite_calls) = write
                 .map_err(|error| Error::Unknown(format!("write piece panicked: {error}")))?
                 .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
+            pwrite_ns += window_pwrite_ns;
+            pwrite_calls += window_pwrite_calls;
             recycle?;
             length += window_length;
         }
@@ -619,6 +659,7 @@ impl Content {
             rx_window_wait_ns,
             digest_ns,
             pwrite_ns,
+            pwrite_calls,
             recycle_ns,
             storage_total_ns,
             "finished writing urma piece from registered receive windows"
@@ -1229,6 +1270,28 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_write_all_vectored_at_preserves_offset_and_parts() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("pwritev");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16).unwrap();
+        let mut buffers = [
+            IoSlice::new(b"abc"),
+            IoSlice::new(b"defg"),
+            IoSlice::new(b"h"),
+        ];
+
+        let calls = write_all_vectored_at(&file, &mut buffers, 4).unwrap();
+
+        assert!(calls >= 1);
+        drop(file);
+        let contents = std::fs::read(path).unwrap();
+        assert_eq!(&contents[..4], &[0; 4]);
+        assert_eq!(&contents[4..12], b"abcdefgh");
+        assert_eq!(&contents[12..], &[0; 4]);
+    }
 
     #[tokio::test]
     async fn test_create_task() {
