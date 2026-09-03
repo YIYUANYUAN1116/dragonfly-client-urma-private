@@ -54,15 +54,56 @@ use dragonfly_client_util::shutdown;
 
 const REQUIRED_TX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Absorbs the short hand-off between a completed persistent-lane Piece and
-/// the server task dropping its process-wide transfer permit. Sustained
-/// overload still receives a transfer-local BUSY response.
+/// Absorbs short scheduler hand-off delays while a completed persistent-lane
+/// Piece releases its process-wide transfer permit. Sustained overload still
+/// receives a transfer-local BUSY response.
 const PROCESS_TRANSFER_ADMISSION_GRACE: Duration = Duration::from_millis(10);
 
 struct ProcessTransferAdmission {
     permit: OwnedSemaphorePermit,
     waited: bool,
     wait_ns: u64,
+}
+
+struct ProcessTransferPermitGuard {
+    permit: Option<OwnedSemaphorePermit>,
+    admission: Arc<Semaphore>,
+    admission_limit: usize,
+    lane_id: u16,
+    transfer_id: u32,
+}
+
+impl ProcessTransferPermitGuard {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        admission: Arc<Semaphore>,
+        admission_limit: usize,
+        lane_id: u16,
+        transfer_id: u32,
+    ) -> Self {
+        Self {
+            permit: Some(permit),
+            admission,
+            admission_limit,
+            lane_id,
+            transfer_id,
+        }
+    }
+}
+
+impl Drop for ProcessTransferPermitGuard {
+    fn drop(&mut self) {
+        self.permit.take();
+        let available_permits = self.admission.available_permits();
+        debug!(
+            lane_id = self.lane_id,
+            transfer_id = self.transfer_id,
+            admission_limit = self.admission_limit,
+            available_permits,
+            active_transfers = self.admission_limit.saturating_sub(available_permits),
+            "released URMA process transfer admission"
+        );
+    }
 }
 
 async fn acquire_process_transfer(
@@ -625,9 +666,16 @@ impl UrmaServerHandler {
                 "URMA process transfer admitted after bounded wait"
             );
         }
+        let permit = ProcessTransferPermitGuard::new(
+            permit,
+            self.transfer_admission.clone(),
+            self.max_concurrent_transfers,
+            lane_id,
+            transfer_id,
+        );
         let result = match time::timeout(
             self.piece_timeout,
-            self.handle_piece(&mut transfer, &request, &piece_id),
+            self.handle_piece(&mut transfer, &request, &piece_id, permit),
         )
         .await
         {
@@ -654,18 +702,6 @@ impl UrmaServerHandler {
                 Err(error.into())
             }
         };
-        drop(permit);
-        let available_permits = self.transfer_admission.available_permits();
-        debug!(
-            lane_id,
-            transfer_id,
-            admission_limit = self.max_concurrent_transfers,
-            available_permits,
-            active_transfers = self
-                .max_concurrent_transfers
-                .saturating_sub(available_permits),
-            "released URMA process transfer admission"
-        );
         result
     }
 
@@ -681,6 +717,7 @@ impl UrmaServerHandler {
         session: &mut UrmaServerTransfer,
         request: &CommonPieceRequest,
         piece_id: &str,
+        process_permit: ProcessTransferPermitGuard,
     ) -> ClientResult<Option<u64>> {
         let piece_total_start = Instant::now();
         let piece = match self.piece_metadata(request.kind, piece_id) {
@@ -1024,6 +1061,14 @@ impl UrmaServerHandler {
                 .await
                 .map_err(client_error)?;
         }
+        // Once all data WRs have completed and their registered TX leases are
+        // recycled, this transfer no longer consumes process data-path
+        // capacity. Release admission before queuing Done: the client cannot
+        // start its replacement Piece until it receives that terminal frame,
+        // so this ordering removes permit hand-off lag without exceeding the
+        // configured number of active data transfers. Error and cancellation
+        // paths retain RAII release through ProcessTransferPermitGuard::drop.
+        drop(process_permit);
         let done_start = Instant::now();
         session.finish_piece().await.map_err(client_error)?;
         let tx_done_ns = done_start.elapsed().as_nanos() as u64;
@@ -1204,11 +1249,17 @@ mod tests {
         let acquired = acquire_process_transfer(admission.clone(), Duration::from_millis(10))
             .await
             .unwrap();
+        let ProcessTransferAdmission {
+            permit,
+            waited,
+            wait_ns,
+        } = acquired;
+        let permit = ProcessTransferPermitGuard::new(permit, admission.clone(), 1, 7, 11);
 
-        assert!(!acquired.waited);
-        assert_eq!(acquired.wait_ns, 0);
+        assert!(!waited);
+        assert_eq!(wait_ns, 0);
         assert_eq!(admission.available_permits(), 0);
-        drop(acquired);
+        drop(permit);
         assert_eq!(admission.available_permits(), 1);
     }
 
@@ -1224,11 +1275,17 @@ mod tests {
         let acquired = acquire_process_transfer(admission.clone(), Duration::from_millis(100))
             .await
             .unwrap();
+        let ProcessTransferAdmission {
+            permit,
+            waited,
+            wait_ns,
+        } = acquired;
+        let permit = ProcessTransferPermitGuard::new(permit, admission.clone(), 1, 7, 12);
 
-        assert!(acquired.waited);
-        assert!(acquired.wait_ns > 0);
+        assert!(waited);
+        assert!(wait_ns > 0);
         assert_eq!(admission.available_permits(), 0);
-        drop(acquired);
+        drop(permit);
         release.await.unwrap();
         assert_eq!(admission.available_permits(), 1);
     }
