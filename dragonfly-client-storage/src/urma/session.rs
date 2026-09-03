@@ -964,6 +964,7 @@ struct ServerLane {
     lane_id: u16,
     max_message_size: u64,
     max_send_inflight: u32,
+    native_send_permits: Arc<Semaphore>,
     control_timeout: Duration,
     failed: AtomicBool,
     closed: AtomicBool,
@@ -1004,6 +1005,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
         local_capability: &UrmaCapability,
         control_timeout: Duration,
         max_concurrent_transfers: usize,
+        max_send_inflight: u32,
     ) -> Result<Self> {
         let connect =
             match read_control(&mut stream, control_timeout, "receive lane Connect").await? {
@@ -1024,6 +1026,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
         let max_message_size = local_capability
             .max_message_size
             .min(connect.capability.max_message_size);
+        if max_send_inflight == 0 || max_send_inflight > lane_config.send_depth {
+            return Err(Error::InvalidConfiguration(format!(
+                "URMA per-Piece send inflight {max_send_inflight} exceeds lane send depth {}",
+                lane_config.send_depth
+            )));
+        }
         let (lane_id, server_descriptor) = fabric.create_lane(lane_config).await?;
         let handshake = async {
             fabric.bind_lane(lane_id, connect.client_descriptor).await?;
@@ -1047,7 +1055,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
                 fabric,
                 lane_id,
                 max_message_size,
-                max_send_inflight: lane_config.send_depth,
+                max_send_inflight,
+                native_send_permits: Arc::new(Semaphore::new(lane_config.send_depth as usize)),
                 control_timeout,
                 failed: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -1237,6 +1246,49 @@ impl UrmaServerTransfer {
                 )))
                 .await;
         }
+        let requested = window.chunk_count;
+        let available_before = self.lane.native_send_permits.available_permits();
+        let admission_start = time::Instant::now();
+        let admission = time::timeout(
+            timeout,
+            self.lane
+                .native_send_permits
+                .clone()
+                .acquire_many_owned(requested),
+        )
+        .await;
+        if available_before < requested as usize {
+            let wait = admission_start.elapsed();
+            collect_urma_required_admission_wait_metrics("tx", wait);
+            debug!(
+                lane_id,
+                transfer_id = piece.transfer_id,
+                requested,
+                available_before,
+                required_tx_wait_count = 1u64,
+                required_tx_wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX),
+                admitted = matches!(&admission, Ok(Ok(_))),
+                "URMA native TX required admission wait finished"
+            );
+        }
+        let _native_send_permit = match admission {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return self
+                    .abort(Error::Shutdown {
+                        failures: vec!["URMA native TX admission is closed".into()],
+                    })
+                    .await;
+            }
+            Err(_) => {
+                collect_urma_budget_pressure_metrics("tx", "required");
+                return self
+                    .abort_peer(Error::OperationTimeout {
+                        sequence: Some(transfer_sequence(piece.transfer_id, window.start_chunk)?),
+                    })
+                    .await;
+            }
+        };
         let grant_credit_start = Instant::now();
         if let Err(error) = self
             .lane

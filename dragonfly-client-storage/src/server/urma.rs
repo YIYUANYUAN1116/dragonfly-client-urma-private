@@ -54,6 +54,32 @@ use dragonfly_client_util::shutdown;
 
 const REQUIRED_TX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SendDepths {
+    window_chunks: u32,
+    lane_depth: u32,
+}
+
+fn send_depths(
+    configured_window_chunks: u32,
+    registered_window_capacity: u32,
+    max_concurrent_transfers: u32,
+    native_capacity: u32,
+) -> SendDepths {
+    let native_capacity = native_capacity.max(1);
+    let window_chunks = configured_window_chunks
+        .max(1)
+        .min(registered_window_capacity.max(1))
+        .min(native_capacity);
+    SendDepths {
+        window_chunks,
+        lane_depth: window_chunks
+            .saturating_mul(max_concurrent_transfers.max(1))
+            .min(native_capacity)
+            .max(window_chunks),
+    }
+}
+
 struct RequiredTxWaiter<'a> {
     waiters: &'a AtomicUsize,
 }
@@ -235,21 +261,33 @@ impl UrmaServer {
             fabric.tx_registered_bytes(),
             fabric.rx_registered_bytes(),
         );
+        let depths = send_depths(
+            urma_config.max_inflight_chunks,
+            fabric.max_tx_window_chunks(urma_config.pipeline_depth),
+            urma_config.max_concurrent_transfers,
+            fabric.max_native_send_depth(),
+        );
         let lane_config = UrmaLaneConfig {
-            send_depth: urma_config
-                .max_inflight_chunks
-                .min(fabric.max_tx_window_chunks(urma_config.pipeline_depth)),
+            send_depth: depths.lane_depth,
             recv_depth: urma_config.max_inflight_chunks,
             post_list_size: urma_config.post_list_size,
             pipeline_depth: urma_config.pipeline_depth,
             ..Default::default()
         };
+        info!(
+            native_send_depth = depths.lane_depth,
+            piece_window_chunks = depths.window_chunks,
+            max_concurrent_transfers = urma_config.max_concurrent_transfers,
+            pipeline_depth = urma_config.pipeline_depth,
+            "configured URMA server send depths"
+        );
         let handler = Arc::new(UrmaServerHandler::new(
             self.storage.clone(),
             self.upload_bandwidth_limiter.clone(),
             fabric.clone(),
             capability.clone(),
             lane_config,
+            depths.window_chunks,
             urma_config.transfer_timeout,
             urma_config.transfer_timeout,
             self.config.download.piece_timeout,
@@ -378,6 +416,7 @@ struct UrmaServerHandler {
     fabric: UrmaFabricHandle,
     capability: UrmaCapability,
     lane_config: UrmaLaneConfig,
+    max_send_inflight: u32,
     control_timeout: Duration,
     session_idle_timeout: Duration,
     transfer_timeout: Duration,
@@ -396,6 +435,7 @@ impl UrmaServerHandler {
         fabric: UrmaFabricHandle,
         capability: UrmaCapability,
         lane_config: UrmaLaneConfig,
+        max_send_inflight: u32,
         control_timeout: Duration,
         transfer_timeout: Duration,
         piece_timeout: Duration,
@@ -408,6 +448,7 @@ impl UrmaServerHandler {
             fabric,
             capability,
             lane_config,
+            max_send_inflight,
             control_timeout,
             session_idle_timeout: server_session_idle_timeout(control_timeout),
             transfer_timeout,
@@ -435,6 +476,7 @@ impl UrmaServerHandler {
             &self.capability,
             self.control_timeout,
             self.max_concurrent_transfers,
+            self.max_send_inflight,
         )
         .await
         .map_err(client_error)?;
@@ -582,7 +624,7 @@ impl UrmaServerHandler {
         let (chunk_size, max_inflight_chunks) = match negotiate_transfer(
             request,
             self.capability.max_message_size,
-            self.lane_config.send_depth,
+            self.max_send_inflight,
         ) {
             Ok(parameters) => parameters,
             Err(error) => {
@@ -906,7 +948,7 @@ impl UrmaServerHandler {
             tx_overlap_windows,
             tx_second_lease_fallback,
             configured_pipeline_depth = self.lane_config.pipeline_depth,
-            max_window_chunks = self.lane_config.send_depth,
+            max_window_chunks = self.max_send_inflight,
             limiter_wait_ns,
             source_open_ns,
             tx_ready_ns,
@@ -997,6 +1039,38 @@ mod tests {
         assert_eq!(
             negotiate_transfer(&request(256 * 1024, 64), 64 * 1024, 8).unwrap(),
             (64 * 1024, 8)
+        );
+    }
+
+    #[test]
+    fn send_depths_separate_piece_window_from_lane_capacity() {
+        assert_eq!(
+            send_depths(32, 64, 16, 128),
+            SendDepths {
+                window_chunks: 32,
+                lane_depth: 128,
+            }
+        );
+        assert_eq!(
+            send_depths(32, 64, 1, 128),
+            SendDepths {
+                window_chunks: 32,
+                lane_depth: 32,
+            }
+        );
+        assert_eq!(
+            send_depths(32, 16, 16, 128),
+            SendDepths {
+                window_chunks: 16,
+                lane_depth: 128,
+            }
+        );
+        assert_eq!(
+            send_depths(32, 64, 16, 8),
+            SendDepths {
+                window_chunks: 8,
+                lane_depth: 8,
+            }
         );
     }
 
