@@ -45,7 +45,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn, Span};
@@ -53,6 +53,43 @@ use tracing::{debug, error, info, instrument, warn, Span};
 use dragonfly_client_util::shutdown;
 
 const REQUIRED_TX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Absorbs the short hand-off between a completed persistent-lane Piece and
+/// the server task dropping its process-wide transfer permit. Sustained
+/// overload still receives a transfer-local BUSY response.
+const PROCESS_TRANSFER_ADMISSION_GRACE: Duration = Duration::from_millis(10);
+
+struct ProcessTransferAdmission {
+    permit: OwnedSemaphorePermit,
+    waited: bool,
+    wait_ns: u64,
+}
+
+async fn acquire_process_transfer(
+    admission: Arc<Semaphore>,
+    grace: Duration,
+) -> Option<ProcessTransferAdmission> {
+    match admission.clone().try_acquire_owned() {
+        Ok(permit) => Some(ProcessTransferAdmission {
+            permit,
+            waited: false,
+            wait_ns: 0,
+        }),
+        Err(TryAcquireError::Closed) => None,
+        Err(TryAcquireError::NoPermits) => {
+            let wait_start = Instant::now();
+            let permit = match time::timeout(grace, admission.acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => return None,
+            };
+            Some(ProcessTransferAdmission {
+                permit,
+                waited: true,
+                wait_ns: u64::try_from(wait_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            })
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SendDepths {
@@ -536,7 +573,31 @@ impl UrmaServerHandler {
         request: CommonPieceRequest,
         piece_id: String,
     ) -> ClientResult<()> {
-        let Ok(_permit) = self.transfer_admission.clone().try_acquire_owned() else {
+        let lane_id = transfer.lane_id();
+        let transfer_id = transfer.transfer_id();
+        let admission_start = Instant::now();
+        let Some(admission) = acquire_process_transfer(
+            self.transfer_admission.clone(),
+            PROCESS_TRANSFER_ADMISSION_GRACE,
+        )
+        .await
+        else {
+            let available_permits = self.transfer_admission.available_permits();
+            let active_transfers = self
+                .max_concurrent_transfers
+                .saturating_sub(available_permits);
+            debug!(
+                lane_id,
+                transfer_id,
+                admission_limit = self.max_concurrent_transfers,
+                available_permits,
+                active_transfers,
+                admission_wait_ns =
+                    u64::try_from(admission_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                admission_grace_ms = PROCESS_TRANSFER_ADMISSION_GRACE.as_millis() as u64,
+                admitted = false,
+                "URMA process transfer admission is full after bounded wait"
+            );
             collect_upload_piece_failure_metrics();
             transfer
                 .reject_piece_transient(ERROR_CODE_BUSY, "URMA process transfer admission is full")
@@ -544,7 +605,27 @@ impl UrmaServerHandler {
                 .map_err(client_error)?;
             return Ok(());
         };
-        match time::timeout(
+        let ProcessTransferAdmission {
+            permit,
+            waited,
+            wait_ns,
+        } = admission;
+        if waited {
+            let available_permits = self.transfer_admission.available_permits();
+            debug!(
+                lane_id,
+                transfer_id,
+                admission_limit = self.max_concurrent_transfers,
+                available_permits,
+                active_transfers = self
+                    .max_concurrent_transfers
+                    .saturating_sub(available_permits),
+                admission_wait_ns = wait_ns,
+                admitted = true,
+                "URMA process transfer admitted after bounded wait"
+            );
+        }
+        let result = match time::timeout(
             self.piece_timeout,
             self.handle_piece(&mut transfer, &request, &piece_id),
         )
@@ -572,7 +653,20 @@ impl UrmaServerHandler {
                 let _ = transfer.abort_transfer(message).await;
                 Err(error.into())
             }
-        }
+        };
+        drop(permit);
+        let available_permits = self.transfer_admission.available_permits();
+        debug!(
+            lane_id,
+            transfer_id,
+            admission_limit = self.max_concurrent_transfers,
+            available_permits,
+            active_transfers = self
+                .max_concurrent_transfers
+                .saturating_sub(available_permits),
+            "released URMA process transfer admission"
+        );
+        result
     }
 
     // The per-Piece span is attached to this future via #[instrument], so it
@@ -1102,6 +1196,56 @@ mod tests {
             assert_eq!(waiters.load(Ordering::Acquire), 1);
         }
         assert_eq!(waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn process_transfer_admission_succeeds_without_waiting_and_releases() {
+        let admission = Arc::new(Semaphore::new(1));
+        let acquired = acquire_process_transfer(admission.clone(), Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert!(!acquired.waited);
+        assert_eq!(acquired.wait_ns, 0);
+        assert_eq!(admission.available_permits(), 0);
+        drop(acquired);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_transfer_admission_waits_for_a_released_permit() {
+        let admission = Arc::new(Semaphore::new(1));
+        let held = admission.clone().acquire_owned().await.unwrap();
+        let release = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(2)).await;
+            drop(held);
+        });
+
+        let acquired = acquire_process_transfer(admission.clone(), Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        assert!(acquired.waited);
+        assert!(acquired.wait_ns > 0);
+        assert_eq!(admission.available_permits(), 0);
+        drop(acquired);
+        release.await.unwrap();
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_transfer_admission_times_out_without_leaking_a_permit() {
+        let admission = Arc::new(Semaphore::new(1));
+        let held = admission.clone().acquire_owned().await.unwrap();
+
+        assert!(
+            acquire_process_transfer(admission.clone(), Duration::from_millis(1))
+                .await
+                .is_none()
+        );
+        assert_eq!(admission.available_permits(), 0);
+        drop(held);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[tokio::test]
