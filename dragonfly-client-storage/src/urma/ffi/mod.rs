@@ -15,6 +15,7 @@ mod sys {
 }
 
 pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM;
+pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {
@@ -64,6 +65,13 @@ pub(crate) struct JettyDescriptorData {
     pub opaque_data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RemoteJettyId {
+    pub eid: [u8; EID_SIZE],
+    pub uasid: u32,
+    pub id: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CompletionRecord {
     pub status: i32,
@@ -72,6 +80,7 @@ pub(crate) struct CompletionRecord {
     pub imm_data: u64,
     pub completion_len: u32,
     pub local_id: u32,
+    pub remote_id: Option<RemoteJettyId>,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
@@ -237,6 +246,11 @@ impl JfcHandle {
                 imm_data: record.imm_data,
                 completion_len: record.completion_len,
                 local_id: record.local_id,
+                remote_id: (record.remote_id_valid != 0).then_some(RemoteJettyId {
+                    eid: record.remote_eid,
+                    uasid: record.remote_uasid,
+                    id: record.remote_jetty_id,
+                }),
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
@@ -389,11 +403,11 @@ impl JettyHandle {
         result
     }
 
-    pub(crate) fn import(
+    pub(crate) fn import_target(
         &mut self,
         descriptor: &JettyDescriptorData,
         token: u32,
-    ) -> Result<(), FfiError> {
+    ) -> Result<TargetHandle, FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let opaque_len = u32::try_from(descriptor.opaque_data.len())
             .map_err(|_| FfiError::Contract("descriptor length exceeds u32"))?;
@@ -405,6 +419,7 @@ impl JettyHandle {
         };
         // SAFETY: Descriptor bytes are validated by the safe wire layer and
         // remain live for the synchronous shim import call.
+        let mut raw_target = std::ptr::null_mut();
         let status = unsafe {
             sys::dfurma_jetty_import(
                 jetty.as_ptr(),
@@ -412,27 +427,16 @@ impl JettyHandle {
                 descriptor.opaque_data.as_ptr(),
                 opaque_len,
                 token,
+                &mut raw_target,
             )
         };
-        status_result(status)
-    }
-
-    pub(crate) fn bind(&mut self) -> Result<(), FfiError> {
-        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
-        // SAFETY: Jetty and its imported target are owned by this handle.
-        status_result(unsafe { sys::dfurma_jetty_bind(jetty.as_ptr()) })
-    }
-
-    pub(crate) fn unbind(&mut self) -> Result<(), FfiError> {
-        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
-        // SAFETY: Jetty is uniquely owned by this handle.
-        status_result(unsafe { sys::dfurma_jetty_unbind(jetty.as_ptr()) })
-    }
-
-    pub(crate) fn unimport(&mut self) -> Result<(), FfiError> {
-        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
-        // SAFETY: The imported target, if any, is uniquely owned by the shim.
-        status_result(unsafe { sys::dfurma_jetty_unimport(jetty.as_ptr()) })
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        Ok(TargetHandle {
+            raw: Some(NonNull::new(raw_target).ok_or(FfiError::NullHandle)?),
+            _not_send_sync: PhantomData,
+        })
     }
 
     pub(crate) fn mark_error(&mut self) -> Result<(), FfiError> {
@@ -444,23 +448,33 @@ impl JettyHandle {
     #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
     pub(crate) fn post_send(
         &mut self,
+        target: &TargetHandle,
         segment: &SegmentHandle,
         offset: u64,
         length: u32,
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, true, None)
+        self.post(Some(target), segment, offset, length, user_ctx, true, None)
     }
 
     pub(crate) fn post_send_imm(
         &mut self,
+        target: &TargetHandle,
         segment: &SegmentHandle,
         offset: u64,
         length: u32,
         user_ctx: u64,
         imm_data: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, true, Some(imm_data))
+        self.post(
+            Some(target),
+            segment,
+            offset,
+            length,
+            user_ctx,
+            true,
+            Some(imm_data),
+        )
     }
 
     pub(crate) fn post_recv(
@@ -470,7 +484,7 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, false, None)
+        self.post(None, segment, offset, length, user_ctx, false, None)
     }
 
     pub(crate) fn local_ids(&self) -> Result<(u32, u32), FfiError> {
@@ -487,14 +501,16 @@ impl JettyHandle {
     #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
     pub(crate) fn post_send_list(
         &mut self,
+        target: &TargetHandle,
         segment: &SegmentHandle,
         entries: &[PostEntry],
     ) -> Result<PostBatch, FfiError> {
-        self.post_list(segment, entries, true, false)
+        self.post_list(Some(target), segment, entries, true, false)
     }
 
     pub(crate) fn post_send_imm_list(
         &mut self,
+        target: &TargetHandle,
         segment: &SegmentHandle,
         entries: &[PostEntry],
     ) -> Result<PostBatch, FfiError> {
@@ -503,7 +519,7 @@ impl JettyHandle {
                 "SEND_IMM post-list entry lacks immediate data",
             ));
         }
-        self.post_list(segment, entries, true, true)
+        self.post_list(Some(target), segment, entries, true, true)
     }
 
     pub(crate) fn post_recv_list(
@@ -511,11 +527,12 @@ impl JettyHandle {
         segment: &SegmentHandle,
         entries: &[PostEntry],
     ) -> Result<PostBatch, FfiError> {
-        self.post_list(segment, entries, false, false)
+        self.post_list(None, segment, entries, false, false)
     }
 
     fn post_list(
         &mut self,
+        target: Option<&TargetHandle>,
         segment: &SegmentHandle,
         entries: &[PostEntry],
         send: bool,
@@ -525,6 +542,7 @@ impl JettyHandle {
             return Err(FfiError::Contract("invalid linked WR post-list length"));
         }
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let target = target.and_then(|target| target.raw);
         let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
         let raw_entries: Vec<sys::dfurma_post_entry_t> = entries
             .iter()
@@ -543,6 +561,9 @@ impl JettyHandle {
             if with_imm {
                 sys::dfurma_post_send_imm_list(
                     jetty.as_ptr(),
+                    target
+                        .ok_or(FfiError::Contract("SEND requires a target"))?
+                        .as_ptr(),
                     segment.as_ptr(),
                     raw_entries.as_ptr(),
                     raw_entries.len() as u32,
@@ -552,6 +573,9 @@ impl JettyHandle {
             } else if send {
                 sys::dfurma_post_send_list(
                     jetty.as_ptr(),
+                    target
+                        .ok_or(FfiError::Contract("SEND requires a target"))?
+                        .as_ptr(),
                     segment.as_ptr(),
                     raw_entries.as_ptr(),
                     raw_entries.len() as u32,
@@ -589,6 +613,7 @@ impl JettyHandle {
 
     fn post(
         &mut self,
+        target: Option<&TargetHandle>,
         segment: &SegmentHandle,
         offset: u64,
         length: u32,
@@ -597,6 +622,7 @@ impl JettyHandle {
         imm_data: Option<u64>,
     ) -> Result<WrHandle, FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let target = target.and_then(|target| target.raw);
         let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: Jetty and Segment are live, range validation is repeated by
@@ -605,6 +631,9 @@ impl JettyHandle {
             if let Some(imm_data) = imm_data {
                 sys::dfurma_post_send_imm(
                     jetty.as_ptr(),
+                    target
+                        .ok_or(FfiError::Contract("SEND requires a target"))?
+                        .as_ptr(),
                     segment.as_ptr(),
                     offset,
                     length,
@@ -615,6 +644,9 @@ impl JettyHandle {
             } else if send {
                 sys::dfurma_post_send(
                     jetty.as_ptr(),
+                    target
+                        .ok_or(FfiError::Contract("SEND requires a target"))?
+                        .as_ptr(),
                     segment.as_ptr(),
                     offset,
                     length,
@@ -687,8 +719,43 @@ impl Drop for WrHandle {
 
 impl Drop for JettyHandle {
     fn drop(&mut self) {
-        let _ = self.unbind();
-        let _ = self.unimport();
+        let _ = self.close();
+    }
+}
+
+pub(crate) struct TargetHandle {
+    raw: Option<NonNull<sys::dfurma_target_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl TargetHandle {
+    pub(crate) fn remote_id(&self) -> Result<RemoteJettyId, FfiError> {
+        let target = self.raw.ok_or(FfiError::Contract("target is closed"))?;
+        let mut eid = [0u8; EID_SIZE];
+        let mut uasid = 0;
+        let mut id = 0;
+        // SAFETY: all outputs are writable and target is a live imported handle.
+        status_result(unsafe {
+            sys::dfurma_target_remote_id(target.as_ptr(), eid.as_mut_ptr(), &mut uasid, &mut id)
+        })?;
+        Ok(RemoteJettyId { eid, uasid, id })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), FfiError> {
+        let Some(target) = self.raw else {
+            return Ok(());
+        };
+        // SAFETY: this consumes the unique imported target wrapper.
+        let result = status_result(unsafe { sys::dfurma_target_unimport(target.as_ptr()) });
+        if result.is_ok() {
+            self.raw = None;
+        }
+        result
+    }
+}
+
+impl Drop for TargetHandle {
+    fn drop(&mut self) {
         let _ = self.close();
     }
 }

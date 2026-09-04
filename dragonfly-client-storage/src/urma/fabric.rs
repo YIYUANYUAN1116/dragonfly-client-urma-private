@@ -96,7 +96,7 @@ pub(crate) struct UrmaLaneConfig {
 impl Default for UrmaLaneConfig {
     fn default() -> Self {
         Self {
-            transport_mode: TransportMode::Rc,
+            transport_mode: TransportMode::Rm,
             send_depth: 128,
             recv_depth: 512,
             max_send_sge: 1,

@@ -2,7 +2,9 @@ use super::{
     buffer::{RegisteredRxWindowLease, TxWindowLease, UrmaBufferPool},
     ffi,
     lane::{OperationType, WrToken},
-    native_error, Error, Result,
+    native_error,
+    target::PeerTargetRegistry,
+    Error, Result,
 };
 use std::{
     collections::HashMap,
@@ -210,6 +212,7 @@ pub(crate) struct CompletionRouter {
     outstanding_by_lane: HashMap<u16, usize>,
     retirement_by_lane: HashMap<u16, LaneRetirement>,
     lane_by_jetty_id: HashMap<u32, u16>,
+    targets: PeerTargetRegistry,
     registered_rx_by_identity: HashMap<(u16, u64), RegisteredRxCompletionTx>,
     stats: CompletionStats,
 }
@@ -230,6 +233,7 @@ impl CompletionRouter {
             outstanding_by_lane: HashMap::new(),
             retirement_by_lane: HashMap::new(),
             lane_by_jetty_id: HashMap::new(),
+            targets: PeerTargetRegistry::default(),
             registered_rx_by_identity: HashMap::new(),
             stats: CompletionStats::default(),
         })
@@ -266,12 +270,42 @@ impl CompletionRouter {
             ))
         })?;
         retirement.waiting_for_flush = true;
+        if self.targets.contains(lane_id) {
+            self.targets.begin_draining(lane_id)?;
+        }
         tracing::debug!(
             lane_id,
             native_jetty_id = retirement.jetty_id,
             native_jfr_id = retirement.jfr_id,
             "waiting for URMA lane flush completion"
         );
+        Ok(())
+    }
+
+    pub(crate) fn authorize_remote(
+        &mut self,
+        lane_id: u16,
+        generation: u8,
+        remote_id: ffi::RemoteJettyId,
+    ) -> Result<()> {
+        if !self.retirement_by_lane.contains_key(&lane_id) {
+            return Err(Error::Protocol(format!(
+                "cannot authorize remote for unknown lane {lane_id}"
+            )));
+        }
+        self.targets.register(lane_id, generation, remote_id)
+    }
+
+    fn validate_remote(&self, token: WrToken, remote_id: Option<ffi::RemoteJettyId>) -> Result<()> {
+        let remote_id = remote_id
+            .ok_or_else(|| Error::Protocol("receive CQE has no remote Jetty identity".into()))?;
+        let route = self.targets.resolve(remote_id)?;
+        if route.id != token.lane_id || route.generation != token.generation {
+            return Err(Error::Protocol(format!(
+                "receive CQE source resolved to PeerTarget {} generation {}, token names {} generation {}",
+                route.id, route.generation, token.lane_id, token.generation
+            )));
+        }
         Ok(())
     }
 
@@ -297,6 +331,9 @@ impl CompletionRouter {
             ))
         })?;
         self.lane_by_jetty_id.remove(&retirement.jetty_id);
+        if self.targets.contains(lane_id) {
+            self.targets.remove(lane_id)?;
+        }
         Ok(())
     }
 
@@ -533,13 +570,19 @@ impl CompletionRouter {
                 record.local_id, token.lane_id
             )));
         }
+        let expected_recv = token.operation == OperationType::Recv;
+        if expected_recv {
+            if let Err(error) = self.validate_remote(token, record.remote_id) {
+                self.stats.cqe_error += 1;
+                return Err(error);
+            }
+        }
         let retiring = self
             .retirement_by_lane
             .get(&token.lane_id)
             .is_some_and(|retirement| retirement.waiting_for_flush);
         let mut outstanding = self.take_outstanding(record.user_ctx)?;
         outstanding.handle.complete();
-        let expected_recv = token.operation == OperationType::Recv;
         let registered_tx = matches!(
             outstanding.completion,
             Some(CompletionTarget::RegisteredTx(_))
@@ -1262,5 +1305,39 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_recv_immediate(invalid_flag).is_err());
+    }
+
+    #[test]
+    fn receive_source_authorization_is_full_identity_and_fail_closed() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_lane(1, 101, 201).unwrap();
+        let expected = ffi::RemoteJettyId {
+            eid: [7; ffi::EID_SIZE],
+            uasid: 11,
+            id: 13,
+        };
+        let different = ffi::RemoteJettyId { id: 14, ..expected };
+        let token = WrToken {
+            lane_id: 1,
+            generation: 1,
+            operation: OperationType::Recv,
+            slot: SlotId::new(0, 1).unwrap(),
+        };
+
+        assert!(router.validate_remote(token, Some(expected)).is_err());
+        router.authorize_remote(1, 1, expected).unwrap();
+        assert!(router.validate_remote(token, Some(expected)).is_ok());
+        assert!(router.validate_remote(token, None).is_err());
+        assert!(router.validate_remote(token, Some(different)).is_err());
+
+        let stale = WrToken {
+            generation: 2,
+            ..token
+        };
+        assert!(router.validate_remote(stale, Some(expected)).is_err());
+
+        assert!(router.authorize_remote(1, 2, different).is_err());
+        assert!(router.validate_remote(token, Some(expected)).is_ok());
+        assert!(router.authorize_remote(2, 1, expected).is_err());
     }
 }

@@ -252,14 +252,7 @@ pub mod urma {
                 urma_config.tx_registered_bytes.as_u64(),
             ) {
                 Ok(fabric) => {
-                    let transport_mode = match urma_config.transport_mode {
-                        dragonfly_client_config::dfdaemon::UrmaTransportMode::Rc => {
-                            TransportMode::Rc
-                        }
-                        dragonfly_client_config::dfdaemon::UrmaTransportMode::Rm => {
-                            TransportMode::Rm
-                        }
-                    };
+                    let transport_mode = TransportMode::Rm;
                     if !fabric.supports_transport_mode(transport_mode) {
                         *state = FabricState::Failed(Instant::now());
                         return Err(Error::Unsupported(format!(

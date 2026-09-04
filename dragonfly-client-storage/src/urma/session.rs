@@ -434,7 +434,7 @@ impl Drop for ClientLane {
     }
 }
 
-/// Downloader-side handle to one persistent control connection and RC/RM Jetty.
+/// Downloader-side handle to one persistent control connection and RM Jetty.
 /// Piece-local state lives in [`UrmaClientTransfer`], so this handle can be
 /// shared by concurrent downloads to the same parent.
 pub(crate) struct UrmaClientSession<S> {

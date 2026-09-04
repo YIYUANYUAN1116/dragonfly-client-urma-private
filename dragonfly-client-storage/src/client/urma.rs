@@ -404,7 +404,7 @@ fn urma_error(error: UrmaError) -> ClientError {
 
 /// UrmaClient downloads pieces over UMDK/URMA: control frames ride a TCP
 /// rendezvous connection to the parent's URMA port, bulk bytes arrive over a
-/// negotiated RC/RM Jetty as copy-received windows. Each error must let the
+/// negotiated RM Jetty as copy-received windows. Each error must let the
 /// caller fall back to the TCP piece transport; URMA never has to succeed for
 /// a piece to complete.
 #[derive(Clone)]

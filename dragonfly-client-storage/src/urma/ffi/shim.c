@@ -29,6 +29,8 @@ _Static_assert(URMA_CR_OPC_SEND == 0,
                "URMA SEND completion opcode changed");
 _Static_assert(URMA_CR_OPC_SEND_WITH_IMM == DFURMA_CR_OPC_SEND_WITH_IMM,
                "URMA SEND_WITH_IMM completion opcode changed");
+_Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
+               "URMA EID size changed");
 
 struct dfurma_runtime {
     urma_device_t *device;
@@ -57,21 +59,27 @@ struct dfurma_jetty {
     dfurma_runtime_t *runtime;
     urma_jfr_t *jfr;
     urma_jetty_t *jetty;
-    urma_target_jetty_t *target;
     urma_transport_mode_t transport_mode;
-    int bound;
     int jetty_error;
     int jfr_error;
     uint32_t outstanding_wr_count;
+    uint32_t target_count;
     dfurma_wr_t *wr_arena;
     dfurma_wr_t *free_wr;
     uint32_t wr_capacity;
+};
+
+struct dfurma_target {
+    dfurma_jetty_t *jetty;
+    urma_target_jetty_t *target;
+    uint32_t outstanding_wr_count;
 };
 
 struct dfurma_wr {
     dfurma_runtime_t *runtime;
     dfurma_segment_t *segment;
     dfurma_jetty_t *jetty;
+    dfurma_target_t *target;
     urma_sge_t sge;
     urma_jfs_wr_t send_wr;
     urma_jfr_wr_t recv_wr;
@@ -369,8 +377,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
         recv_jfc == NULL || config == NULL || out == NULL ||
         send_jfc->runtime != runtime || recv_jfc->runtime != runtime ||
         send_jfc->jfc == NULL || recv_jfc->jfc == NULL ||
-        (config->transport_mode != URMA_TM_RC &&
-         config->transport_mode != URMA_TM_RM) ||
+        config->transport_mode != URMA_TM_RM ||
         config->send_depth == 0 || config->recv_depth == 0 ||
         config->max_send_sge == 0 || config->max_send_sge > UINT8_MAX ||
         config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX) {
@@ -545,18 +552,20 @@ void dfurma_descriptor_free(uint8_t *opaque_data)
 int dfurma_jetty_import(dfurma_jetty_t *jetty,
                           const dfurma_jetty_descriptor_meta_t *meta,
                           const uint8_t *opaque_data, uint32_t opaque_len,
-                          uint32_t token)
+                          uint32_t token, dfurma_target_t **out)
 {
     urma_rjetty_t *rjetty;
+    dfurma_target_t *target;
     urma_token_t token_value = {0};
 
     if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
         meta == NULL || opaque_data == NULL || opaque_len == 0 ||
         opaque_len != meta->opaque_len || opaque_len < sizeof(urma_rjetty_t) ||
-        jetty->target != NULL ||
+        out == NULL ||
         meta->transport_type != (uint32_t)jetty->runtime->device->type) {
         return -EINVAL;
     }
+    *out = NULL;
 
     rjetty = malloc(opaque_len);
     if (rjetty == NULL) {
@@ -570,77 +579,64 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
         return -EPROTO;
     }
 
+    target = calloc(1, sizeof(*target));
+    if (target == NULL) {
+        free(rjetty);
+        return -ENOMEM;
+    }
+
     token_value.token = token;
     errno = 0;
-    jetty->target = urma_import_jetty(jetty->runtime->context, rjetty,
-                                      &token_value);
+    target->target = urma_import_jetty(jetty->runtime->context, rjetty,
+                                       &token_value);
     free(rjetty);
-    if (jetty->target == NULL) {
-        return dfurma_pointer_error(-EIO);
+    if (target->target == NULL) {
+        int status = dfurma_pointer_error(-EIO);
+        free(target);
+        return status;
     }
+    target->jetty = jetty;
+    jetty->target_count++;
+    *out = target;
     return 0;
 }
 
-int dfurma_jetty_bind(dfurma_jetty_t *jetty)
+int dfurma_target_unimport(dfurma_target_t *target)
 {
     urma_status_t status;
+    dfurma_jetty_t *jetty;
 
-    if (jetty == NULL || jetty->jetty == NULL || jetty->target == NULL) {
+    if (target == NULL || target->jetty == NULL || target->target == NULL) {
         return -EINVAL;
     }
-    if (jetty->transport_mode != URMA_TM_RC) {
-        return -EPERM;
-    }
-    if (jetty->bound != 0) {
-        return 0;
-    }
-    status = urma_bind_jetty(jetty->jetty, jetty->target);
-    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
-        return (int)status;
-    }
-    jetty->bound = 1;
-    return 0;
-}
-
-int dfurma_jetty_unbind(dfurma_jetty_t *jetty)
-{
-    urma_status_t status;
-
-    if (jetty == NULL || jetty->jetty == NULL) {
-        return -EINVAL;
-    }
-    if (jetty->outstanding_wr_count != 0) {
+    if (target->outstanding_wr_count != 0) {
         return -EBUSY;
     }
-    if (jetty->bound == 0) {
-        return 0;
-    }
-    status = urma_unbind_jetty(jetty->jetty);
+    status = urma_unimport_jetty(target->target);
     if (status != URMA_SUCCESS) {
         return (int)status;
     }
-    jetty->bound = 0;
+    jetty = target->jetty;
+    if (jetty->target_count > 0) {
+        jetty->target_count--;
+    }
+    target->target = NULL;
+    target->jetty = NULL;
+    free(target);
     return 0;
 }
 
-int dfurma_jetty_unimport(dfurma_jetty_t *jetty)
+int dfurma_target_remote_id(dfurma_target_t *target,
+                            uint8_t eid[DFURMA_EID_SIZE], uint32_t *uasid,
+                            uint32_t *jetty_id)
 {
-    urma_status_t status;
-
-    if (jetty == NULL || jetty->jetty == NULL) {
+    if (target == NULL || target->target == NULL || eid == NULL ||
+        uasid == NULL || jetty_id == NULL) {
         return -EINVAL;
     }
-    if (jetty->bound != 0) {
-        return -EBUSY;
-    }
-    if (jetty->target == NULL) {
-        return 0;
-    }
-    status = urma_unimport_jetty(jetty->target);
-    if (status != URMA_SUCCESS) {
-        return (int)status;
-    }
-    jetty->target = NULL;
+    (void)memcpy(eid, target->target->id.eid.raw, DFURMA_EID_SIZE);
+    *uasid = target->target->id.uasid;
+    *jetty_id = target->target->id.id;
     return 0;
 }
 
@@ -653,8 +649,7 @@ int dfurma_jetty_delete(dfurma_jetty_t *jetty)
         (jetty->jetty == NULL && jetty->jfr == NULL)) {
         return -EINVAL;
     }
-    if (jetty->bound != 0 || jetty->target != NULL ||
-        jetty->outstanding_wr_count != 0) {
+    if (jetty->target_count != 0 || jetty->outstanding_wr_count != 0) {
         return -EBUSY;
     }
     runtime = jetty->runtime;
@@ -725,9 +720,13 @@ static void dfurma_wr_posted(dfurma_wr_t *wr)
     wr->runtime->outstanding_wr_count++;
     wr->segment->outstanding_wr_count++;
     wr->jetty->outstanding_wr_count++;
+    if (wr->target != NULL) {
+        wr->target->outstanding_wr_count++;
+    }
 }
 
 static int dfurma_post_send_common(dfurma_jetty_t *jetty,
+                                   dfurma_target_t *target,
                                    dfurma_segment_t *segment,
                                    uint64_t offset, uint32_t length,
                                    uint64_t user_ctx, uint64_t imm_data,
@@ -738,7 +737,8 @@ static int dfurma_post_send_common(dfurma_jetty_t *jetty,
     urma_status_t status;
     int create_status;
 
-    if (jetty == NULL || jetty->target == NULL || jetty->bound == 0) {
+    if (jetty == NULL || target == NULL || target->target == NULL ||
+        target->jetty != jetty) {
         return -ENOTCONN;
     }
     create_status = dfurma_wr_acquire(jetty, segment, offset, length, &wr);
@@ -748,7 +748,8 @@ static int dfurma_post_send_common(dfurma_jetty_t *jetty,
     wr->send_wr.opcode = with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
     wr->send_wr.flag.value = 0;
     wr->send_wr.flag.bs.complete_enable = 1;
-    wr->send_wr.tjetty = jetty->target;
+    wr->target = target;
+    wr->send_wr.tjetty = target->target;
     wr->send_wr.user_ctx = user_ctx;
     wr->send_wr.send.src.sge = &wr->sge;
     wr->send_wr.send.src.num_sge = 1;
@@ -764,21 +765,21 @@ static int dfurma_post_send_common(dfurma_jetty_t *jetty,
     return 0;
 }
 
-int dfurma_post_send(dfurma_jetty_t *jetty,
+int dfurma_post_send(dfurma_jetty_t *jetty, dfurma_target_t *target,
                      dfurma_segment_t *segment, uint64_t offset,
                      uint32_t length, uint64_t user_ctx,
                      dfurma_wr_t **out)
 {
-    return dfurma_post_send_common(jetty, segment, offset, length, user_ctx,
+    return dfurma_post_send_common(jetty, target, segment, offset, length, user_ctx,
                                    0, 0, out);
 }
 
-int dfurma_post_send_imm(dfurma_jetty_t *jetty,
+int dfurma_post_send_imm(dfurma_jetty_t *jetty, dfurma_target_t *target,
                          dfurma_segment_t *segment, uint64_t offset,
                          uint32_t length, uint64_t user_ctx,
                          uint64_t imm_data, dfurma_wr_t **out)
 {
-    return dfurma_post_send_common(jetty, segment, offset, length, user_ctx,
+    return dfurma_post_send_common(jetty, target, segment, offset, length, user_ctx,
                                    imm_data, 1, out);
 }
 
@@ -846,6 +847,7 @@ static int dfurma_post_list_prepare(dfurma_jetty_t *jetty,
 }
 
 static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
+                                        dfurma_target_t *target,
                                         dfurma_segment_t *segment,
                                         const dfurma_post_entry_t *entries,
                                         uint32_t count, uint8_t with_imm,
@@ -859,7 +861,8 @@ static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
     uint32_t i;
     int prepare_status;
 
-    if (jetty == NULL || jetty->target == NULL || jetty->bound == 0) {
+    if (jetty == NULL || target == NULL || target->target == NULL ||
+        target->jetty != jetty) {
         return -ENOTCONN;
     }
     prepare_status = dfurma_post_list_prepare(jetty, segment, entries, count,
@@ -873,7 +876,8 @@ static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
             with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
         wr->send_wr.flag.value = 0;
         wr->send_wr.flag.bs.complete_enable = 1;
-        wr->send_wr.tjetty = jetty->target;
+        wr->target = target;
+        wr->send_wr.tjetty = target->target;
         wr->send_wr.user_ctx = entries[i].user_ctx;
         wr->send_wr.send.src.sge = &wr->sge;
         wr->send_wr.send.src.num_sge = 1;
@@ -910,22 +914,22 @@ static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
     return result_status;
 }
 
-int dfurma_post_send_list(dfurma_jetty_t *jetty,
+int dfurma_post_send_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
                           dfurma_segment_t *segment,
                           const dfurma_post_entry_t *entries, uint32_t count,
                           dfurma_wr_t **out, uint32_t *posted)
 {
-    return dfurma_post_send_list_common(jetty, segment, entries, count, 0,
+    return dfurma_post_send_list_common(jetty, target, segment, entries, count, 0,
                                         out, posted);
 }
 
-int dfurma_post_send_imm_list(dfurma_jetty_t *jetty,
+int dfurma_post_send_imm_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
                               dfurma_segment_t *segment,
                               const dfurma_post_entry_t *entries,
                               uint32_t count, dfurma_wr_t **out,
                               uint32_t *posted)
 {
-    return dfurma_post_send_list_common(jetty, segment, entries, count, 1,
+    return dfurma_post_send_list_common(jetty, target, segment, entries, count, 1,
                                         out, posted);
 }
 
@@ -994,6 +998,9 @@ void dfurma_wr_complete(dfurma_wr_t *wr)
     if (wr->jetty->outstanding_wr_count > 0) {
         wr->jetty->outstanding_wr_count--;
     }
+    if (wr->target != NULL && wr->target->outstanding_wr_count > 0) {
+        wr->target->outstanding_wr_count--;
+    }
     dfurma_wr_return(wr);
 }
 
@@ -1013,12 +1020,17 @@ int dfurma_jfc_poll(dfurma_jfc_t *jfc, uint32_t capacity,
         return count;
     }
     for (i = 0; i < (uint32_t)count; ++i) {
+        (void)memset(&out[i], 0, sizeof(out[i]));
         out[i].status = (int32_t)cr[i].status;
         out[i].opcode = (uint32_t)cr[i].opcode;
         out[i].user_ctx = cr[i].user_ctx;
         out[i].imm_data = cr[i].imm_data;
         out[i].completion_len = cr[i].completion_len;
         out[i].local_id = cr[i].local_id;
+        memcpy(out[i].remote_eid, cr[i].remote_id.eid.raw,
+               DFURMA_EID_SIZE);
+        out[i].remote_uasid = cr[i].remote_id.uasid;
+        out[i].remote_jetty_id = cr[i].remote_id.id;
         out[i].is_recv = cr[i].flag.bs.s_r;
         out[i].is_jetty = cr[i].flag.bs.jetty;
         out[i].user_ctx_valid =
@@ -1027,6 +1039,10 @@ int dfurma_jfc_poll(dfurma_jfc_t *jfc, uint32_t capacity,
         out[i].imm_data_valid =
             (cr[i].flag.bs.s_r != 0 &&
              cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM);
+        out[i].remote_id_valid =
+            (cr[i].flag.bs.s_r != 0 &&
+             cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
+             cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
         if (cr[i].status == URMA_CR_WR_SUSPEND_DONE) {
             out[i].event_kind = DFURMA_COMPLETION_WR_SUSPEND_DONE;
         } else if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {

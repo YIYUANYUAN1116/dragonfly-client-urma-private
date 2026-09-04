@@ -323,10 +323,7 @@ impl UrmaServer {
             urma_config.tx_registered_bytes.as_u64(),
         )
         .map_err(client_error)?;
-        let transport_mode = match urma_config.transport_mode {
-            dragonfly_client_config::dfdaemon::UrmaTransportMode::Rc => TransportMode::Rc,
-            dragonfly_client_config::dfdaemon::UrmaTransportMode::Rm => TransportMode::Rm,
-        };
+        let transport_mode = TransportMode::Rm;
         if !fabric.supports_transport_mode(transport_mode) {
             return Err(ClientError::Unsupported(format!(
                 "URMA device does not advertise {transport_mode:?} mode"

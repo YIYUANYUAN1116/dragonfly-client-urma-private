@@ -1012,10 +1012,8 @@ impl Default for StorageServer {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UrmaTransportMode {
-    /// Reliable Connection remains the production default.
+    /// This experimental branch intentionally supports Reliable Message only.
     #[default]
-    Rc,
-    /// Reliable Message is an experimental per-peer compatibility backend.
     Rm,
 }
 
@@ -2655,7 +2653,7 @@ mod urma_config_tests {
     fn default_urma_server_is_safe() {
         let urma = UrmaServer::default();
         assert!(!urma.enable);
-        assert_eq!(urma.transport_mode, UrmaTransportMode::Rc);
+        assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
         assert_eq!(urma.port, 4008);
         assert!(urma.device.is_none());
         assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));
@@ -2668,9 +2666,14 @@ mod urma_config_tests {
     }
 
     #[test]
-    fn deserialize_experimental_rm_mode_explicitly() {
+    fn deserialize_rm_mode_explicitly() {
         let urma: UrmaServer = serde_yaml::from_str("transportMode: rm").unwrap();
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
+    }
+
+    #[test]
+    fn reject_rc_mode_on_rm_only_branch() {
+        assert!(serde_yaml::from_str::<UrmaServer>("transportMode: rc").is_err());
     }
 
     #[test]

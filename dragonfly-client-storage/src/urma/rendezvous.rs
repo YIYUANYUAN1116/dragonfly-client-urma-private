@@ -1,7 +1,7 @@
 //! URMA control-plane wire contract built on the shared Piece rendezvous schema.
 //!
 //! TCP carries reliable control frames; only chunk bytes use the negotiated
-//! RC or RM Jetty. The sender may not post a SEND until a validated
+//! RM Jetty. The sender may not post a SEND until a validated
 //! `RecvPosted` window has granted matching remote receive credits.
 
 use super::lane::TransportMode;
@@ -20,7 +20,7 @@ pub(crate) const MAGIC: u32 = 0x4446_5552;
 // Version 2 scopes every Piece control frame to a logical transfer. This is
 // the wire prerequisite for multiplexing several Pieces over one peer lane;
 // version 1 implicitly allowed only one active Piece per lane.
-// Version 3 adds the explicitly negotiated RC/RM transport mode.
+// Version 3 explicitly identifies RM and rejects RC peers on this branch.
 pub(crate) const VERSION: u8 = 3;
 const MAX_DESCRIPTOR_LENGTH: usize = 64 * 1024;
 
@@ -293,7 +293,7 @@ mod tests {
     fn capability() -> UrmaCapability {
         UrmaCapability {
             transport_type: 3,
-            transport_mode: TransportMode::Rc,
+            transport_mode: TransportMode::Rm,
             fabric_tag: "rack-a".into(),
             max_message_size: 64 * 1024,
         }
@@ -434,16 +434,12 @@ mod tests {
         let mut remote = local.clone();
         remote.fabric_tag = "rack-b".into();
         assert!(local.compatible(&remote).is_err());
-
-        let mut remote = local.clone();
-        remote.transport_mode = TransportMode::Rm;
-        assert!(local.compatible(&remote).is_err());
     }
 
     #[test]
     fn transport_mode_wire_values_match_umdks_public_api() {
         assert_eq!(TransportMode::from_wire(1).unwrap(), TransportMode::Rm);
-        assert_eq!(TransportMode::from_wire(2).unwrap(), TransportMode::Rc);
+        assert!(TransportMode::from_wire(2).is_err());
         assert!(TransportMode::from_wire(0).is_err());
     }
 }

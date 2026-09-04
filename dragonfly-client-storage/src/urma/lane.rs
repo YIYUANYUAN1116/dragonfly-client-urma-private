@@ -12,9 +12,8 @@ use super::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u32)]
 pub enum TransportMode {
-    Rm = 1,
     #[default]
-    Rc = 2,
+    Rm = 1,
 }
 
 impl TransportMode {
@@ -25,24 +24,8 @@ impl TransportMode {
     pub(crate) fn from_wire(value: u8) -> std::result::Result<Self, String> {
         match value {
             1 => Ok(Self::Rm),
-            2 => Ok(Self::Rc),
             _ => Err(format!("invalid URMA transport mode {value}")),
         }
-    }
-
-    fn requires_bind(self) -> bool {
-        self == Self::Rc
-    }
-}
-
-#[cfg(test)]
-mod transport_mode_tests {
-    use super::TransportMode;
-
-    #[test]
-    fn only_rc_requires_explicit_bind() {
-        assert!(TransportMode::Rc.requires_bind());
-        assert!(!TransportMode::Rm.requires_bind());
     }
 }
 
@@ -255,7 +238,7 @@ pub(crate) struct JettyConfig {
 impl Default for JettyConfig {
     fn default() -> Self {
         Self {
-            transport_mode: TransportMode::Rc,
+            transport_mode: TransportMode::Rm,
             send_depth: 128,
             recv_depth: 512,
             max_send_sge: 1,
@@ -273,9 +256,7 @@ pub(crate) struct UrmaJetty {
     local_jetty_id: u32,
     local_jfr_id: u32,
     token: u32,
-    transport_mode: TransportMode,
-    imported: bool,
-    bound: bool,
+    target: Option<ffi::TargetHandle>,
 }
 
 impl UrmaJetty {
@@ -303,9 +284,7 @@ impl UrmaJetty {
             local_jetty_id,
             local_jfr_id,
             token: config.token,
-            transport_mode: config.transport_mode,
-            imported: false,
-            bound: false,
+            target: None,
         })
     }
 
@@ -318,27 +297,22 @@ impl UrmaJetty {
     }
 
     fn import(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
-        if self.imported {
+        if self.target.is_some() {
             return Err(Error::Protocol("a remote Jetty is already imported".into()));
         }
-        self.handle
-            .import(&descriptor.to_ffi()?, self.token)
-            .map_err(|error| native_error("import_jetty", error))?;
-        self.imported = true;
+        self.target = Some(
+            self.handle
+                .import_target(&descriptor.to_ffi()?, self.token)
+                .map_err(|error| native_error("import_jetty", error))?,
+        );
         Ok(())
     }
 
     fn connect_remote(&mut self) -> Result<()> {
-        if !self.imported {
+        if self.target.is_none() {
             return Err(Error::Protocol(
                 "connecting a remote Jetty requires an imported target".into(),
             ));
-        }
-        if self.transport_mode.requires_bind() {
-            self.handle
-                .bind()
-                .map_err(|error| native_error("bind_jetty", error))?;
-            self.bound = true;
         }
         Ok(())
     }
@@ -353,6 +327,14 @@ impl UrmaJetty {
         (self.local_jetty_id, self.local_jfr_id)
     }
 
+    fn remote_id(&self) -> Result<ffi::RemoteJettyId> {
+        self.target
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?
+            .remote_id()
+            .map_err(|error| native_error("query_remote_jetty_id", error))
+    }
+
     fn post_send_imm(
         &mut self,
         segment: &ffi::SegmentHandle,
@@ -361,8 +343,12 @@ impl UrmaJetty {
         user_ctx: u64,
         imm_data: u64,
     ) -> Result<ffi::WrHandle> {
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?;
         self.handle
-            .post_send_imm(segment, offset, length, user_ctx, imm_data)
+            .post_send_imm(target, segment, offset, length, user_ctx, imm_data)
             .map_err(|error| native_error("post_jetty_send_imm_wr", error))
     }
 
@@ -398,8 +384,12 @@ impl UrmaJetty {
                 error: None,
             });
         }
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?;
         self.handle
-            .post_send_imm_list(segment, entries)
+            .post_send_imm_list(target, segment, entries)
             .map_err(|error| native_error("post_jetty_send_imm_wr_list", error))
     }
 
@@ -426,19 +416,13 @@ impl UrmaJetty {
 
     fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if self.bound {
-            match self.handle.unbind() {
-                Ok(()) => self.bound = false,
-                Err(error) => failures.push(native_error("unbind_jetty", error).to_string()),
-            }
-        }
-        if self.imported && !self.bound {
-            match self.handle.unimport() {
-                Ok(()) => self.imported = false,
+        if let Some(target) = self.target.as_mut() {
+            match target.close() {
+                Ok(()) => self.target = None,
                 Err(error) => failures.push(native_error("unimport_jetty", error).to_string()),
             }
         }
-        if !self.bound && !self.imported {
+        if self.target.is_none() {
             if let Err(error) = self.handle.close() {
                 failures.push(native_error("delete_jetty", error).to_string());
             }
@@ -457,7 +441,7 @@ impl Drop for UrmaJetty {
     }
 }
 
-/// Lifecycle of one peer-facing RC or RM Jetty.
+/// Lifecycle of one peer-facing RM Jetty.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaneState {
     JettyCreated,
@@ -513,6 +497,10 @@ impl UrmaLane {
         self.id
     }
 
+    pub(crate) fn generation(&self) -> u8 {
+        self.generation
+    }
+
     pub(crate) fn export_descriptor(&mut self) -> Result<JettyDescriptor> {
         if !matches!(
             self.state,
@@ -545,6 +533,10 @@ impl UrmaLane {
         self.jetty.connect_remote()?;
         self.state = LaneState::RemoteConnected;
         Ok(())
+    }
+
+    pub(crate) fn remote_id(&self) -> Result<ffi::RemoteJettyId> {
+        self.jetty.remote_id()
     }
 
     pub(crate) fn mark_ready(&mut self) -> Result<()> {

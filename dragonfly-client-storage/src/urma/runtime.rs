@@ -314,9 +314,14 @@ mod native {
             lane_id: u16,
             descriptor: &JettyDescriptor,
         ) -> Result<()> {
-            let lane = self.lane_mut(lane_id)?;
-            lane.connect_remote_descriptor(descriptor)?;
-            lane.mark_ready()
+            let (generation, remote_id) = {
+                let lane = self.lane_mut(lane_id)?;
+                lane.connect_remote_descriptor(descriptor)?;
+                lane.mark_ready()?;
+                (lane.generation(), lane.remote_id()?)
+            };
+            self.completions
+                .authorize_remote(lane_id, generation, remote_id)
         }
 
         pub(crate) fn post_receive_window_registered(
