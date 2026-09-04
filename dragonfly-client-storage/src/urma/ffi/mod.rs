@@ -19,6 +19,7 @@ pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {
     pub transport_type: i32,
+    pub transport_modes: u32,
     pub max_jfc: u32,
     pub max_jfs: u32,
     pub max_jfr: u32,
@@ -33,6 +34,7 @@ pub(crate) struct DeviceCapability {
 }
 
 pub(crate) struct JettyConfig {
+    pub transport_mode: u32,
     pub send_depth: u32,
     pub recv_depth: u32,
     pub max_send_sge: u32,
@@ -148,6 +150,7 @@ impl NativeRuntime {
         let raw = unsafe { raw.assume_init() };
         Ok(DeviceCapability {
             transport_type: raw.transport_type,
+            transport_modes: raw.transport_modes,
             max_jfc: raw.max_jfc,
             max_jfs: raw.max_jfs,
             max_jfr: raw.max_jfr,
@@ -338,6 +341,7 @@ impl JettyHandle {
             .raw
             .ok_or(FfiError::Contract("recv JFC is closed"))?;
         let raw_config = sys::dfurma_jetty_config_t {
+            transport_mode: config.transport_mode,
             send_depth: config.send_depth,
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,

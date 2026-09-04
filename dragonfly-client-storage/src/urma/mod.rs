@@ -20,6 +20,7 @@ pub(crate) mod session;
 pub(crate) use buffer::{RegisteredRxWindowLease, TxWindowLease};
 pub(crate) use error::native_error;
 pub use error::{Error, Result};
+pub use lane::TransportMode;
 
 /// PEER_SESSION_IDLE_TIMEOUT is how long the downloader keeps an unused persistent peer Session.
 /// The server adds one control-timeout grace period before closing its side, ensuring the client

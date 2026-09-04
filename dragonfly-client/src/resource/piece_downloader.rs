@@ -71,7 +71,7 @@ pub mod urma {
     use dragonfly_client_storage::client::urma::{discover, UrmaClient, UrmaStreamReader};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
-    use dragonfly_client_storage::urma::PEER_SESSION_IDLE_TIMEOUT;
+    use dragonfly_client_storage::urma::{TransportMode, PEER_SESSION_IDLE_TIMEOUT};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,16 +252,32 @@ pub mod urma {
                 urma_config.tx_registered_bytes.as_u64(),
             ) {
                 Ok(fabric) => {
+                    let transport_mode = match urma_config.transport_mode {
+                        dragonfly_client_config::dfdaemon::UrmaTransportMode::Rc => {
+                            TransportMode::Rc
+                        }
+                        dragonfly_client_config::dfdaemon::UrmaTransportMode::Rm => {
+                            TransportMode::Rm
+                        }
+                    };
+                    if !fabric.supports_transport_mode(transport_mode) {
+                        *state = FabricState::Failed(Instant::now());
+                        return Err(Error::Unsupported(format!(
+                            "URMA device does not advertise {transport_mode:?} mode"
+                        )));
+                    }
                     dragonfly_client_metric::collect_urma_registered_bytes_metrics(
                         fabric.tx_registered_bytes(),
                         fabric.rx_registered_bytes(),
                     );
                     let capability = UrmaCapability {
                         transport_type: fabric.transport_type(),
+                        transport_mode,
                         fabric_tag: fabric_tag.to_string(),
                         max_message_size: fabric.max_message_size(),
                     };
                     info!(
+                        transport_mode = ?transport_mode,
                         registered_bytes = fabric.registered_bytes(),
                         tx_registered_bytes = fabric.tx_registered_bytes(),
                         rx_registered_bytes = fabric.rx_registered_bytes(),

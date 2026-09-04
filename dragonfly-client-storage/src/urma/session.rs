@@ -434,7 +434,7 @@ impl Drop for ClientLane {
     }
 }
 
-/// Downloader-side handle to one persistent control connection and Jetty.
+/// Downloader-side handle to one persistent control connection and RC/RM Jetty.
 /// Piece-local state lives in [`UrmaClientTransfer`], so this handle can be
 /// shared by concurrent downloads to the same parent.
 pub(crate) struct UrmaClientSession<S> {
@@ -488,14 +488,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                     Frame::Connected(connected) => connected,
                     frame => return Err(unexpected(frame, "lane connect")),
                 };
-            fabric.bind_lane(lane_id, connected.server_descriptor).await
+            fabric
+                .connect_lane(lane_id, connected.server_descriptor)
+                .await
         }
         .await;
         if let Err(error) = handshake {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
-        info!(role = "client", lane_id, "urma peer lane established");
+        info!(
+            role = "client",
+            lane_id,
+            transport_mode = ?lane_config.transport_mode,
+            "urma peer lane established"
+        );
         Ok(Self {
             lane: Arc::new(ClientLane {
                 control: LaneControl::spawn(stream, max_concurrent_transfers)?,
@@ -1034,7 +1041,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
         }
         let (lane_id, server_descriptor) = fabric.create_lane(lane_config).await?;
         let handshake = async {
-            fabric.bind_lane(lane_id, connect.client_descriptor).await?;
+            fabric
+                .connect_lane(lane_id, connect.client_descriptor)
+                .await?;
             write_control(
                 &mut stream,
                 &Frame::Connected(LaneConnected { server_descriptor }),
@@ -1048,7 +1057,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
-        info!(role = "server", lane_id, "urma peer lane established");
+        info!(
+            role = "server",
+            lane_id,
+            transport_mode = ?lane_config.transport_mode,
+            "urma peer lane established"
+        );
         Ok(Self {
             lane: Arc::new(ServerLane {
                 control: LaneControl::spawn(stream, max_concurrent_transfers)?,

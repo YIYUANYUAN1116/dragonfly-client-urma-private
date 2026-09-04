@@ -62,6 +62,7 @@ fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UrmaDeviceCapability {
     pub(crate) transport_type: i32,
+    pub(crate) transport_modes: u32,
     pub(crate) max_jfc: u32,
     pub(crate) max_jfs: u32,
     pub(crate) max_jfr: u32,
@@ -308,13 +309,13 @@ mod native {
             Ok((lane_id, descriptor))
         }
 
-        pub(crate) fn bind_lane(
+        pub(crate) fn connect_lane(
             &mut self,
             lane_id: u16,
             descriptor: &JettyDescriptor,
         ) -> Result<()> {
             let lane = self.lane_mut(lane_id)?;
-            lane.import_and_bind(descriptor)?;
+            lane.connect_remote_descriptor(descriptor)?;
             lane.mark_ready()
         }
 
@@ -434,6 +435,10 @@ mod native {
 
         pub(crate) fn transport_type(&self) -> u32 {
             u32::try_from(self.capability.transport_type).unwrap_or(0)
+        }
+
+        pub(crate) fn transport_modes(&self) -> u32 {
+            self.capability.transport_modes
         }
 
         pub(crate) fn max_message_size(&self) -> u64 {
@@ -603,6 +608,12 @@ mod native {
                 "device does not advertise the resources required by a duplex Jetty".into(),
             ));
         }
+        if capability.transport_modes & config.transport_mode as u32 == 0 {
+            return Err(Error::InvalidConfiguration(format!(
+                "device does not advertise URMA {:?} transport mode",
+                config.transport_mode
+            )));
+        }
         for (name, value, maximum) in [
             ("send_depth", config.send_depth, capability.max_jfs_depth),
             ("recv_depth", config.recv_depth, capability.max_jfr_depth),
@@ -617,7 +628,7 @@ mod native {
         }
         if capability.max_jfs_rsge == 0 {
             return Err(Error::InvalidConfiguration(
-                "device does not advertise an RC remote-SGE capability".into(),
+                "device does not advertise a remote-SGE capability".into(),
             ));
         }
         if config.post_list_size == 0 || config.post_list_size > ffi::MAX_POST_LIST {
@@ -677,6 +688,7 @@ mod native {
     fn from_ffi_capability(raw: ffi::DeviceCapability) -> UrmaDeviceCapability {
         UrmaDeviceCapability {
             transport_type: raw.transport_type,
+            transport_modes: raw.transport_modes,
             max_jfc: raw.max_jfc,
             max_jfs: raw.max_jfs,
             max_jfr: raw.max_jfr,

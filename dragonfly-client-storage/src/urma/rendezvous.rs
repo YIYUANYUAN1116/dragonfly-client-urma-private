@@ -1,9 +1,10 @@
 //! URMA control-plane wire contract built on the shared Piece rendezvous schema.
 //!
-//! TCP carries reliable control frames; only chunk bytes use the bound RC
-//! Jetty. The sender may not post a SEND until a validated `RecvPosted` window
-//! has granted matching remote receive credits.
+//! TCP carries reliable control frames; only chunk bytes use the negotiated
+//! RC or RM Jetty. The sender may not post a SEND until a validated
+//! `RecvPosted` window has granted matching remote receive credits.
 
+use super::lane::TransportMode;
 use crate::rendezvous::{
     put_bytes, read_envelope, write_envelope, PayloadReader, MAX_PAYLOAD_LENGTH, MAX_STRING_LENGTH,
 };
@@ -19,7 +20,8 @@ pub(crate) const MAGIC: u32 = 0x4446_5552;
 // Version 2 scopes every Piece control frame to a logical transfer. This is
 // the wire prerequisite for multiplexing several Pieces over one peer lane;
 // version 1 implicitly allowed only one active Piece per lane.
-pub(crate) const VERSION: u8 = 2;
+// Version 3 adds the explicitly negotiated RC/RM transport mode.
+pub(crate) const VERSION: u8 = 3;
 const MAX_DESCRIPTOR_LENGTH: usize = 64 * 1024;
 
 pub(crate) type TransferId = u32;
@@ -28,6 +30,7 @@ pub(crate) const SESSION_TRANSFER_ID: TransferId = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrmaCapability {
     pub transport_type: u32,
+    pub transport_mode: TransportMode,
     pub fabric_tag: String,
     pub max_message_size: u64,
 }
@@ -38,6 +41,12 @@ impl UrmaCapability {
             return Err(format!(
                 "URMA transport mismatch: local {}, remote {}",
                 self.transport_type, remote.transport_type
+            ));
+        }
+        if self.transport_mode != remote.transport_mode {
+            return Err(format!(
+                "URMA mode mismatch: local {:?}, remote {:?}",
+                self.transport_mode, remote.transport_mode
             ));
         }
         if self.fabric_tag.is_empty() || remote.fabric_tag.is_empty() {
@@ -57,6 +66,7 @@ impl UrmaCapability {
 
     fn encode(&self, payload: &mut Vec<u8>) {
         payload.extend_from_slice(&self.transport_type.to_be_bytes());
+        payload.push(self.transport_mode.wire_value());
         put_bytes(payload, self.fabric_tag.as_bytes());
         payload.extend_from_slice(&self.max_message_size.to_be_bytes());
     }
@@ -64,6 +74,7 @@ impl UrmaCapability {
     fn decode(reader: &mut PayloadReader<'_>) -> Result<Self> {
         Ok(Self {
             transport_type: reader.u32()?,
+            transport_mode: TransportMode::from_wire(reader.u8()?).map_err(Error::Unknown)?,
             fabric_tag: reader.string(MAX_STRING_LENGTH)?,
             max_message_size: reader.u64()?,
         })
@@ -282,6 +293,7 @@ mod tests {
     fn capability() -> UrmaCapability {
         UrmaCapability {
             transport_type: 3,
+            transport_mode: TransportMode::Rc,
             fabric_tag: "rack-a".into(),
             max_message_size: 64 * 1024,
         }
@@ -422,5 +434,16 @@ mod tests {
         let mut remote = local.clone();
         remote.fabric_tag = "rack-b".into();
         assert!(local.compatible(&remote).is_err());
+
+        let mut remote = local.clone();
+        remote.transport_mode = TransportMode::Rm;
+        assert!(local.compatible(&remote).is_err());
+    }
+
+    #[test]
+    fn transport_mode_wire_values_match_umdks_public_api() {
+        assert_eq!(TransportMode::from_wire(1).unwrap(), TransportMode::Rm);
+        assert_eq!(TransportMode::from_wire(2).unwrap(), TransportMode::Rc);
+        assert!(TransportMode::from_wire(0).is_err());
     }
 }

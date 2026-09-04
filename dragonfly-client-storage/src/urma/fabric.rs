@@ -12,7 +12,7 @@ use super::{
         RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
         RegisteredTxCompletionTx,
     },
-    lane::{JettyConfig, JettyDescriptor},
+    lane::{JettyConfig, JettyDescriptor, TransportMode},
     runtime::{RuntimeConfig, UrmaRuntime},
     Error, Result,
 };
@@ -83,6 +83,7 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
 /// the owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UrmaLaneConfig {
+    pub(crate) transport_mode: TransportMode,
     pub send_depth: u32,
     pub recv_depth: u32,
     pub max_send_sge: u32,
@@ -95,6 +96,7 @@ pub(crate) struct UrmaLaneConfig {
 impl Default for UrmaLaneConfig {
     fn default() -> Self {
         Self {
+            transport_mode: TransportMode::Rc,
             send_depth: 128,
             recv_depth: 512,
             max_send_sge: 1,
@@ -109,6 +111,7 @@ impl Default for UrmaLaneConfig {
 impl From<UrmaLaneConfig> for JettyConfig {
     fn from(config: UrmaLaneConfig) -> Self {
         Self {
+            transport_mode: config.transport_mode,
             send_depth: config.send_depth,
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,
@@ -222,23 +225,28 @@ impl UrmaFabric {
             })?;
 
         match startup_rx.recv() {
-            Ok(Ok((transport_type, max_message_size, max_jfr_depth, max_jfs_depth))) => {
-                Ok(UrmaFabricHandle {
-                    inner: Arc::new(FabricInner {
-                        command_tx: Mutex::new(Some(command_tx)),
-                        command_slots,
-                        readiness: readiness_rx,
-                        runtime_config,
-                        transport_type,
-                        max_message_size,
-                        max_jfr_depth,
-                        max_jfs_depth,
-                        required_rx_waiters: RequiredRxWaiters::default(),
-                        shutdown: AsyncMutex::new(()),
-                        join: Mutex::new(Some(join)),
-                    }),
-                })
-            }
+            Ok(Ok((
+                transport_type,
+                transport_modes,
+                max_message_size,
+                max_jfr_depth,
+                max_jfs_depth,
+            ))) => Ok(UrmaFabricHandle {
+                inner: Arc::new(FabricInner {
+                    command_tx: Mutex::new(Some(command_tx)),
+                    command_slots,
+                    readiness: readiness_rx,
+                    runtime_config,
+                    transport_type,
+                    transport_modes,
+                    max_message_size,
+                    max_jfr_depth,
+                    max_jfs_depth,
+                    required_rx_waiters: RequiredRxWaiters::default(),
+                    shutdown: AsyncMutex::new(()),
+                    join: Mutex::new(Some(join)),
+                }),
+            }),
             Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error)
@@ -315,6 +323,11 @@ impl UrmaFabricHandle {
         self.inner.transport_type
     }
 
+    /// Reports whether the provider advertised the selected transport mode.
+    pub fn supports_transport_mode(&self, mode: TransportMode) -> bool {
+        self.inner.transport_modes & mode as u32 != 0
+    }
+
     /// max_message_size returns the effective single-message payload limit: the
     /// smaller of the device capability and one registered buffer slot.
     pub fn max_message_size(&self) -> u64 {
@@ -379,8 +392,8 @@ impl UrmaFabricHandle {
     }
 
     /// Imports the peer descriptor and transitions the lane to Ready.
-    pub(crate) async fn bind_lane(&self, lane_id: u16, descriptor: Vec<u8>) -> Result<()> {
-        self.submit(|reply| FabricCommand::BindLane {
+    pub(crate) async fn connect_lane(&self, lane_id: u16, descriptor: Vec<u8>) -> Result<()> {
+        self.submit(|reply| FabricCommand::ConnectLane {
             lane_id,
             descriptor,
             reply,
@@ -665,6 +678,7 @@ struct FabricInner {
     readiness: watch::Receiver<FabricReadiness>,
     runtime_config: RuntimeConfig,
     transport_type: u32,
+    transport_modes: u32,
     max_message_size: u64,
     max_jfr_depth: u32,
     max_jfs_depth: u32,
@@ -692,7 +706,7 @@ enum FabricCommand {
         config: UrmaLaneConfig,
         reply: oneshot::Sender<Result<(u16, Vec<u8>)>>,
     },
-    BindLane {
+    ConnectLane {
         lane_id: u16,
         descriptor: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
@@ -776,7 +790,7 @@ fn run_owner(
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
-    startup_tx: std_mpsc::SyncSender<Result<(u32, u64, u32, u32)>>,
+    startup_tx: std_mpsc::SyncSender<Result<(u32, u32, u64, u32, u32)>>,
 ) {
     let recycle_notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
         let _ = recycle_command_tx.send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
@@ -794,6 +808,7 @@ fn run_owner(
 
     let probe = (
         runtime.transport_type(),
+        runtime.transport_modes(),
         runtime.max_message_size(),
         runtime.max_jfr_depth(),
         runtime.max_jfs_depth(),
@@ -885,14 +900,14 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
-        FabricCommand::BindLane {
+        FabricCommand::ConnectLane {
             lane_id,
             descriptor,
             reply,
         } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
                 let descriptor = JettyDescriptor::deserialize(&descriptor)?;
-                runtime.bind_lane(lane_id, &descriptor)
+                runtime.connect_lane(lane_id, &descriptor)
             });
             let _ = reply.send(result);
             OwnerControl::Continue
@@ -1118,6 +1133,7 @@ mod tests {
     #[test]
     fn lane_config_maps_to_native_jetty_config() {
         let config = UrmaLaneConfig {
+            transport_mode: TransportMode::Rm,
             send_depth: 1,
             recv_depth: 2,
             max_send_sge: 3,
@@ -1127,6 +1143,7 @@ mod tests {
             token: 6,
         };
         let native: JettyConfig = config.into();
+        assert_eq!(native.transport_mode, TransportMode::Rm);
         assert_eq!(native.send_depth, 1);
         assert_eq!(native.recv_depth, 2);
         assert_eq!(native.post_list_size, 5);

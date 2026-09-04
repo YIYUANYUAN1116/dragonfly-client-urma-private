@@ -9,6 +9,43 @@ use super::{
     Error, Result,
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TransportMode {
+    Rm = 1,
+    #[default]
+    Rc = 2,
+}
+
+impl TransportMode {
+    pub(crate) fn wire_value(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_wire(value: u8) -> std::result::Result<Self, String> {
+        match value {
+            1 => Ok(Self::Rm),
+            2 => Ok(Self::Rc),
+            _ => Err(format!("invalid URMA transport mode {value}")),
+        }
+    }
+
+    fn requires_bind(self) -> bool {
+        self == Self::Rc
+    }
+}
+
+#[cfg(test)]
+mod transport_mode_tests {
+    use super::TransportMode;
+
+    #[test]
+    fn only_rc_requires_explicit_bind() {
+        assert!(TransportMode::Rc.requires_bind());
+        assert!(!TransportMode::Rm.requires_bind());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub(crate) enum OperationType {
@@ -203,8 +240,9 @@ impl JettyDescriptor {
     }
 }
 
-/// RC Jetty sizing and import token used when a lane is created.
+/// Jetty sizing, transport mode, and import token used when a lane is created.
 pub(crate) struct JettyConfig {
+    pub(crate) transport_mode: TransportMode,
     pub(crate) send_depth: u32,
     pub(crate) recv_depth: u32,
     pub(crate) max_send_sge: u32,
@@ -217,6 +255,7 @@ pub(crate) struct JettyConfig {
 impl Default for JettyConfig {
     fn default() -> Self {
         Self {
+            transport_mode: TransportMode::Rc,
             send_depth: 128,
             recv_depth: 512,
             max_send_sge: 1,
@@ -234,6 +273,7 @@ pub(crate) struct UrmaJetty {
     local_jetty_id: u32,
     local_jfr_id: u32,
     token: u32,
+    transport_mode: TransportMode,
     imported: bool,
     bound: bool,
 }
@@ -246,6 +286,7 @@ impl UrmaJetty {
         config: &JettyConfig,
     ) -> Result<Self> {
         let ffi_config = ffi::JettyConfig {
+            transport_mode: config.transport_mode as u32,
             send_depth: config.send_depth,
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,
@@ -262,6 +303,7 @@ impl UrmaJetty {
             local_jetty_id,
             local_jfr_id,
             token: config.token,
+            transport_mode: config.transport_mode,
             imported: false,
             bound: false,
         })
@@ -286,14 +328,18 @@ impl UrmaJetty {
         Ok(())
     }
 
-    fn bind(&mut self) -> Result<()> {
+    fn connect_remote(&mut self) -> Result<()> {
         if !self.imported {
-            return Err(Error::Protocol("bind requires an imported Jetty".into()));
+            return Err(Error::Protocol(
+                "connecting a remote Jetty requires an imported target".into(),
+            ));
         }
-        self.handle
-            .bind()
-            .map_err(|error| native_error("bind_jetty", error))?;
-        self.bound = true;
+        if self.transport_mode.requires_bind() {
+            self.handle
+                .bind()
+                .map_err(|error| native_error("bind_jetty", error))?;
+            self.bound = true;
+        }
         Ok(())
     }
 
@@ -411,12 +457,12 @@ impl Drop for UrmaJetty {
     }
 }
 
-/// Lifecycle of one peer-facing RC Jetty.
+/// Lifecycle of one peer-facing RC or RM Jetty.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaneState {
     JettyCreated,
     DescriptorExchanged,
-    Bound,
+    RemoteConnected,
     Ready,
     Draining,
     Failed,
@@ -479,7 +525,7 @@ impl UrmaLane {
         Ok(descriptor)
     }
 
-    pub(crate) fn import_and_bind(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
+    pub(crate) fn connect_remote_descriptor(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
         if !matches!(
             self.state,
             LaneState::JettyCreated | LaneState::DescriptorExchanged
@@ -496,13 +542,13 @@ impl UrmaLane {
         }
         self.state = LaneState::DescriptorExchanged;
         self.jetty.import(descriptor)?;
-        self.jetty.bind()?;
-        self.state = LaneState::Bound;
+        self.jetty.connect_remote()?;
+        self.state = LaneState::RemoteConnected;
         Ok(())
     }
 
     pub(crate) fn mark_ready(&mut self) -> Result<()> {
-        self.require(LaneState::Bound)?;
+        self.require(LaneState::RemoteConnected)?;
         self.state = LaneState::Ready;
         Ok(())
     }
@@ -519,7 +565,7 @@ impl UrmaLane {
         sequences: Vec<u64>,
         completion_txs: Vec<RegisteredRxCompletionTx>,
     ) -> Result<()> {
-        if !matches!(self.state, LaneState::Bound | LaneState::Ready) {
+        if !matches!(self.state, LaneState::RemoteConnected | LaneState::Ready) {
             return Err(self.state_error("post registered receive window"));
         }
         if sequences.is_empty() || sequences.len() != completion_txs.len() {

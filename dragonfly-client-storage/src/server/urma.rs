@@ -26,6 +26,7 @@ use crate::urma::rendezvous::{
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
+use crate::urma::TransportMode;
 use crate::urma::TxWindowLease;
 use crate::Storage;
 use dragonfly_client_config::dfdaemon::Config;
@@ -322,12 +323,23 @@ impl UrmaServer {
             urma_config.tx_registered_bytes.as_u64(),
         )
         .map_err(client_error)?;
+        let transport_mode = match urma_config.transport_mode {
+            dragonfly_client_config::dfdaemon::UrmaTransportMode::Rc => TransportMode::Rc,
+            dragonfly_client_config::dfdaemon::UrmaTransportMode::Rm => TransportMode::Rm,
+        };
+        if !fabric.supports_transport_mode(transport_mode) {
+            return Err(ClientError::Unsupported(format!(
+                "URMA device does not advertise {transport_mode:?} mode"
+            )));
+        }
         let capability = UrmaCapability {
             transport_type: fabric.transport_type(),
+            transport_mode,
             fabric_tag: fabric_tag.to_string(),
             max_message_size: fabric.max_message_size(),
         };
         info!(
+            transport_mode = ?transport_mode,
             registered_bytes = fabric.registered_bytes(),
             tx_registered_bytes = fabric.tx_registered_bytes(),
             rx_registered_bytes = fabric.rx_registered_bytes(),
@@ -346,6 +358,7 @@ impl UrmaServer {
             fabric.max_native_send_depth(),
         );
         let lane_config = UrmaLaneConfig {
+            transport_mode: capability.transport_mode,
             send_depth: depths.lane_depth,
             recv_depth: urma_config.max_inflight_chunks,
             post_list_size: urma_config.post_list_size,

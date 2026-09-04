@@ -404,9 +404,9 @@ fn urma_error(error: UrmaError) -> ClientError {
 
 /// UrmaClient downloads pieces over UMDK/URMA: control frames ride a TCP
 /// rendezvous connection to the parent's URMA port, bulk bytes arrive over a
-/// bound RC Jetty as copy-received windows. Each error must let the caller fall
-/// back to the TCP piece transport; URMA never has to succeed for a piece to
-/// complete.
+/// negotiated RC/RM Jetty as copy-received windows. Each error must let the
+/// caller fall back to the TCP piece transport; URMA never has to succeed for
+/// a piece to complete.
 #[derive(Clone)]
 pub struct UrmaClient {
     /// config is the configuration of the dfdaemon.
@@ -437,8 +437,8 @@ pub struct UrmaClient {
     /// transfer_timeout bounds each posted receive window's completion wait.
     transfer_timeout: Duration,
 
-    /// session owns the persistent control connection and RC lane shared by
-    /// bounded concurrent Piece transfers to this parent.
+    /// session owns the persistent control connection and negotiated lane
+    /// shared by bounded concurrent Piece transfers to this parent.
     session: SessionSlot,
 
     /// Completed outcomes are aggregated because several Piece streams may be
@@ -469,6 +469,7 @@ impl UrmaClient {
             fabric.max_native_receive_depth(),
         );
         let mut lane_config = UrmaLaneConfig::default();
+        lane_config.transport_mode = capability.transport_mode;
         lane_config.recv_depth = depths.lane_depth;
         lane_config.post_list_size = config.storage.server.urma.post_list_size;
         lane_config.pipeline_depth = config.storage.server.urma.pipeline_depth;

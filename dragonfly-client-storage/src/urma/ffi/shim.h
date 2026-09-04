@@ -32,6 +32,7 @@ typedef struct dfurma_wr dfurma_wr_t;
 /* Rust-owned capability DTO. No pointer in this object belongs to liburma. */
 typedef struct dfurma_device_capability {
     int32_t transport_type;
+    uint32_t transport_modes;
     uint32_t max_jfc;
     uint32_t max_jfs;
     uint32_t max_jfr;
@@ -46,6 +47,7 @@ typedef struct dfurma_device_capability {
 } dfurma_device_capability_t;
 
 typedef struct dfurma_jetty_config {
+    uint32_t transport_mode;
     uint32_t send_depth;
     uint32_t recv_depth;
     uint32_t max_send_sge;
@@ -124,7 +126,7 @@ int dfurma_segment_delete(dfurma_segment_t *segment);
 int dfurma_segment_data(dfurma_segment_t *segment, uint8_t **data,
                         uint64_t *length);
 
-/* Creates one RC duplex Jetty backed by an owned shared JFR. */
+/* Creates one RC or RM duplex Jetty backed by an owned shared JFR. */
 int dfurma_jetty_create(dfurma_runtime_t *runtime,
                         dfurma_jfc_t *send_jfc,
                         dfurma_jfc_t *recv_jfc,

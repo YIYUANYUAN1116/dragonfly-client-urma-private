@@ -58,6 +58,7 @@ struct dfurma_jetty {
     urma_jfr_t *jfr;
     urma_jetty_t *jetty;
     urma_target_jetty_t *target;
+    urma_transport_mode_t transport_mode;
     int bound;
     int jetty_error;
     int jfr_error;
@@ -179,6 +180,7 @@ int dfurma_runtime_query_device(dfurma_runtime_t *runtime,
 
     (void)memset(out, 0, sizeof(*out));
     out->transport_type = (int32_t)runtime->device->type;
+    out->transport_modes = attr.dev_cap.trans_mode;
     out->max_jfc = attr.dev_cap.max_jfc;
     out->max_jfs = attr.dev_cap.max_jfs;
     out->max_jfr = attr.dev_cap.max_jfr;
@@ -367,6 +369,8 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
         recv_jfc == NULL || config == NULL || out == NULL ||
         send_jfc->runtime != runtime || recv_jfc->runtime != runtime ||
         send_jfc->jfc == NULL || recv_jfc->jfc == NULL ||
+        (config->transport_mode != URMA_TM_RC &&
+         config->transport_mode != URMA_TM_RM) ||
         config->send_depth == 0 || config->recv_depth == 0 ||
         config->max_send_sge == 0 || config->max_send_sge > UINT8_MAX ||
         config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX) {
@@ -399,7 +403,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jfs_cfg.depth = config->send_depth;
-    jfs_cfg.trans_mode = URMA_TM_RC;
+    jfs_cfg.trans_mode = (urma_transport_mode_t)config->transport_mode;
     jfs_cfg.priority = rtp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
     jfs_cfg.max_rsge = 1;
@@ -411,7 +415,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     jfr_cfg.depth = config->recv_depth;
     jfr_cfg.flag.value = 0;
     jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    jfr_cfg.trans_mode = URMA_TM_RC;
+    jfr_cfg.trans_mode = (urma_transport_mode_t)config->transport_mode;
     jfr_cfg.max_sge = (uint8_t)config->max_recv_sge;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     jfr_cfg.jfc = recv_jfc->jfc;
@@ -444,6 +448,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jetty->runtime = runtime;
+    jetty->transport_mode = (urma_transport_mode_t)config->transport_mode;
     runtime->jetty_count++;
     *out = jetty;
     return 0;
@@ -559,7 +564,8 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
     }
     (void)memcpy(rjetty, opaque_data, opaque_len);
     if (rjetty->jetty_id.id != meta->jetty_id ||
-        rjetty->trans_mode != URMA_TM_RC || rjetty->type != URMA_JETTY) {
+        rjetty->trans_mode != jetty->transport_mode ||
+        rjetty->type != URMA_JETTY) {
         free(rjetty);
         return -EPROTO;
     }
@@ -581,6 +587,9 @@ int dfurma_jetty_bind(dfurma_jetty_t *jetty)
 
     if (jetty == NULL || jetty->jetty == NULL || jetty->target == NULL) {
         return -EINVAL;
+    }
+    if (jetty->transport_mode != URMA_TM_RC) {
+        return -EPERM;
     }
     if (jetty->bound != 0) {
         return 0;
