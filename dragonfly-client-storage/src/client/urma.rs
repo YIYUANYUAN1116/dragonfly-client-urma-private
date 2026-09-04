@@ -70,6 +70,13 @@ impl TransferOutcomes {
 /// enabled, so a production `urma` build cannot be faulted through its environment.
 const FAIL_AFTER_RECV_WINDOWS_ENV: &str = "DF_URMA_FAIL_AFTER_RECV_WINDOWS";
 
+/// Validation-only profile which drains registered RX windows without CRC32 or
+/// file writes. It is unavailable in production `urma` builds.
+#[cfg(feature = "urma-test-failpoints")]
+const PERFORMANCE_PROFILE_ENV: &str = "DF_URMA_PERFORMANCE_PROFILE";
+#[cfg(feature = "urma-test-failpoints")]
+const TRANSPORT_ONLY_PROFILE: &str = "transport-only";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReceiveDepths {
     window_chunks: u32,
@@ -119,6 +126,30 @@ fn fail_after_recv_windows() -> Option<u64> {
     #[cfg(not(feature = "urma-test-failpoints"))]
     {
         None
+    }
+}
+
+/// Reports whether the validation binary should measure only the URMA
+/// transport/lease path. The caller must still validate window identities,
+/// lengths, Done, and recycle every registered lease.
+pub(crate) fn transport_only_profile_enabled() -> bool {
+    #[cfg(feature = "urma-test-failpoints")]
+    {
+        match std::env::var(PERFORMANCE_PROFILE_ENV) {
+            Ok(value) if value == TRANSPORT_ONLY_PROFILE => true,
+            Ok(value) => {
+                warn!(
+                    env = PERFORMANCE_PROFILE_ENV,
+                    value, "ignoring unknown URMA performance profile"
+                );
+                false
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(feature = "urma-test-failpoints"))]
+    {
+        false
     }
 }
 

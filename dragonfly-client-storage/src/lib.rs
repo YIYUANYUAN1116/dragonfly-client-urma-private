@@ -928,6 +928,21 @@ impl Storage {
         reader: &mut crate::client::urma::UrmaStreamReader,
         timeout: Duration,
     ) -> Result<metadata::Piece> {
+        #[cfg(feature = "urma-test-failpoints")]
+        if crate::client::urma::transport_only_profile_enabled() {
+            return self
+                .download_piece_from_parent_finished_urma_transport_only(
+                    piece_id,
+                    offset,
+                    length,
+                    expected_digest,
+                    parent_id,
+                    reader,
+                    timeout,
+                )
+                .await;
+        }
+
         let finish_total_start = Instant::now();
         let write_start = Instant::now();
         let response = self
@@ -947,6 +962,82 @@ impl Storage {
             metadata_commit_notify_ns,
             finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
             "finished committing urma piece to storage"
+        );
+        Ok(piece)
+    }
+
+    /// Validation-only transport profile. It keeps the complete URMA receive
+    /// protocol, SEND_IMM routing, CQE validation, length/Done gates, and lease
+    /// recycling, but deliberately skips CRC32 and pwrite so a benchmark can
+    /// isolate transport headroom. The resulting run-scoped task file is not
+    /// valid content and must never be used for an integrity assertion.
+    #[cfg(feature = "urma-test-failpoints")]
+    #[allow(clippy::too_many_arguments)]
+    async fn download_piece_from_parent_finished_urma_transport_only(
+        &self,
+        piece_id: &str,
+        offset: u64,
+        expected_length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        reader: &mut crate::client::urma::UrmaStreamReader,
+        window_timeout: Duration,
+    ) -> Result<metadata::Piece> {
+        let started = Instant::now();
+        let digest = expected_digest
+            .parse::<Digest>()
+            .map_err(|error| Error::Unknown(format!("invalid URMA benchmark digest: {error}")))?;
+        if digest.algorithm() != Algorithm::Crc32 {
+            return Err(Error::Unknown(
+                "URMA transport-only profile requires a crc32 Piece digest".into(),
+            ));
+        }
+
+        let mut length = 0u64;
+        let mut windows = 0u64;
+        let mut recycle_ns = 0u64;
+        loop {
+            let window = tokio::time::timeout(window_timeout, reader.next_window())
+                .await
+                .map_err(|_| Error::DownloadPieceFinishedTimeout(piece_id.to_string()))??;
+            let Some(window) = window else {
+                break;
+            };
+            let window_length = u64::try_from(window.len())
+                .map_err(|_| Error::Unknown("URMA window length exceeds u64".into()))?;
+            length = length
+                .checked_add(window_length)
+                .ok_or_else(|| Error::Unknown("URMA transport-only length overflow".into()))?;
+            if length > expected_length {
+                return Err(Error::Unknown(format!(
+                    "urma transport-only stream exceeded expected length {expected_length}"
+                )));
+            }
+            windows += 1;
+            let recycle_start = Instant::now();
+            window.recycle().await?;
+            recycle_ns += recycle_start.elapsed().as_nanos() as u64;
+        }
+        if length != expected_length {
+            return Err(Error::Unknown(format!(
+                "expected length {expected_length} but got {length}"
+            )));
+        }
+
+        let response = io::WriteRangeResponse {
+            length,
+            hash: digest.encoded().to_string(),
+        };
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        debug!(
+            piece_id,
+            expected_length,
+            windows,
+            recycle_ns,
+            transport_only_ns = started.elapsed().as_nanos() as u64,
+            "finished URMA transport-only validation Piece"
         );
         Ok(piece)
     }
