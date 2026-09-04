@@ -223,7 +223,9 @@ impl JettyDescriptor {
     }
 }
 
-/// Jetty sizing, transport mode, and import token used when a lane is created.
+/// Jetty sizing, transport mode, and import token used when the shared RM
+/// endpoint is created.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JettyConfig {
     pub(crate) transport_mode: TransportMode,
     pub(crate) send_depth: u32,
@@ -250,13 +252,15 @@ impl Default for JettyConfig {
     }
 }
 
-/// Safe owner of a local Jetty and an optional imported/bound remote Jetty.
+/// Safe owner of the process-shared RM Jetty. The Jetty itself owns no
+/// remote targets: every peer imports its own `TargetHandle` into this Jetty,
+/// and SEND posts must name that target explicitly. This is the single
+/// native data-plane endpoint shared by every PeerTarget.
 pub(crate) struct UrmaJetty {
     handle: ffi::JettyHandle,
     local_jetty_id: u32,
     local_jfr_id: u32,
     token: u32,
-    target: Option<ffi::TargetHandle>,
 }
 
 impl UrmaJetty {
@@ -284,11 +288,10 @@ impl UrmaJetty {
             local_jetty_id,
             local_jfr_id,
             token: config.token,
-            target: None,
         })
     }
 
-    fn export_descriptor(&self) -> Result<JettyDescriptor> {
+    pub(crate) fn export_descriptor(&self) -> Result<JettyDescriptor> {
         let raw = self
             .handle
             .export_descriptor()
@@ -296,28 +299,18 @@ impl UrmaJetty {
         JettyDescriptor::from_ffi(raw)
     }
 
-    fn import(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
-        if self.target.is_some() {
-            return Err(Error::Protocol("a remote Jetty is already imported".into()));
-        }
-        self.target = Some(
-            self.handle
-                .import_target(&descriptor.to_ffi()?, self.token)
-                .map_err(|error| native_error("import_jetty", error))?,
-        );
-        Ok(())
+    /// Imports one remote Jetty identity as an independent target owned by
+    /// the caller (one `TargetHandle` per PeerTarget).
+    pub(crate) fn import_target(
+        &mut self,
+        descriptor: &JettyDescriptor,
+    ) -> Result<ffi::TargetHandle> {
+        self.handle
+            .import_target(&descriptor.to_ffi()?, self.token)
+            .map_err(|error| native_error("import_jetty", error))
     }
 
-    fn connect_remote(&mut self) -> Result<()> {
-        if self.target.is_none() {
-            return Err(Error::Protocol(
-                "connecting a remote Jetty requires an imported target".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn mark_error(&mut self) -> Result<()> {
+    pub(crate) fn mark_error(&mut self) -> Result<()> {
         self.handle
             .mark_error()
             .map_err(|error| native_error("modify_jetty_error", error))
@@ -327,26 +320,15 @@ impl UrmaJetty {
         (self.local_jetty_id, self.local_jfr_id)
     }
 
-    fn remote_id(&self) -> Result<ffi::RemoteJettyId> {
-        self.target
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?
-            .remote_id()
-            .map_err(|error| native_error("query_remote_jetty_id", error))
-    }
-
-    fn post_send_imm(
+    pub(crate) fn post_send_imm(
         &mut self,
+        target: &ffi::TargetHandle,
         segment: &ffi::SegmentHandle,
         offset: u64,
         length: u32,
         user_ctx: u64,
         imm_data: u64,
     ) -> Result<ffi::WrHandle> {
-        let target = self
-            .target
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?;
         self.handle
             .post_send_imm(target, segment, offset, length, user_ctx, imm_data)
             .map_err(|error| native_error("post_jetty_send_imm_wr", error))
@@ -364,8 +346,9 @@ impl UrmaJetty {
             .map_err(|error| native_error("post_jetty_recv_wr", error))
     }
 
-    fn post_send_batch(
+    pub(crate) fn post_send_batch(
         &mut self,
+        target: &ffi::TargetHandle,
         segment: &ffi::SegmentHandle,
         entries: &[ffi::PostEntry],
     ) -> Result<ffi::PostBatch> {
@@ -375,6 +358,7 @@ impl UrmaJetty {
             })?;
             return Ok(ffi::PostBatch {
                 handles: vec![self.post_send_imm(
+                    target,
                     segment,
                     entry.offset,
                     entry.length,
@@ -384,10 +368,6 @@ impl UrmaJetty {
                 error: None,
             });
         }
-        let target = self
-            .target
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?;
         self.handle
             .post_send_imm_list(target, segment, entries)
             .map_err(|error| native_error("post_jetty_send_imm_wr_list", error))
@@ -414,18 +394,10 @@ impl UrmaJetty {
             .map_err(|error| native_error("post_jetty_recv_wr_list", error))
     }
 
-    fn close(&mut self) -> Result<()> {
+    pub(crate) fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(target) = self.target.as_mut() {
-            match target.close() {
-                Ok(()) => self.target = None,
-                Err(error) => failures.push(native_error("unimport_jetty", error).to_string()),
-            }
-        }
-        if self.target.is_none() {
-            if let Err(error) = self.handle.close() {
-                failures.push(native_error("delete_jetty", error).to_string());
-            }
+        if let Err(error) = self.handle.close() {
+            failures.push(native_error("delete_jetty", error).to_string());
         }
         if failures.is_empty() {
             Ok(())
@@ -441,28 +413,25 @@ impl Drop for UrmaJetty {
     }
 }
 
-/// Lifecycle of one peer-facing RM Jetty.
+/// Lifecycle of one PeerTarget on the shared RM endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaneState {
-    JettyCreated,
-    DescriptorExchanged,
-    RemoteConnected,
+    Created,
     Ready,
     Draining,
     Failed,
     Closed,
 }
 
-/// An owned peer lane. Process-wide resources such as JFCs and registered
-/// memory remain in the fabric owner and are borrowed only for individual
-/// posts. This makes lanes storable beside those resources without a
-/// self-referential Runtime/Lane graph.
+/// An owned PeerTarget. The native Jetty/JFR live in the Runtime's shared
+/// endpoint and are borrowed only for individual posts; a PeerTarget owns
+/// only its imported target identity, logical credits, and lifecycle state.
 pub(crate) struct UrmaLane {
     id: u16,
     generation: u8,
     state: LaneState,
     capability: UrmaDeviceCapability,
-    jetty: UrmaJetty,
+    target: Option<ffi::TargetHandle>,
     credits: LaneCredits,
     post_list_size: usize,
     retirement_armed: bool,
@@ -473,7 +442,6 @@ impl UrmaLane {
         id: u16,
         generation: u8,
         capability: UrmaDeviceCapability,
-        jetty: UrmaJetty,
         post_list_size: u32,
     ) -> Result<Self> {
         if id == 0 || generation == 0 {
@@ -484,9 +452,9 @@ impl UrmaLane {
         Ok(Self {
             id,
             generation,
-            state: LaneState::JettyCreated,
+            state: LaneState::Created,
             capability,
-            jetty,
+            target: None,
             credits: LaneCredits::default(),
             post_list_size: post_list_size as usize,
             retirement_armed: false,
@@ -501,23 +469,14 @@ impl UrmaLane {
         self.generation
     }
 
-    pub(crate) fn export_descriptor(&mut self) -> Result<JettyDescriptor> {
-        if !matches!(
-            self.state,
-            LaneState::JettyCreated | LaneState::DescriptorExchanged
-        ) {
-            return Err(self.state_error("export descriptor"));
-        }
-        let descriptor = self.jetty.export_descriptor()?;
-        self.state = LaneState::DescriptorExchanged;
-        Ok(descriptor)
-    }
-
-    pub(crate) fn connect_remote_descriptor(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
-        if !matches!(
-            self.state,
-            LaneState::JettyCreated | LaneState::DescriptorExchanged
-        ) {
+    /// Imports the remote Jetty descriptor as this PeerTarget's own target on
+    /// the shared endpoint and moves the lane to Ready.
+    pub(crate) fn import_remote(
+        &mut self,
+        jetty: &mut UrmaJetty,
+        descriptor: &JettyDescriptor,
+    ) -> Result<()> {
+        if self.state != LaneState::Created {
             return Err(self.state_error("import descriptor"));
         }
         let local_transport = u32::try_from(self.capability.transport_type)
@@ -528,21 +487,17 @@ impl UrmaLane {
                 descriptor.transport_type, local_transport
             )));
         }
-        self.state = LaneState::DescriptorExchanged;
-        self.jetty.import(descriptor)?;
-        self.jetty.connect_remote()?;
-        self.state = LaneState::RemoteConnected;
+        self.target = Some(jetty.import_target(descriptor)?);
+        self.state = LaneState::Ready;
         Ok(())
     }
 
     pub(crate) fn remote_id(&self) -> Result<ffi::RemoteJettyId> {
-        self.jetty.remote_id()
-    }
-
-    pub(crate) fn mark_ready(&mut self) -> Result<()> {
-        self.require(LaneState::RemoteConnected)?;
-        self.state = LaneState::Ready;
-        Ok(())
+        self.target
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?
+            .remote_id()
+            .map_err(|error| native_error("query_remote_jetty_id", error))
     }
 
     pub(crate) fn grant_send_credit(&mut self, count: u32) -> Result<()> {
@@ -552,14 +507,13 @@ impl UrmaLane {
 
     pub(crate) fn post_receive_window_registered(
         &mut self,
+        jetty: &mut UrmaJetty,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
         sequences: Vec<u64>,
         completion_txs: Vec<RegisteredRxCompletionTx>,
     ) -> Result<()> {
-        if !matches!(self.state, LaneState::RemoteConnected | LaneState::Ready) {
-            return Err(self.state_error("post registered receive window"));
-        }
+        self.require(LaneState::Ready)?;
         if sequences.is_empty() || sequences.len() != completion_txs.len() {
             return Err(Error::InvalidConfiguration(
                 "registered RX window requires matching non-empty sequences and completions".into(),
@@ -611,7 +565,7 @@ impl UrmaLane {
                 )?;
                 return Err(error);
             }
-            let posted = match self.jetty.post_recv_batch(pool.segment_handle()?, &entries) {
+            let posted = match jetty.post_recv_batch(pool.segment_handle()?, &entries) {
                 Ok(posted) => posted,
                 Err(error) => {
                     for (slot, _, _) in &batch {
@@ -660,6 +614,7 @@ impl UrmaLane {
 
     pub(crate) fn send_registered_window(
         &mut self,
+        jetty: &mut UrmaJetty,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
         lease: TxWindowLease,
@@ -701,7 +656,13 @@ impl UrmaLane {
                 state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
-            let posted = match self.jetty.post_send_batch(pool.segment_handle()?, &entries) {
+            let posted = match jetty.post_send_batch(
+                self.target
+                    .as_ref()
+                    .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?,
+                pool.segment_handle()?,
+                &entries,
+            ) {
                 Ok(posted) => posted,
                 Err(error) => {
                     for ((slot, _, _), _) in &batch {
@@ -745,14 +706,14 @@ impl UrmaLane {
         if self.state == LaneState::Closed {
             return Ok(());
         }
+        // The shared endpoint must stay healthy for the other PeerTargets, so
+        // a single peer's retirement cannot call Jetty mark_error. Draining
+        // only converges once this target's outstanding WRs complete on their
+        // own; a peer that strands WRs requires the endpoint-level flush
+        // escalation in Runtime shutdown (per-target flush is pending RM0).
         self.state = LaneState::Draining;
-        self.jetty.mark_error()?;
         self.retirement_armed = true;
         Ok(())
-    }
-
-    pub(crate) fn local_ids(&self) -> (u32, u32) {
-        self.jetty.local_ids()
     }
 
     pub(crate) fn is_draining(&self) -> bool {
@@ -773,7 +734,17 @@ impl UrmaLane {
                 self.id
             )));
         }
-        match self.jetty.close() {
+        let result = match self.target.as_mut() {
+            Some(target) => match target.close() {
+                Ok(()) => {
+                    self.target = None;
+                    Ok(())
+                }
+                Err(error) => Err(native_error("unimport_jetty", error)),
+            },
+            None => Ok(()),
+        };
+        match result {
             Ok(()) => {
                 self.credits.clear();
                 self.state = LaneState::Closed;

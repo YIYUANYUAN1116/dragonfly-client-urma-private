@@ -142,7 +142,57 @@ mod native {
 
     static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    /// Process-level owner of the complete native resource tree.
+    /// The one process-shared RM data-plane endpoint (Jetty + JFR pair).
+    /// Created lazily before the first peer connects and reused by every
+    /// later PeerTarget: all peers import into this Jetty and share the same
+    /// local descriptor, so native Jetty/JFR resources stay O(1) per process.
+    struct SharedRmEndpoint {
+        jetty: UrmaJetty,
+        descriptor: JettyDescriptor,
+        config: JettyConfig,
+        effective_post_list_size: usize,
+    }
+
+    impl SharedRmEndpoint {
+        fn create(
+            native: &mut ffi::NativeRuntime,
+            send_jfc: &ffi::JfcHandle,
+            recv_jfc: &ffi::JfcHandle,
+            config: &JettyConfig,
+            max_post_list_size: u32,
+        ) -> Result<Self> {
+            let mut jetty = UrmaJetty::create(native, send_jfc, recv_jfc, config)?;
+            let descriptor = match jetty.export_descriptor() {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    // Roll the freshly created Jetty back so the process-wide
+                    // endpoint state stays all-or-nothing.
+                    let _ = jetty.close();
+                    return Err(error);
+                }
+            };
+            let effective_post_list_size = config
+                .post_list_size
+                .min(config.send_depth)
+                .min(config.recv_depth)
+                .min(max_post_list_size) as usize;
+            Ok(Self {
+                jetty,
+                descriptor,
+                config: *config,
+                effective_post_list_size,
+            })
+        }
+
+        /// Per-peer Jetty configuration must match the shared endpoint: RM
+        /// mode has exactly one Jetty, so a peer asking for different sizing
+        /// is a caller bug, not a reason to allocate a second endpoint.
+        fn matches_config(&self, config: &JettyConfig) -> bool {
+            &self.config == config
+        }
+    }
+
+    /// Safe owner of the complete native resource tree.
     pub(crate) struct UrmaRuntime {
         capability: UrmaDeviceCapability,
         max_payload_size: u64,
@@ -151,6 +201,7 @@ mod native {
         recv_jfc: Option<UrmaJfc>,
         send_jfc: Option<UrmaJfc>,
         native: Option<ffi::NativeRuntime>,
+        endpoint: Option<SharedRmEndpoint>,
         accepting: bool,
         poisoned: bool,
         next_lane_id: u16,
@@ -257,6 +308,7 @@ mod native {
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
                 native: Some(native),
+                endpoint: None,
                 accepting: true,
                 poisoned: false,
                 next_lane_id: 1,
@@ -283,30 +335,50 @@ mod native {
                 .checked_add(1)
                 .filter(|id| *id != 0)
                 .ok_or_else(|| Error::InvalidConfiguration("lane id space exhausted".into()))?;
-            let native = self
-                .native
-                .as_mut()
-                .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
-            let send_jfc = self
-                .send_jfc
+
+            if let Some(endpoint) = self.endpoint.as_ref() {
+                if !endpoint.matches_config(&config) {
+                    return Err(Error::InvalidConfiguration(
+                        "RM peers must share one endpoint: per-peer Jetty config differs from the already-created shared endpoint".into(),
+                    ));
+                }
+            } else {
+                // First peer: create the one process-shared RM endpoint.
+                let native = self
+                    .native
+                    .as_mut()
+                    .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
+                let send_jfc = self
+                    .send_jfc
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidConfiguration("send JFC is closed".into()))?;
+                let recv_jfc = self
+                    .recv_jfc
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
+                let endpoint = SharedRmEndpoint::create(
+                    native,
+                    send_jfc.handle(),
+                    recv_jfc.handle(),
+                    &config,
+                    self.max_post_list_size,
+                )?;
+                let (jetty_id, jfr_id) = endpoint.jetty.local_ids();
+                self.completions.register_endpoint(jetty_id, jfr_id)?;
+                self.endpoint = Some(endpoint);
+            }
+            let endpoint = self
+                .endpoint
                 .as_ref()
-                .ok_or_else(|| Error::InvalidConfiguration("send JFC is closed".into()))?;
-            let recv_jfc = self
-                .recv_jfc
-                .as_ref()
-                .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
-            let jetty = UrmaJetty::create(native, send_jfc.handle(), recv_jfc.handle(), &config)?;
-            let effective_post_list_size = config
-                .post_list_size
-                .min(config.send_depth)
-                .min(config.recv_depth)
-                .min(self.max_post_list_size);
-            let mut lane = UrmaLane::new(lane_id, 1, capability, jetty, effective_post_list_size)?;
-            let descriptor = lane.export_descriptor()?;
-            let (jetty_id, jfr_id) = lane.local_ids();
-            self.completions.register_lane(lane_id, jetty_id, jfr_id)?;
+                .expect("shared endpoint exists after create_lane");
+            let lane = UrmaLane::new(
+                lane_id,
+                1,
+                capability,
+                endpoint.effective_post_list_size as u32,
+            )?;
             self.lanes.insert(lane_id, lane);
-            Ok((lane_id, descriptor))
+            Ok((lane_id, endpoint.descriptor.clone()))
         }
 
         pub(crate) fn connect_lane(
@@ -314,12 +386,19 @@ mod native {
             lane_id: u16,
             descriptor: &JettyDescriptor,
         ) -> Result<()> {
-            let (generation, remote_id) = {
-                let lane = self.lane_mut(lane_id)?;
-                lane.connect_remote_descriptor(descriptor)?;
-                lane.mark_ready()?;
-                (lane.generation(), lane.remote_id()?)
-            };
+            // Split borrows: the endpoint Jetty and the lane map are distinct
+            // fields of Runtime.
+            let Self {
+                endpoint, lanes, ..
+            } = self;
+            let endpoint = endpoint
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
+            let lane = lanes
+                .get_mut(&lane_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?;
+            lane.import_remote(&mut endpoint.jetty, descriptor)?;
+            let (generation, remote_id) = (lane.generation(), lane.remote_id()?);
             self.completions
                 .authorize_remote(lane_id, generation, remote_id)
         }
@@ -330,17 +409,25 @@ mod native {
             sequences: Vec<u64>,
             completion_txs: Vec<RegisteredRxCompletionTx>,
         ) -> Result<()> {
-            let (lanes, pool, completions) = (
-                &mut self.lanes,
-                self.buffer_pool
-                    .as_mut()
-                    .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?,
-                &mut self.completions,
-            );
-            lanes
+            let pool = self
+                .buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?;
+            let completions = &mut self.completions;
+            let endpoint = self
+                .endpoint
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
+            self.lanes
                 .get_mut(&lane_id)
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .post_receive_window_registered(pool, completions, sequences, completion_txs)
+                .post_receive_window_registered(
+                    &mut endpoint.jetty,
+                    pool,
+                    completions,
+                    sequences,
+                    completion_txs,
+                )
         }
 
         pub(crate) fn grant_send_credit(&mut self, lane_id: u16, count: u32) -> Result<()> {
@@ -354,17 +441,26 @@ mod native {
             sequences: Vec<u64>,
             completion: RegisteredTxCompletionTx,
         ) -> Result<()> {
-            let (lanes, pool, completions) = (
-                &mut self.lanes,
-                self.buffer_pool
-                    .as_mut()
-                    .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?,
-                &mut self.completions,
-            );
-            lanes
+            let pool = self
+                .buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?;
+            let completions = &mut self.completions;
+            let endpoint = self
+                .endpoint
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
+            self.lanes
                 .get_mut(&lane_id)
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
-                .send_registered_window(pool, completions, lease, sequences, completion)
+                .send_registered_window(
+                    &mut endpoint.jetty,
+                    pool,
+                    completions,
+                    lease,
+                    sequences,
+                    completion,
+                )
         }
 
         pub(crate) fn poll_once(&mut self) -> Result<usize> {
@@ -471,15 +567,18 @@ mod native {
         }
 
         fn reap_drained_lanes(&mut self) -> Result<()> {
+            // Per-peer retirement needs no endpoint flush: the shared Jetty
+            // keeps serving other peers, and a PeerTarget is reaped once its
+            // own outstanding WRs (SEND plus the RECV window it posted) have
+            // all completed.
             let drained = self
                 .lanes
                 .iter()
                 .filter_map(|(&lane_id, lane)| {
                     (lane.is_draining()
                         && lane.is_retirement_armed()
-                        && self.completions.outstanding_for_lane(lane_id) == 0
-                        && self.completions.lane_flush_done(lane_id))
-                    .then_some(lane_id)
+                        && self.completions.outstanding_for_lane(lane_id) == 0)
+                        .then_some(lane_id)
                 })
                 .collect::<Vec<_>>();
             for lane_id in drained {
@@ -525,14 +624,44 @@ mod native {
                 }
             }
             if !self.lanes.is_empty() {
-                failures.push(format!(
-                    "timed out retiring {} URMA lanes with {} outstanding WRs",
-                    self.lanes.len(),
-                    self.completions.outstanding(),
-                ));
+                // Fatal escalation: the process is going away, so force every
+                // stranded WR on the shared endpoint to complete with an
+                // error (Jetty mark_error + WR_FLUSH_ERR_DONE) and keep
+                // polling until the flush CQE confirms completion.
+                if self.completions.begin_endpoint_flush() {
+                    if let Some(endpoint) = self.endpoint.as_mut() {
+                        if let Err(error) = endpoint.jetty.mark_error() {
+                            failures.push(error.to_string());
+                        }
+                    }
+                }
+                let flush_deadline = deadline_after(Duration::from_secs(5));
+                while !self.lanes.is_empty() && !deadline_expired(flush_deadline) {
+                    if self.completions.endpoint_flush_done() && self.completions.outstanding() == 0
+                    {
+                        break;
+                    }
+                    if let Err(error) = self.poll_once() {
+                        if !matches!(error, Error::Completion { .. }) {
+                            failures.push(error.to_string());
+                        }
+                    }
+                }
+                if !self.lanes.is_empty() {
+                    failures.push(format!(
+                        "timed out retiring {} URMA lanes with {} outstanding WRs even after endpoint flush",
+                        self.lanes.len(),
+                        self.completions.outstanding(),
+                    ));
+                }
             }
 
             if self.lanes.is_empty() {
+                if let Some(mut endpoint) = self.endpoint.take() {
+                    if let Err(error) = endpoint.jetty.close() {
+                        failures.push(error.to_string());
+                    }
+                }
                 if let Some(mut pool) = self.buffer_pool.take() {
                     pool.stop();
                     if let Err(error) = pool.close() {

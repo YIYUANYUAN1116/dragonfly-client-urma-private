@@ -193,7 +193,7 @@ struct OutstandingWr {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LaneRetirement {
+struct EndpointLifecycle {
     jetty_id: u32,
     jfr_id: u32,
     waiting_for_flush: bool,
@@ -210,8 +210,10 @@ pub(crate) struct CompletionRouter {
     outstanding_send: usize,
     outstanding_recv: usize,
     outstanding_by_lane: HashMap<u16, usize>,
-    retirement_by_lane: HashMap<u16, LaneRetirement>,
-    lane_by_jetty_id: HashMap<u32, u16>,
+    /// The one process-shared RM endpoint; receive CQEs must resolve their
+    /// source through the PeerTargetRegistry because posted RECV WRs are
+    /// anonymous on the shared receive queue.
+    endpoint: Option<EndpointLifecycle>,
     targets: PeerTargetRegistry,
     registered_rx_by_identity: HashMap<(u16, u64), RegisteredRxCompletionTx>,
     stats: CompletionStats,
@@ -231,55 +233,49 @@ impl CompletionRouter {
             outstanding_send: 0,
             outstanding_recv: 0,
             outstanding_by_lane: HashMap::new(),
-            retirement_by_lane: HashMap::new(),
-            lane_by_jetty_id: HashMap::new(),
+            endpoint: None,
             targets: PeerTargetRegistry::default(),
             registered_rx_by_identity: HashMap::new(),
             stats: CompletionStats::default(),
         })
     }
 
-    pub(crate) fn register_lane(&mut self, lane_id: u16, jetty_id: u32, jfr_id: u32) -> Result<()> {
-        if self.retirement_by_lane.contains_key(&lane_id) {
-            return Err(Error::Protocol(format!(
-                "duplicate completion lifecycle registration for lane {lane_id}"
-            )));
+    pub(crate) fn register_endpoint(&mut self, jetty_id: u32, jfr_id: u32) -> Result<()> {
+        if self.endpoint.is_some() {
+            return Err(Error::Protocol(
+                "the shared RM endpoint is already registered".into(),
+            ));
         }
-        if let Some(existing) = self.lane_by_jetty_id.insert(jetty_id, lane_id) {
-            self.lane_by_jetty_id.insert(jetty_id, existing);
-            return Err(Error::Protocol(format!(
-                "native Jetty id {jetty_id} is already owned by lane {existing}"
-            )));
-        }
-        self.retirement_by_lane.insert(
-            lane_id,
-            LaneRetirement {
-                jetty_id,
-                jfr_id,
-                waiting_for_flush: false,
-                flush_done: false,
-            },
-        );
+        self.endpoint = Some(EndpointLifecycle {
+            jetty_id,
+            jfr_id,
+            waiting_for_flush: false,
+            flush_done: false,
+        });
         Ok(())
     }
 
     pub(crate) fn begin_lane_retirement(&mut self, lane_id: u16) -> Result<()> {
-        let retirement = self.retirement_by_lane.get_mut(&lane_id).ok_or_else(|| {
-            Error::Protocol(format!(
-                "lane {lane_id} has no completion lifecycle registration"
-            ))
-        })?;
-        retirement.waiting_for_flush = true;
+        // Per-peer retirement only marks the PeerTarget draining: the shared
+        // Jetty must keep serving the remaining peers, so no flush is armed
+        // here. Endpoint-level flush escalation lives in `begin_endpoint_flush`.
         if self.targets.contains(lane_id) {
             self.targets.begin_draining(lane_id)?;
         }
-        tracing::debug!(
-            lane_id,
-            native_jetty_id = retirement.jetty_id,
-            native_jfr_id = retirement.jfr_id,
-            "waiting for URMA lane flush completion"
-        );
+        tracing::debug!(lane_id, "waiting for URMA PeerTarget WRs to drain");
         Ok(())
+    }
+
+    /// Fatal escalation for the whole shared endpoint (shutdown timeout or
+    /// process teardown): forces every stranded WR to complete with an error.
+    pub(crate) fn begin_endpoint_flush(&mut self) -> bool {
+        match self.endpoint.as_mut() {
+            Some(endpoint) if !endpoint.waiting_for_flush => {
+                endpoint.waiting_for_flush = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn authorize_remote(
@@ -288,31 +284,23 @@ impl CompletionRouter {
         generation: u8,
         remote_id: ffi::RemoteJettyId,
     ) -> Result<()> {
-        if !self.retirement_by_lane.contains_key(&lane_id) {
-            return Err(Error::Protocol(format!(
-                "cannot authorize remote for unknown lane {lane_id}"
-            )));
-        }
         self.targets.register(lane_id, generation, remote_id)
     }
 
-    fn validate_remote(&self, token: WrToken, remote_id: Option<ffi::RemoteJettyId>) -> Result<()> {
+    /// Resolves the authorized PeerTarget that sourced a receive CQE. On the
+    /// shared receive queue the posting WR's token lane does not imply the
+    /// data source: any peer's SEND may consume any posted RECV, so the
+    /// source peer is resolved from the hardware-reported remote identity.
+    fn resolve_source(&self, remote_id: Option<ffi::RemoteJettyId>) -> Result<u16> {
         let remote_id = remote_id
             .ok_or_else(|| Error::Protocol("receive CQE has no remote Jetty identity".into()))?;
-        let route = self.targets.resolve(remote_id)?;
-        if route.id != token.lane_id || route.generation != token.generation {
-            return Err(Error::Protocol(format!(
-                "receive CQE source resolved to PeerTarget {} generation {}, token names {} generation {}",
-                route.id, route.generation, token.lane_id, token.generation
-            )));
-        }
-        Ok(())
+        Ok(self.targets.resolve(remote_id)?.id)
     }
 
-    pub(crate) fn lane_flush_done(&self, lane_id: u16) -> bool {
-        self.retirement_by_lane
-            .get(&lane_id)
-            .is_some_and(|retirement| retirement.flush_done)
+    pub(crate) fn endpoint_flush_done(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.flush_done)
     }
 
     pub(crate) fn unregister_lane(&mut self, lane_id: u16) -> Result<()> {
@@ -325,12 +313,6 @@ impl CompletionRouter {
                 "cannot unregister lane {lane_id} with registered RX identities"
             )));
         }
-        let retirement = self.retirement_by_lane.remove(&lane_id).ok_or_else(|| {
-            Error::Protocol(format!(
-                "lane {lane_id} has no completion lifecycle registration"
-            ))
-        })?;
-        self.lane_by_jetty_id.remove(&retirement.jetty_id);
         if self.targets.contains(lane_id) {
             self.targets.remove(lane_id)?;
         }
@@ -338,9 +320,9 @@ impl CompletionRouter {
     }
 
     fn has_pending_flush(&self) -> bool {
-        self.retirement_by_lane
-            .values()
-            .any(|retirement| retirement.waiting_for_flush && !retirement.flush_done)
+        self.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.waiting_for_flush && !endpoint.flush_done)
     }
 
     pub(crate) fn track_registered_rx(
@@ -553,34 +535,47 @@ impl CompletionRouter {
         }
         let token = WrToken::decode(record.user_ctx)?;
         // Cross-validate the hardware-written native Jetty identity against
-        // the software-written user_ctx lane before touching any WR
-        // ownership. UMDK stamps local_id = jetty->jetty_id.id with
-        // is_jetty=1 on both SEND and RECV CQEs of a shared-JFR Jetty
-        // (udma_u_parse_cqe_for_jfc resolves source identity through the
-        // Jetty table; udma_u_delete_jetty cleans the send and receive JFCs
-        // by Jetty id, and udma_u_clean_jfc matches local_id against it), so
-        // local_id must always map back to the token's lane. A mismatch
-        // means corrupt routing identity: fail closed without retiring the
-        // WR through the untrusted user_ctx; the poll error fails the fabric
-        // owner via fail_pending and poison.
-        if self.lane_by_jetty_id.get(&record.local_id) != Some(&token.lane_id) {
+        // the one shared RM endpoint before touching any WR ownership. UMDK
+        // stamps local_id = jetty->jetty_id.id with is_jetty=1 on both SEND
+        // and RECV CQEs of the shared-JFR Jetty (udma_u_parse_cqe_for_jfc
+        // resolves source identity through the Jetty table; udma_u_delete_jetty
+        // cleans the send and receive JFCs by Jetty id, and udma_u_clean_jfc
+        // matches local_id against it), so local_id must name the single
+        // registered endpoint. A mismatch means corrupt routing identity:
+        // fail closed without retiring the WR through the untrusted user_ctx;
+        // the poll error fails the fabric owner via fail_pending and poison.
+        if self
+            .endpoint
+            .as_ref()
+            .is_none_or(|endpoint| endpoint.jetty_id != record.local_id)
+        {
             self.stats.cqe_error += 1;
             return Err(Error::Protocol(format!(
-                "CQE native Jetty {} does not belong to lane {}",
-                record.local_id, token.lane_id
+                "CQE native Jetty {} does not belong to the shared RM endpoint",
+                record.local_id
             )));
         }
         let expected_recv = token.operation == OperationType::Recv;
-        if expected_recv {
-            if let Err(error) = self.validate_remote(token, record.remote_id) {
-                self.stats.cqe_error += 1;
-                return Err(error);
+        // Resolve the data source from the hardware-reported remote identity.
+        // With the shared receive queue, a CQE's posting WR (token lane) is
+        // anonymous: any authorized peer's SEND may consume any posted RECV.
+        // The source peer must still be an authorized PeerTarget; anything
+        // else fails closed.
+        let source = if expected_recv {
+            match self.resolve_source(record.remote_id) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.stats.cqe_error += 1;
+                    return Err(error);
+                }
             }
-        }
+        } else {
+            token.lane_id
+        };
         let retiring = self
-            .retirement_by_lane
-            .get(&token.lane_id)
-            .is_some_and(|retirement| retirement.waiting_for_flush);
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.waiting_for_flush);
         let mut outstanding = self.take_outstanding(record.user_ctx)?;
         outstanding.handle.complete();
         let registered_tx = matches!(
@@ -647,7 +642,7 @@ impl CompletionRouter {
                                 return Err(error);
                             }
                         };
-                        let completion = match self.take_registered_rx(token.lane_id, imm_data) {
+                        let completion = match self.take_registered_rx(source, imm_data) {
                             Ok(completion) => completion,
                             Err(error) => {
                                 pool.complete_error(token.slot, token.operation)?;
@@ -673,7 +668,10 @@ impl CompletionRouter {
                             }
                         };
                         Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
-                            lane_id: token.lane_id,
+                            // The source peer owns the transfer identity; the
+                            // lease's slot ownership stays with the posting
+                            // WR (token lane).
+                            lane_id: source,
                             posted_sequence: outstanding.sequence,
                             imm_data,
                             slot: token.slot,
@@ -701,31 +699,26 @@ impl CompletionRouter {
                 "WR_FLUSH_ERR_DONE arrived on the receive JFC".into(),
             ));
         }
-        let lane_id = self
-            .lane_by_jetty_id
-            .get(&record.local_id)
-            .copied()
-            .ok_or_else(|| {
-                Error::Protocol(format!(
-                    "WR_FLUSH_ERR_DONE references unknown native Jetty {}",
-                    record.local_id
-                ))
-            })?;
-        let retirement = self
-            .retirement_by_lane
-            .get_mut(&lane_id)
-            .expect("native Jetty map and lane retirement map agree");
-        if !retirement.waiting_for_flush {
+        let endpoint = self.endpoint.as_mut().ok_or_else(|| {
+            Error::Protocol("WR_FLUSH_ERR_DONE arrived without a shared RM endpoint".into())
+        })?;
+        if endpoint.jetty_id != record.local_id {
             self.stats.cqe_error += 1;
             return Err(Error::Protocol(format!(
-                "lane {lane_id} received WR_FLUSH_ERR_DONE before retirement"
+                "WR_FLUSH_ERR_DONE references unknown native Jetty {}",
+                record.local_id
             )));
         }
-        retirement.flush_done = true;
+        if !endpoint.waiting_for_flush {
+            self.stats.cqe_error += 1;
+            return Err(Error::Protocol(
+                "shared RM endpoint received WR_FLUSH_ERR_DONE before retirement".into(),
+            ));
+        }
+        endpoint.flush_done = true;
         tracing::debug!(
-            lane_id,
             native_jetty_id = record.local_id,
-            "received URMA lane flush completion"
+            "received URMA shared endpoint flush completion"
         );
         Ok(())
     }
@@ -1076,12 +1069,13 @@ mod tests {
     }
 
     #[test]
-    fn flush_done_is_routed_by_native_jetty_id_and_gates_retirement() {
+    fn flush_done_is_routed_by_native_jetty_id_and_gates_shutdown() {
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(7, 101, 202).unwrap();
-        router.begin_lane_retirement(7).unwrap();
+        router.register_endpoint(101, 202).unwrap();
+        assert!(!router.endpoint_flush_done());
+        router.begin_endpoint_flush();
         assert!(router.has_pending_flush());
-        assert!(!router.lane_flush_done(7));
+        assert!(!router.endpoint_flush_done());
 
         router
             .route_flush_done(
@@ -1095,22 +1089,23 @@ mod tests {
             )
             .unwrap();
 
-        assert!(router.lane_flush_done(7));
+        assert!(router.endpoint_flush_done());
         assert!(!router.has_pending_flush());
-        router.unregister_lane(7).unwrap();
     }
 
     #[test]
-    fn flush_done_rejects_receive_jfc_and_unknown_native_id() {
+    fn flush_done_requires_endpoint_retirement_and_known_jetty() {
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(8, 303, 404).unwrap();
-        router.begin_lane_retirement(8).unwrap();
+        router.register_endpoint(303, 404).unwrap();
         let record = ffi::CompletionRecord {
             status: 13,
             local_id: 303,
             event_kind: ffi::CompletionEventKind::FlushErrorDone,
             ..Default::default()
         };
+        // Without an armed endpoint flush, the lifecycle CQE must be rejected.
+        assert!(router.route_flush_done(record, false).is_err());
+        router.begin_endpoint_flush();
         assert!(router.route_flush_done(record, true).is_err());
         assert!(router
             .route_flush_done(
@@ -1124,16 +1119,15 @@ mod tests {
     }
 
     #[test]
-    fn send_cqe_fails_closed_on_cross_lane_native_jetty() {
+    fn send_cqe_fails_closed_on_unknown_native_jetty() {
         // UMDK stamps local_id = jetty->jetty_id.id with is_jetty=1 on both
-        // SEND and RECV CQEs of a shared-JFR Jetty, so a CQE whose native
-        // Jetty (102) belongs to lane 2 while its user_ctx encodes lane 1
-        // carries corrupt routing identity. The router must fail closed
+        // SEND and RECV CQEs of the shared-JFR endpoint, so a CQE whose
+        // native Jetty (102) does not name the registered shared endpoint
+        // (101) carries corrupt routing identity. The router must fail closed
         // without consuming the WR ownership referenced by the untrusted
         // user_ctx; the poll error then fails the fabric owner.
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(1, 101, 201).unwrap();
-        router.register_lane(2, 102, 202).unwrap();
+        router.register_endpoint(101, 201).unwrap();
 
         let send_ctx = WrToken {
             lane_id: 1,
@@ -1175,17 +1169,16 @@ mod tests {
                 false,
                 &mut pool,
             )
-            .expect_err("cross-lane native Jetty identity must fail closed");
+            .expect_err("unknown native Jetty identity must fail closed");
         assert!(matches!(error, Error::Protocol(_)), "{error:?}");
         assert_eq!(router.outstanding(), 1);
         assert_eq!(router.outstanding_for_lane(1), 1);
     }
 
     #[test]
-    fn recv_cqe_fails_closed_on_cross_lane_native_jetty() {
+    fn recv_cqe_fails_closed_on_unknown_native_jetty() {
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(1, 101, 201).unwrap();
-        router.register_lane(2, 102, 202).unwrap();
+        router.register_endpoint(101, 201).unwrap();
 
         let recv_ctx = WrToken {
             lane_id: 1,
@@ -1221,17 +1214,16 @@ mod tests {
                 true,
                 &mut pool,
             )
-            .expect_err("cross-lane native Jetty identity must fail closed");
+            .expect_err("unknown native Jetty identity must fail closed");
         assert!(matches!(error, Error::Protocol(_)), "{error:?}");
         assert_eq!(router.outstanding(), 1);
         assert_eq!(router.outstanding_for_lane(1), 1);
     }
 
     #[test]
-    fn send_cqe_routes_when_native_jetty_matches_token_lane() {
+    fn send_cqe_routes_when_native_jetty_matches_shared_endpoint() {
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(1, 101, 201).unwrap();
-        router.register_lane(2, 102, 202).unwrap();
+        router.register_endpoint(101, 201).unwrap();
 
         let send_ctx = WrToken {
             lane_id: 1,
@@ -1310,34 +1302,40 @@ mod tests {
     #[test]
     fn receive_source_authorization_is_full_identity_and_fail_closed() {
         let mut router = CompletionRouter::new(4).unwrap();
-        router.register_lane(1, 101, 201).unwrap();
         let expected = ffi::RemoteJettyId {
             eid: [7; ffi::EID_SIZE],
             uasid: 11,
             id: 13,
         };
         let different = ffi::RemoteJettyId { id: 14, ..expected };
-        let token = WrToken {
-            lane_id: 1,
-            generation: 1,
-            operation: OperationType::Recv,
-            slot: SlotId::new(0, 1).unwrap(),
-        };
 
-        assert!(router.validate_remote(token, Some(expected)).is_err());
+        // Without an authorized PeerTarget the remote identity resolves to
+        // nothing: fail closed.
+        assert!(matches!(
+            router.resolve_source(Some(expected)),
+            Err(Error::Protocol(_))
+        ));
         router.authorize_remote(1, 1, expected).unwrap();
-        assert!(router.validate_remote(token, Some(expected)).is_ok());
-        assert!(router.validate_remote(token, None).is_err());
-        assert!(router.validate_remote(token, Some(different)).is_err());
+        assert_eq!(router.resolve_source(Some(expected)).unwrap(), 1);
+        assert!(matches!(
+            router.resolve_source(None),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            router.resolve_source(Some(different)),
+            Err(Error::Protocol(_))
+        ));
+        // An unassigned remote identity (id 0) must also fail closed.
+        assert!(matches!(
+            router.resolve_source(Some(ffi::RemoteJettyId { id: 0, ..expected })),
+            Err(Error::Protocol(_))
+        ));
 
-        let stale = WrToken {
-            generation: 2,
-            ..token
-        };
-        assert!(router.validate_remote(stale, Some(expected)).is_err());
-
+        // Rebinding the same PeerTarget to a new remote identity for a new
+        // generation is rejected while the old binding stays authoritative.
         assert!(router.authorize_remote(1, 2, different).is_err());
-        assert!(router.validate_remote(token, Some(expected)).is_ok());
+        assert_eq!(router.resolve_source(Some(expected)).unwrap(), 1);
+        // A second PeerTarget cannot claim an already-bound remote identity.
         assert!(router.authorize_remote(2, 1, expected).is_err());
     }
 }
