@@ -51,7 +51,9 @@ impl TryFrom<u8> for OperationType {
 }
 
 /// Pointer-free user_ctx encoding:
-/// `[lane:16][generation:8][operation:8][slot-generation:16|slot-index:16]`.
+/// `[owner:16][generation:8][operation:8][slot-generation:16|slot-index:16]`.
+/// SEND uses its PeerTarget id as owner; shared-JFR RECV uses owner zero and
+/// learns the logical PeerTarget from completion remote_id + routing token.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WrToken {
     pub(crate) lane_id: u16,
@@ -61,11 +63,18 @@ pub(crate) struct WrToken {
 }
 
 impl WrToken {
+    pub(crate) fn anonymous_recv(slot: SlotId) -> Self {
+        Self {
+            lane_id: 0,
+            generation: 1,
+            operation: OperationType::Recv,
+            slot,
+        }
+    }
+
     pub(crate) fn encode(self) -> Result<u64> {
-        if self.lane_id == 0 || self.generation == 0 {
-            return Err(Error::InvalidConfiguration(
-                "lane id and generation must be non-zero".into(),
-            ));
+        if self.generation == 0 || (self.lane_id == 0 && self.operation != OperationType::Recv) {
+            return Err(Error::InvalidConfiguration("WR identity is invalid".into()));
         }
         Ok((u64::from(self.lane_id) << 48)
             | (u64::from(self.generation) << 40)
@@ -77,7 +86,7 @@ impl WrToken {
         let lane_id = (value >> 48) as u16;
         let generation = ((value >> 40) & 0xff) as u8;
         let operation = OperationType::try_from(((value >> 32) & 0xff) as u8)?;
-        if lane_id == 0 || generation == 0 {
+        if generation == 0 || (lane_id == 0 && operation != OperationType::Recv) {
             return Err(Error::Protocol("CQE user_ctx has a zero identity".into()));
         }
         Ok(Self {
@@ -508,6 +517,7 @@ impl UrmaLane {
     pub(crate) fn post_receive_window_registered(
         &mut self,
         jetty: &mut UrmaJetty,
+        shared_recv_depth: usize,
         pool: &mut UrmaBufferPool,
         completions: &mut CompletionRouter,
         sequences: Vec<u64>,
@@ -519,6 +529,7 @@ impl UrmaLane {
                 "registered RX window requires matching non-empty sequences and completions".into(),
             ));
         }
+        completions.ensure_recv_capacity(sequences.len(), shared_recv_depth)?;
         // Reject duplicate logical ownership before any native WR is posted.
         // Once a RECV is visible to the provider, its SEND_IMM identity must
         // already have exactly one lane-global waiter.
@@ -541,7 +552,9 @@ impl UrmaLane {
             let prepare = (|| {
                 for (slot, _, _) in &batch {
                     let (offset, length) = pool.recv_post_layout(*slot)?;
-                    let user_ctx = self.token(OperationType::Recv, *slot).encode()?;
+                    // Shared-JFR receive slots have no PeerTarget owner until
+                    // the CQE supplies remote_id plus the routing token.
+                    let user_ctx = WrToken::anonymous_recv(*slot).encode()?;
                     pool.mark_posted(*slot, SlotKind::Rx)?;
                     entries.push(ffi::PostEntry {
                         offset,
@@ -590,6 +603,7 @@ impl UrmaLane {
                 if index < posted_len {
                     let wr = handles.next().expect("posted prefix handle count matches");
                     if let Err(error) = completions.track_registered_rx(
+                        self.id,
                         entries[index].user_ctx,
                         wr,
                         Some(sequence),

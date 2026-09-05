@@ -1,6 +1,6 @@
 //! Persistent peer session over the thread-owned URMA fabric.
 //!
-//! A TCP control connection and one bound Jetty are established once, then
+//! A TCP control connection and one imported RM PeerTarget are established once, then
 //! shared by bounded concurrent logical Piece transfers. Storage lookup and
 //! stream exposure stay in the `client::urma` / `server::urma` adapters.
 
@@ -37,6 +37,18 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 const REQUIRED_RX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+// SEND_IMM routing is process-wide once multiple control sessions can alias
+// the same remote RM endpoint. Allocate transfer ids across every session so
+// `(remote_id, transfer_id, chunk)` remains unambiguous at the shared JFR.
+static NEXT_TRANSFER_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_transfer_id() -> TransferId {
+    NEXT_TRANSFER_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.wrapping_add(1).max(1))
+        })
+        .expect("transfer id allocator always supplies a next value")
+}
 
 fn transfer_sequence(transfer_id: TransferId, chunk: u64) -> Result<u64> {
     if transfer_id == 0 || chunk > u64::from(u32::MAX) {
@@ -416,7 +428,6 @@ struct ClientLane {
     max_receive_inflight: u32,
     receive_pipeline_depth: usize,
     control_timeout: Duration,
-    next_transfer_id: AtomicU32,
     failed: AtomicBool,
     native_receive_permits: Arc<Semaphore>,
     native_receive_admission_state: Arc<Mutex<NativeReceiveAdmissionState>>,
@@ -512,7 +523,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 max_receive_inflight,
                 receive_pipeline_depth: lane_config.pipeline_depth as usize,
                 control_timeout,
-                next_transfer_id: AtomicU32::new(1),
                 failed: AtomicBool::new(false),
                 native_receive_permits: Arc::new(Semaphore::new(lane_config.recv_depth as usize)),
                 native_receive_admission_state: Arc::new(Mutex::new(
@@ -538,13 +548,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         {
             return Err(Error::Protocol("invalid URMA Piece request".into()));
         }
-        let transfer_id = self
-            .lane
-            .next_transfer_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.wrapping_add(1).max(1))
-            })
-            .unwrap();
+        let transfer_id = next_transfer_id();
         debug!(
             role = "client",
             lane_id = self.lane.lane_id,

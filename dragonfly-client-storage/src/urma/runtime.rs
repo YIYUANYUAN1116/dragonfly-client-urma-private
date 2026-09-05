@@ -423,6 +423,7 @@ mod native {
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
                 .post_receive_window_registered(
                     &mut endpoint.jetty,
+                    endpoint.config.recv_depth as usize,
                     pool,
                     completions,
                     sequences,
@@ -481,6 +482,12 @@ mod native {
                 .poll_once(send_jfc.handle(), recv_jfc.handle(), pool);
             if let Err(error) = &progress {
                 self.completions.fail_pending(error);
+            }
+            let failed_peers = self.completions.take_failed_peers();
+            for lane_id in failed_peers {
+                if self.lanes.contains_key(&lane_id) {
+                    self.abort_lane(lane_id)?;
+                }
             }
             let reap = self.reap_drained_lanes();
             match (progress, reap) {
@@ -623,7 +630,7 @@ mod native {
                     }
                 }
             }
-            if !self.lanes.is_empty() {
+            if !self.lanes.is_empty() || self.completions.outstanding() != 0 {
                 // Fatal escalation: the process is going away, so force every
                 // stranded WR on the shared endpoint to complete with an
                 // error (Jetty mark_error + WR_FLUSH_ERR_DONE) and keep
@@ -636,27 +643,25 @@ mod native {
                     }
                 }
                 let flush_deadline = deadline_after(Duration::from_secs(5));
-                while !self.lanes.is_empty() && !deadline_expired(flush_deadline) {
-                    if self.completions.endpoint_flush_done() && self.completions.outstanding() == 0
-                    {
-                        break;
-                    }
+                while (!self.lanes.is_empty() || !self.completions.endpoint_ready_to_close())
+                    && !deadline_expired(flush_deadline)
+                {
                     if let Err(error) = self.poll_once() {
                         if !matches!(error, Error::Completion { .. }) {
                             failures.push(error.to_string());
                         }
                     }
                 }
-                if !self.lanes.is_empty() {
+                if !self.lanes.is_empty() || !self.completions.endpoint_ready_to_close() {
                     failures.push(format!(
-                        "timed out retiring {} URMA lanes with {} outstanding WRs even after endpoint flush",
+                        "timed out retiring {} URMA lanes with {} endpoint WRs even after endpoint flush",
                         self.lanes.len(),
                         self.completions.outstanding(),
                     ));
                 }
             }
 
-            if self.lanes.is_empty() {
+            if self.lanes.is_empty() && self.completions.endpoint_ready_to_close() {
                 if let Some(mut endpoint) = self.endpoint.take() {
                     if let Err(error) = endpoint.jetty.close() {
                         failures.push(error.to_string());

@@ -1,5 +1,5 @@
 use super::{ffi::RemoteJettyId, Error, Result};
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) type PeerTargetId = u16;
 
@@ -25,7 +25,10 @@ struct PeerTargetEntry {
 #[derive(Default)]
 pub(crate) struct PeerTargetRegistry {
     by_id: HashMap<PeerTargetId, PeerTargetEntry>,
-    by_remote: HashMap<RemoteJettyId, PeerTargetId>,
+    // A process-shared remote RM endpoint can be referenced by more than one
+    // control session. Keep every logical PeerTarget alias; receive routing
+    // disambiguates aliases with the routing token registered by the session.
+    by_remote: HashMap<RemoteJettyId, HashSet<PeerTargetId>>,
 }
 
 impl PeerTargetRegistry {
@@ -49,17 +52,7 @@ impl PeerTargetRegistry {
                 "PeerTarget {id} is already registered"
             )));
         }
-        match self.by_remote.entry(remote_id) {
-            Entry::Occupied(existing) => {
-                return Err(Error::Protocol(format!(
-                    "remote Jetty identity is already authorized for PeerTarget {}",
-                    existing.get()
-                )));
-            }
-            Entry::Vacant(remote) => {
-                remote.insert(id);
-            }
-        }
+        self.by_remote.entry(remote_id).or_default().insert(id);
         self.by_id.insert(
             id,
             PeerTargetEntry {
@@ -74,15 +67,19 @@ impl PeerTargetRegistry {
         Ok(())
     }
 
-    pub(crate) fn resolve(&self, remote_id: RemoteJettyId) -> Result<PeerTargetRoute> {
-        let id = self.by_remote.get(&remote_id).ok_or_else(|| {
+    pub(crate) fn routes(&self, remote_id: RemoteJettyId) -> Result<Vec<PeerTargetRoute>> {
+        let ids = self.by_remote.get(&remote_id).ok_or_else(|| {
             Error::Protocol("receive CQE source is not an authorized PeerTarget".into())
         })?;
-        Ok(self
-            .by_id
-            .get(id)
-            .expect("remote and id indexes are updated together")
-            .route)
+        Ok(ids
+            .iter()
+            .map(|id| {
+                self.by_id
+                    .get(id)
+                    .expect("remote and id indexes are updated together")
+                    .route
+            })
+            .collect())
     }
 
     pub(crate) fn begin_draining(&mut self, id: PeerTargetId) -> Result<()> {
@@ -99,7 +96,12 @@ impl PeerTargetRegistry {
             .by_id
             .remove(&id)
             .ok_or_else(|| Error::Protocol(format!("unknown PeerTarget {id}")))?;
-        self.by_remote.remove(&entry.remote_id);
+        if let Some(ids) = self.by_remote.get_mut(&entry.remote_id) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.by_remote.remove(&entry.remote_id);
+            }
+        }
         Ok(())
     }
 }
@@ -122,7 +124,7 @@ mod tests {
         let identity = remote(7, 11);
         registry.register(3, 5, identity).unwrap();
         assert_eq!(
-            registry.resolve(identity).unwrap(),
+            registry.routes(identity).unwrap()[0],
             PeerTargetRoute {
                 id: 3,
                 generation: 5,
@@ -132,22 +134,29 @@ mod tests {
 
         registry.begin_draining(3).unwrap();
         assert_eq!(
-            registry.resolve(identity).unwrap().state,
+            registry.routes(identity).unwrap()[0].state,
             PeerTargetState::Draining
         );
         registry.remove(3).unwrap();
-        assert!(registry.resolve(identity).is_err());
+        assert!(registry.routes(identity).is_err());
     }
 
     #[test]
-    fn registry_rejects_duplicate_id_identity_and_zero_generation() {
+    fn registry_rejects_duplicate_id_and_zero_generation_but_allows_identity_aliases() {
         let mut registry = PeerTargetRegistry::default();
         let first = remote(1, 1);
         registry.register(1, 1, first).unwrap();
         assert!(registry.register(1, 2, remote(2, 2)).is_err());
-        assert!(registry.register(2, 1, first).is_err());
-        assert!(registry.register(2, 0, remote(2, 2)).is_err());
+        registry.register(2, 1, first).unwrap();
+        assert!(registry.register(3, 0, remote(2, 2)).is_err());
 
-        assert_eq!(registry.resolve(first).unwrap().id, 1);
+        let mut aliases = registry
+            .routes(first)
+            .unwrap()
+            .into_iter()
+            .map(|route| route.id)
+            .collect::<Vec<_>>();
+        aliases.sort_unstable();
+        assert_eq!(aliases, vec![1, 2]);
     }
 }
