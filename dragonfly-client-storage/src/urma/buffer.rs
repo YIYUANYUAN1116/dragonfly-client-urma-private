@@ -79,6 +79,25 @@ pub(crate) enum SlotState {
     LeasedTx,
 }
 
+/// Owner-thread snapshot of the physical RX slot state machine. `allocated`
+/// and `ready` are short transition states; quiescent snapshots normally only
+/// contain free, posted, and leased slots.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RxBufferStateCounts {
+    pub(crate) free: usize,
+    pub(crate) allocated: usize,
+    pub(crate) posted: usize,
+    pub(crate) ready: usize,
+    pub(crate) leased: usize,
+    pub(crate) total: usize,
+}
+
+impl RxBufferStateCounts {
+    pub(crate) fn accounted(self) -> usize {
+        self.free + self.allocated + self.posted + self.ready + self.leased
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SlotId {
     index: u16,
@@ -258,6 +277,7 @@ pub(crate) struct RegisteredRxWindowLease {
     length: usize,
     cores: Vec<LeaseCore>,
     pipeline_permit: Option<OwnedSemaphorePermit>,
+    shared_rx_permit: Option<OwnedSemaphorePermit>,
     #[cfg(test)]
     _test_backing: Vec<Box<[u8]>>,
 }
@@ -295,9 +315,9 @@ impl RegisteredRxWindowLease {
         #[cfg(test)]
         let mut test_backing = Vec::new();
         for mut window in windows {
-            if window.pipeline_permit.is_some() {
+            if window.pipeline_permit.is_some() || window.shared_rx_permit.is_some() {
                 return Err(Error::Protocol(
-                    "chunk lease unexpectedly owns a pipeline permit".into(),
+                    "chunk lease unexpectedly owns receive admission permits".into(),
                 ));
             }
             length = length
@@ -313,6 +333,7 @@ impl RegisteredRxWindowLease {
             length,
             cores,
             pipeline_permit: None,
+            shared_rx_permit: None,
             #[cfg(test)]
             _test_backing: test_backing,
         })
@@ -320,6 +341,13 @@ impl RegisteredRxWindowLease {
 
     pub(crate) fn with_pipeline_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
         self.pipeline_permit = Some(permit);
+        self
+    }
+
+    /// Keeps process-wide shared-JFR capacity reserved until Storage releases
+    /// the registered RX lease and its slots can be reused.
+    pub(crate) fn with_shared_rx_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self.shared_rx_permit = Some(permit);
         self
     }
 
@@ -348,6 +376,7 @@ impl RegisteredRxWindowLease {
                 notifier,
             }],
             pipeline_permit: None,
+            shared_rx_permit: None,
             _test_backing: backing,
         }
     }
@@ -372,6 +401,7 @@ impl RegisteredRxWindowLease {
             spans,
             cores: Vec::new(),
             pipeline_permit: None,
+            shared_rx_permit: None,
             _test_backing: backing,
         }
     }
@@ -657,6 +687,24 @@ mod native {
             SlotId::new(index, slot.generation).ok()
         }
 
+        pub(crate) fn rx_state_counts(&self) -> RxBufferStateCounts {
+            let mut counts = RxBufferStateCounts::default();
+            for slot in self.slots.iter().filter(|slot| slot.kind == SlotKind::Rx) {
+                counts.total += 1;
+                match slot.state {
+                    SlotState::Free => counts.free += 1,
+                    SlotState::Allocated => counts.allocated += 1,
+                    SlotState::PostedRecv => counts.posted += 1,
+                    SlotState::RecvCompleted => counts.ready += 1,
+                    SlotState::LeasedRx => counts.leased += 1,
+                    SlotState::SendPosted | SlotState::SendCompleted | SlotState::LeasedTx => {
+                        debug_assert!(false, "RX slot entered a TX-only state")
+                    }
+                }
+            }
+            counts
+        }
+
         pub(crate) fn allocate_rx_window(&mut self, count: usize) -> Result<Vec<SlotId>> {
             if count == 0 {
                 return Err(Error::InvalidConfiguration(
@@ -915,6 +963,7 @@ mod native {
                     notifier: self.recycle_notifier.clone(),
                 }],
                 pipeline_permit: None,
+                shared_rx_permit: None,
                 #[cfg(test)]
                 _test_backing: Vec::new(),
             })
@@ -1184,6 +1233,26 @@ pub(crate) use native::UrmaBufferPool;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rx_state_snapshot_accounts_each_physical_slot_once() {
+        let pool = UrmaBufferPool::from_test_slot_states(&[
+            (SlotKind::Tx, SlotState::SendPosted),
+            (SlotKind::Rx, SlotState::Free),
+            (SlotKind::Rx, SlotState::Allocated),
+            (SlotKind::Rx, SlotState::PostedRecv),
+            (SlotKind::Rx, SlotState::RecvCompleted),
+            (SlotKind::Rx, SlotState::LeasedRx),
+        ]);
+        let counts = pool.rx_state_counts();
+        assert_eq!(counts.free, 1);
+        assert_eq!(counts.allocated, 1);
+        assert_eq!(counts.posted, 1);
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.leased, 1);
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.accounted(), counts.total);
+    }
     use std::sync::{mpsc, Mutex};
 
     #[test]
@@ -1290,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_rx_window_preserves_parts_recycles_every_slot_and_holds_pipeline_credit() {
+    fn merged_rx_window_holds_pipeline_and_shared_rx_credit_until_drop() {
         let mut leases = LeaseBook::new();
         let first = leases
             .issue(LeaseKind::Rx, vec![SlotId::new(8, 1).unwrap()])
@@ -1310,20 +1379,25 @@ mod tests {
         );
         let tail_window =
             RegisteredRxWindowLease::from_test_parts(vec![vec![5, 6]], second, notifier);
-        let permits = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = permits.clone().try_acquire_owned().unwrap();
+        let pipeline_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let pipeline_permit = pipeline_permits.clone().try_acquire_owned().unwrap();
+        let shared_rx_permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let shared_rx_permit = shared_rx_permits.clone().try_acquire_many_owned(2).unwrap();
         let window = RegisteredRxWindowLease::merge(vec![first_window, tail_window])
             .unwrap()
-            .with_pipeline_permit(permit);
+            .with_pipeline_permit(pipeline_permit)
+            .with_shared_rx_permit(shared_rx_permit);
 
         assert_eq!(window.len(), 6);
         assert_eq!(
             window.parts().collect::<Vec<_>>(),
             vec![&[1, 2, 3, 4][..], &[5, 6][..]]
         );
-        assert!(permits.clone().try_acquire_owned().is_err());
+        assert!(pipeline_permits.clone().try_acquire_owned().is_err());
+        assert!(shared_rx_permits.clone().try_acquire_owned().is_err());
         drop(window);
-        assert!(permits.try_acquire_owned().is_ok());
+        assert!(pipeline_permits.try_acquire_owned().is_ok());
+        assert!(shared_rx_permits.try_acquire_owned().is_ok());
         let mut actual = returned.lock().unwrap().clone();
         actual.sort_by_key(|recycle| recycle.lease_id);
         assert_eq!(actual, vec![first, second]);

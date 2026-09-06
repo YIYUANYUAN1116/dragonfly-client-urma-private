@@ -9,6 +9,11 @@ use std::time::Duration;
 mod buffer;
 mod completion;
 pub(crate) mod control;
+// The guaranteed/borrowed planner stays test-only until a concrete active-Peer
+// quota and async admission policy is selected. The production data path still
+// uses work-conserving process-wide admission.
+#[cfg(test)]
+mod credit;
 mod error;
 pub mod fabric;
 mod ffi;
@@ -17,6 +22,7 @@ pub mod rendezvous;
 pub(crate) mod runtime;
 pub(crate) mod session;
 mod target;
+mod transfer;
 
 pub(crate) use buffer::{RegisteredRxWindowLease, TxWindowLease};
 pub(crate) use error::native_error;

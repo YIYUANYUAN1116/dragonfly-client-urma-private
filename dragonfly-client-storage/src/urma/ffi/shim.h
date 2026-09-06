@@ -48,7 +48,6 @@ typedef struct dfurma_device_capability {
 } dfurma_device_capability_t;
 
 typedef struct dfurma_jetty_config {
-    uint32_t transport_mode;
     uint32_t send_depth;
     uint32_t recv_depth;
     uint32_t max_send_sge;

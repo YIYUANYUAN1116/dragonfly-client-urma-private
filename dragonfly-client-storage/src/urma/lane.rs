@@ -232,30 +232,23 @@ impl JettyDescriptor {
     }
 }
 
-/// Jetty sizing, transport mode, and import token used when the shared RM
-/// endpoint is created.
+/// Native sizing and import token for the one process-shared RM endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JettyConfig {
-    pub(crate) transport_mode: TransportMode,
     pub(crate) send_depth: u32,
     pub(crate) recv_depth: u32,
     pub(crate) max_send_sge: u32,
     pub(crate) max_recv_sge: u32,
-    pub(crate) post_list_size: u32,
-    pub(crate) pipeline_depth: u32,
     pub(crate) token: u32,
 }
 
 impl Default for JettyConfig {
     fn default() -> Self {
         Self {
-            transport_mode: TransportMode::Rm,
             send_depth: 128,
             recv_depth: 512,
             max_send_sge: 1,
             max_recv_sge: 1,
-            post_list_size: 1,
-            pipeline_depth: 2,
             token: 0,
         }
     }
@@ -280,7 +273,6 @@ impl UrmaJetty {
         config: &JettyConfig,
     ) -> Result<Self> {
         let ffi_config = ffi::JettyConfig {
-            transport_mode: config.transport_mode as u32,
             send_depth: config.send_depth,
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,
@@ -532,7 +524,7 @@ impl UrmaLane {
         completions.ensure_recv_capacity(sequences.len(), shared_recv_depth)?;
         // Reject duplicate logical ownership before any native WR is posted.
         // Once a RECV is visible to the provider, its SEND_IMM identity must
-        // already have exactly one lane-global waiter.
+        // already have exactly one waiter in this PeerTarget's TransferRegistry.
         completions.validate_registered_rx_identities(self.id, &sequences)?;
         // Reserve the entire logical window before posting any native WR. A
         // second pipeline window can therefore degrade cleanly when the global

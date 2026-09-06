@@ -301,6 +301,34 @@ pub static URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS: LazyLock<IntCounterVec> =
         .expect("metric can be created")
     });
 
+/// Process-wide shared-JFR physical and logical receive state.
+pub static URMA_RX_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "urma_rx_state",
+            "Gauge of process-wide shared-JFR physical slots, posted WRs, and logical credits.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["state"],
+    )
+    .expect("metric can be created")
+});
+
+/// Receive CQEs rejected before logical ownership could be selected.
+pub static URMA_RX_ANOMALY_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "urma_rx_anomaly_total",
+            "Counter of shared-JFR receive routing anomalies.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["reason"],
+    )
+    .expect("metric can be created")
+});
+
 /// Used to record the download task duration.
 pub static DOWNLOAD_TASK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
@@ -731,6 +759,14 @@ fn register_custom_metrics() {
 
     REGISTRY
         .register(Box::new(URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_RX_STATE.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_RX_ANOMALY_COUNT.clone()))
         .expect("metric can be registered");
 
     REGISTRY
@@ -1191,6 +1227,35 @@ pub fn collect_urma_required_admission_wait_metrics(direction: &str, duration: D
     URMA_REQUIRED_ADMISSION_WAIT_NANOSECONDS
         .with_label_values(&[direction])
         .inc_by(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
+}
+
+/// Publishes one owner-thread conservation snapshot for the shared receive
+/// queue. State names are fixed here to keep metric cardinality bounded.
+pub fn collect_urma_rx_state_metrics(
+    free: usize,
+    allocated: usize,
+    posted: usize,
+    ready: usize,
+    leased: usize,
+    logical_credits: usize,
+) {
+    for (state, value) in [
+        ("free", free),
+        ("allocated", allocated),
+        ("posted", posted),
+        ("ready", ready),
+        ("leased", leased),
+        ("logical_credits", logical_credits),
+    ] {
+        URMA_RX_STATE
+            .with_label_values(&[state])
+            .set(i64::try_from(value).unwrap_or(i64::MAX));
+    }
+}
+
+/// Counts one receive-routing anomaly. Callers pass only fixed reason names.
+pub fn collect_urma_rx_anomaly_metrics(reason: &str) {
+    URMA_RX_ANOMALY_COUNT.with_label_values(&[reason]).inc();
 }
 
 /// Collects the upload piece failure metrics.

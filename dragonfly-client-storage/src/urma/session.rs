@@ -13,6 +13,7 @@ use super::{
         read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
         PieceMetadata, ReceiveWindow, RendezvousError, TransferId, UrmaCapability,
     },
+    transfer::RoutingToken,
     Error, Result,
 };
 use crate::rendezvous::{ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE, ERROR_CODE_INTERNAL};
@@ -38,36 +39,30 @@ use tracing::{debug, info, warn};
 
 const REQUIRED_RX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 // SEND_IMM routing is process-wide once multiple control sessions can alias
-// the same remote RM endpoint. Allocate transfer ids across every session so
-// `(remote_id, transfer_id, chunk)` remains unambiguous at the shared JFR.
+// the same remote RM endpoint. Allocate transfer ids across every session and
+// never reuse them during the process lifetime, so a late CQE cannot match a
+// new transfer after id wraparound.
 static NEXT_TRANSFER_ID: AtomicU32 = AtomicU32::new(1);
 
-fn next_transfer_id() -> TransferId {
-    NEXT_TRANSFER_ID
+fn next_transfer_id() -> Result<TransferId> {
+    allocate_transfer_id(&NEXT_TRANSFER_ID)
+}
+
+fn allocate_transfer_id(counter: &AtomicU32) -> Result<TransferId> {
+    counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.wrapping_add(1).max(1))
+            current.checked_add(1)
         })
-        .expect("transfer id allocator always supplies a next value")
+        .map_err(|_| Error::InvalidConfiguration("URMA transfer id space exhausted".into()))
 }
 
 fn transfer_sequence(transfer_id: TransferId, chunk: u64) -> Result<u64> {
-    if transfer_id == 0 || chunk > u64::from(u32::MAX) {
-        return Err(Error::Protocol(format!(
-            "invalid URMA transfer sequence: transfer_id={transfer_id} chunk={chunk}"
-        )));
-    }
-    Ok((u64::from(transfer_id) << 32) | chunk)
+    RoutingToken::encode(transfer_id, chunk)
 }
 
 fn decode_transfer_sequence(sequence: u64) -> Result<(TransferId, u64)> {
-    let transfer_id = (sequence >> 32) as TransferId;
-    let chunk = sequence & u64::from(u32::MAX);
-    if transfer_id == 0 {
-        return Err(Error::Protocol(format!(
-            "invalid URMA SEND_IMM identity: sequence={sequence} transfer_id=0"
-        )));
-    }
-    Ok((transfer_id, chunk))
+    let token = RoutingToken::decode(sequence)?;
+    Ok((token.transfer_id(), u64::from(token.chunk())))
 }
 
 fn control_error(error: ClientError) -> Error {
@@ -249,7 +244,7 @@ struct NativeReceiveAdmissionState {
 }
 
 struct NativeReceiveWindowPermit {
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     state: Arc<Mutex<NativeReceiveAdmissionState>>,
     lane_id: u16,
     transfer_id: TransferId,
@@ -284,12 +279,18 @@ impl NativeReceiveWindowPermit {
             "URMA native RX window admitted"
         );
         Self {
-            _permit: permit,
+            permit: Some(permit),
             state,
             lane_id,
             transfer_id,
             window_start_chunk: window.start_chunk,
         }
+    }
+
+    fn into_permit(mut self) -> OwnedSemaphorePermit {
+        self.permit
+            .take()
+            .expect("native receive permit is handed off once")
     }
 }
 
@@ -473,10 +474,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         local_capability
             .compatible(remote_capability)
             .map_err(Error::Protocol)?;
-        if max_receive_inflight == 0 || max_receive_inflight > lane_config.recv_depth {
+        let shared_receive_depth = fabric.max_native_receive_depth();
+        if max_receive_inflight == 0 || max_receive_inflight > shared_receive_depth {
             return Err(Error::InvalidConfiguration(format!(
-                "URMA per-Piece receive inflight {max_receive_inflight} exceeds lane receive depth {}",
-                lane_config.recv_depth
+                "URMA per-Piece receive inflight {max_receive_inflight} exceeds shared receive depth {shared_receive_depth}",
             )));
         }
         let max_message_size = local_capability
@@ -508,12 +509,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
-        info!(
-            role = "client",
-            lane_id,
-            transport_mode = ?lane_config.transport_mode,
-            "urma peer lane established"
-        );
+        let native_receive_permits = match fabric.shared_rx_permits(shared_receive_depth) {
+            Ok(permits) => permits,
+            Err(error) => {
+                let _ = fabric.abort_lane(lane_id).await;
+                return Err(error);
+            }
+        };
+        info!(role = "client", lane_id, "urma peer lane established");
         Ok(Self {
             lane: Arc::new(ClientLane {
                 control: LaneControl::spawn(stream, max_concurrent_transfers)?,
@@ -524,7 +527,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
                 receive_pipeline_depth: lane_config.pipeline_depth as usize,
                 control_timeout,
                 failed: AtomicBool::new(false),
-                native_receive_permits: Arc::new(Semaphore::new(lane_config.recv_depth as usize)),
+                native_receive_permits,
                 native_receive_admission_state: Arc::new(Mutex::new(
                     NativeReceiveAdmissionState::default(),
                 )),
@@ -548,7 +551,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         {
             return Err(Error::Protocol("invalid URMA Piece request".into()));
         }
-        let transfer_id = next_transfer_id();
+        let transfer_id = next_transfer_id()?;
         debug!(
             role = "client",
             lane_id = self.lane.lane_id,
@@ -671,16 +674,25 @@ impl UrmaClientTransfer {
                     piece.window_permits.clone(),
                 )
             };
-            // Every posted sequence is registered in the lane-global
-            // completion dispatcher. Native RECV matching may therefore
-            // cross Piece and window boundaries; SEND_IMM remains the
-            // authoritative logical owner.
+            // Every posted sequence is registered under this PeerTarget's
+            // TransferRegistry. Native RECV matching may still cross Piece
+            // and window boundaries; SEND_IMM remains the authoritative
+            // logical owner after remote_id selects the PeerTarget.
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) if pending_count != 0 => return Ok(()),
                 Err(_) => permits.acquire_owned().await.map_err(|_| Error::Shutdown {
                     failures: vec!["URMA RX window pipeline is closed".into()],
                 })?,
+            };
+            // A required first window is visible before it starts waiting for
+            // shared native capacity and remains visible until its post has
+            // completed. Optional windows therefore yield across both the
+            // semaphore and Fabric command/buffer admission phases.
+            let _required_rx_waiter = if pending_count == 0 {
+                Some(self.lane.fabric.required_rx_waiter())
+            } else {
+                None
             };
             let native_receive_credit = if pending_count == 0 {
                 let requested = window.chunk_count;
@@ -727,12 +739,10 @@ impl UrmaClientTransfer {
                     }
                 }
             } else {
-                match self
-                    .lane
-                    .native_receive_permits
-                    .clone()
-                    .try_acquire_many_owned(window.chunk_count)
-                {
+                match self.lane.fabric.try_acquire_optional_rx_permit(
+                    self.lane.native_receive_permits.clone(),
+                    window.chunk_count,
+                ) {
                     Ok(permit) => permit,
                     Err(_) => {
                         debug!(
@@ -757,7 +767,6 @@ impl UrmaClientTransfer {
                 // A Piece cannot make progress without its first RX window.
                 // Keep its admission visible process-wide so optional second
                 // windows on every lane yield while registered leases drain.
-                let _required_waiter = self.lane.fabric.required_rx_waiter();
                 let admission_start = time::Instant::now();
                 let deadline = time::Instant::now() + timeout;
                 let mut waited = false;
@@ -863,9 +872,16 @@ impl UrmaClientTransfer {
             .as_mut()
             .and_then(|piece| piece.pending.pop_front())
             .ok_or_else(|| Error::Protocol("no pending URMA receive window".into()))?;
+        let PendingReceiveWindow {
+            window,
+            expected_len,
+            operations,
+            permit,
+            _native_receive_permit: native_receive_permit,
+        } = pending;
         let transfer_id = self.piece.as_ref().expect("active Piece").transfer_id;
-        let mut completions = Vec::with_capacity(pending.operations.len());
-        for operation in pending.operations {
+        let mut completions = Vec::with_capacity(operations.len());
+        for operation in operations {
             match operation.wait_timeout(timeout).await {
                 Ok(completion) => completions.push(completion),
                 Err(error) => return self.abort(error).await,
@@ -875,21 +891,21 @@ impl UrmaClientTransfer {
             lane_id,
             transfer_id,
             &self.piece.as_ref().expect("active Piece").shape,
-            pending.window,
+            window,
             completions,
         ) {
             Ok(leases) => leases,
             Err(error) => return self.abort(error).await,
         };
         let lease = match RegisteredRxWindowLease::merge(leases) {
-            Ok(lease) if lease.len() == pending.expected_len => {
-                lease.with_pipeline_permit(pending.permit)
-            }
+            Ok(lease) if lease.len() == expected_len => lease
+                .with_pipeline_permit(permit)
+                .with_shared_rx_permit(native_receive_permit.into_permit()),
             Ok(lease) => {
                 return self
                     .abort(Error::Protocol(format!(
                         "registered URMA window length mismatch: expected {}, got {}",
-                        pending.expected_len,
+                        expected_len,
                         lease.len()
                     )))
                     .await;
@@ -897,9 +913,9 @@ impl UrmaClientTransfer {
             Err(error) => return self.abort(error).await,
         };
         let piece = self.piece.as_mut().expect("active Piece");
-        piece.next_deliver_chunk += u64::from(pending.window.chunk_count);
+        piece.next_deliver_chunk += u64::from(window.chunk_count);
         piece.receive_window_count += 1;
-        piece.send_imm_chunk_count += u64::from(pending.window.chunk_count);
+        piece.send_imm_chunk_count += u64::from(window.chunk_count);
         piece.reordered_chunk_count += routing.reordered_chunk_count;
         piece.cross_transfer_chunk_count += routing.cross_transfer_chunk_count;
         Ok(lease)
@@ -1037,10 +1053,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
         let max_message_size = local_capability
             .max_message_size
             .min(connect.capability.max_message_size);
-        if max_send_inflight == 0 || max_send_inflight > lane_config.send_depth {
+        let shared_send_depth = fabric.max_native_send_depth();
+        if max_send_inflight == 0 || max_send_inflight > shared_send_depth {
             return Err(Error::InvalidConfiguration(format!(
-                "URMA per-Piece send inflight {max_send_inflight} exceeds lane send depth {}",
-                lane_config.send_depth
+                "URMA per-Piece send inflight {max_send_inflight} exceeds shared send depth {shared_send_depth}",
             )));
         }
         let (lane_id, server_descriptor) = fabric.create_lane(lane_config).await?;
@@ -1061,12 +1077,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
-        info!(
-            role = "server",
-            lane_id,
-            transport_mode = ?lane_config.transport_mode,
-            "urma peer lane established"
-        );
+        let native_send_permits = match fabric.shared_tx_permits(shared_send_depth) {
+            Ok(permits) => permits,
+            Err(error) => {
+                let _ = fabric.abort_lane(lane_id).await;
+                return Err(error);
+            }
+        };
+        info!(role = "server", lane_id, "urma peer lane established");
         Ok(Self {
             lane: Arc::new(ServerLane {
                 control: LaneControl::spawn(stream, max_concurrent_transfers)?,
@@ -1074,7 +1092,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
                 lane_id,
                 max_message_size,
                 max_send_inflight,
-                native_send_permits: Arc::new(Semaphore::new(lane_config.send_depth as usize)),
+                native_send_permits,
                 control_timeout,
                 failed: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -1548,6 +1566,14 @@ mod tests {
     use crate::rendezvous::PieceKind;
     use crate::urma::buffer::SlotId;
 
+    #[test]
+    fn transfer_id_allocator_never_wraps_or_reuses_an_identity() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+        assert_eq!(allocate_transfer_id(&counter).unwrap(), u32::MAX - 1);
+        assert!(allocate_transfer_id(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Acquire), u32::MAX);
+    }
+
     fn request() -> CommonPieceRequest {
         CommonPieceRequest {
             kind: PieceKind::Piece,
@@ -1815,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_shape_rejects_inflight_above_local_lane_depth() {
+    fn transfer_shape_rejects_inflight_above_shared_endpoint_depth() {
         let metadata = PieceMetadata {
             offset: 0,
             length: 8,

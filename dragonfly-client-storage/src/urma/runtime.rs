@@ -1,10 +1,11 @@
 use super::{
     buffer::{
         BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
-        TxWindowLease,
+        RxBufferStateCounts, TxWindowLease,
     },
     Error, Result,
 };
+use dragonfly_client_metric::collect_urma_rx_state_metrics;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeConfig {
@@ -58,6 +59,25 @@ fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> 
     Ok(device_max.min(slot_size))
 }
 
+fn shared_endpoint_config(
+    runtime: &RuntimeConfig,
+    capability: &UrmaDeviceCapability,
+) -> crate::urma::lane::JettyConfig {
+    crate::urma::lane::JettyConfig {
+        send_depth: runtime
+            .send_jfc_depth
+            .min(capability.max_jfs_depth)
+            .min(u32::try_from(runtime.buffer_pool.tx_slot_count).unwrap_or(u32::MAX)),
+        recv_depth: runtime
+            .recv_jfc_depth
+            .min(capability.max_jfr_depth)
+            .min(u32::try_from(runtime.buffer_pool.rx_slot_count).unwrap_or(u32::MAX)),
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        token: 0,
+    }
+}
+
 /// Rust-owned capability subset copied from `urma_device_attr_t`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UrmaDeviceCapability {
@@ -85,7 +105,7 @@ mod native {
             RegisteredTxCompletionTx,
         },
         ffi::{self, NativeRuntime},
-        lane::{JettyConfig, JettyDescriptor, UrmaJetty, UrmaLane},
+        lane::{JettyConfig, JettyDescriptor, TransportMode, UrmaJetty, UrmaLane},
         native_error,
     };
     use std::{
@@ -149,8 +169,38 @@ mod native {
     struct SharedRmEndpoint {
         jetty: UrmaJetty,
         descriptor: JettyDescriptor,
-        config: JettyConfig,
-        effective_post_list_size: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct SharedRxStateSnapshot {
+        physical: RxBufferStateCounts,
+        posted_wrs: usize,
+        logical_credits: usize,
+    }
+
+    impl SharedRxStateSnapshot {
+        fn validate(self) -> Result<()> {
+            if self.physical.accounted() != self.physical.total {
+                return Err(Error::Protocol(format!(
+                    "shared RX slot conservation failed: accounted={} total={}",
+                    self.physical.accounted(),
+                    self.physical.total
+                )));
+            }
+            if self.physical.posted != self.posted_wrs {
+                return Err(Error::Protocol(format!(
+                    "shared RX WR conservation failed: physical_posted={} tracked_posted={}",
+                    self.physical.posted, self.posted_wrs
+                )));
+            }
+            if self.logical_credits > self.posted_wrs {
+                return Err(Error::Protocol(format!(
+                    "shared RX logical credit exceeds posted WRs: logical={} posted={}",
+                    self.logical_credits, self.posted_wrs
+                )));
+            }
+            Ok(())
+        }
     }
 
     impl SharedRmEndpoint {
@@ -159,7 +209,6 @@ mod native {
             send_jfc: &ffi::JfcHandle,
             recv_jfc: &ffi::JfcHandle,
             config: &JettyConfig,
-            max_post_list_size: u32,
         ) -> Result<Self> {
             let mut jetty = UrmaJetty::create(native, send_jfc, recv_jfc, config)?;
             let descriptor = match jetty.export_descriptor() {
@@ -171,24 +220,7 @@ mod native {
                     return Err(error);
                 }
             };
-            let effective_post_list_size = config
-                .post_list_size
-                .min(config.send_depth)
-                .min(config.recv_depth)
-                .min(max_post_list_size) as usize;
-            Ok(Self {
-                jetty,
-                descriptor,
-                config: *config,
-                effective_post_list_size,
-            })
-        }
-
-        /// Per-peer Jetty configuration must match the shared endpoint: RM
-        /// mode has exactly one Jetty, so a peer asking for different sizing
-        /// is a caller bug, not a reason to allocate a second endpoint.
-        fn matches_config(&self, config: &JettyConfig) -> bool {
-            &self.config == config
+            Ok(Self { jetty, descriptor })
         }
     }
 
@@ -197,6 +229,7 @@ mod native {
         capability: UrmaDeviceCapability,
         max_payload_size: u64,
         max_post_list_size: u32,
+        endpoint_config: JettyConfig,
         buffer_pool: Option<UrmaBufferPool>,
         recv_jfc: Option<UrmaJfc>,
         send_jfc: Option<UrmaJfc>,
@@ -260,6 +293,8 @@ mod native {
                 .min(config.recv_jfc_depth)
                 .min(u32::try_from(config.buffer_pool.tx_slot_count).unwrap_or(u32::MAX))
                 .min(u32::try_from(config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX));
+            let endpoint_config = shared_endpoint_config(&config, &capability);
+            validate_jetty_config(&endpoint_config, &capability)?;
 
             let send_jfc = match UrmaJfc::create(&mut native, JfcKind::Send, config.send_jfc_depth)
             {
@@ -304,6 +339,7 @@ mod native {
                 capability,
                 max_payload_size,
                 max_post_list_size,
+                endpoint_config,
                 buffer_pool: Some(buffer_pool),
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
@@ -320,14 +356,19 @@ mod native {
 
         pub(crate) fn create_lane(
             &mut self,
-            config: JettyConfig,
+            post_list_size: u32,
         ) -> Result<(u16, JettyDescriptor)> {
             if !self.accepting {
                 return Err(Error::InvalidConfiguration(
                     "runtime is no longer accepting operations".into(),
                 ));
             }
-            validate_jetty_config(&config, &self.capability)?;
+            if post_list_size == 0 || post_list_size > ffi::MAX_POST_LIST {
+                return Err(Error::InvalidConfiguration(format!(
+                    "post_list_size={post_list_size} is outside 1..={}",
+                    ffi::MAX_POST_LIST
+                )));
+            }
             let capability = self.capability.clone();
             let lane_id = self.next_lane_id;
             self.next_lane_id = self
@@ -336,13 +377,7 @@ mod native {
                 .filter(|id| *id != 0)
                 .ok_or_else(|| Error::InvalidConfiguration("lane id space exhausted".into()))?;
 
-            if let Some(endpoint) = self.endpoint.as_ref() {
-                if !endpoint.matches_config(&config) {
-                    return Err(Error::InvalidConfiguration(
-                        "RM peers must share one endpoint: per-peer Jetty config differs from the already-created shared endpoint".into(),
-                    ));
-                }
-            } else {
+            if self.endpoint.is_none() {
                 // First peer: create the one process-shared RM endpoint.
                 let native = self
                     .native
@@ -360,8 +395,7 @@ mod native {
                     native,
                     send_jfc.handle(),
                     recv_jfc.handle(),
-                    &config,
-                    self.max_post_list_size,
+                    &self.endpoint_config,
                 )?;
                 let (jetty_id, jfr_id) = endpoint.jetty.local_ids();
                 self.completions.register_endpoint(jetty_id, jfr_id)?;
@@ -375,7 +409,10 @@ mod native {
                 lane_id,
                 1,
                 capability,
-                endpoint.effective_post_list_size as u32,
+                post_list_size
+                    .min(self.endpoint_config.send_depth)
+                    .min(self.endpoint_config.recv_depth)
+                    .min(self.max_post_list_size),
             )?;
             self.lanes.insert(lane_id, lane);
             Ok((lane_id, endpoint.descriptor.clone()))
@@ -423,12 +460,13 @@ mod native {
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
                 .post_receive_window_registered(
                     &mut endpoint.jetty,
-                    endpoint.config.recv_depth as usize,
+                    self.endpoint_config.recv_depth as usize,
                     pool,
                     completions,
                     sequences,
                     completion_txs,
-                )
+                )?;
+            self.verify_shared_rx_state()
         }
 
         pub(crate) fn grant_send_credit(&mut self, lane_id: u16, count: u32) -> Result<()> {
@@ -490,10 +528,12 @@ mod native {
                 }
             }
             let reap = self.reap_drained_lanes();
-            match (progress, reap) {
+            let count = match (progress, reap) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(count), Ok(())) => Ok(count),
-            }
+            }?;
+            self.verify_shared_rx_state()?;
+            Ok(count)
         }
 
         pub(crate) fn outstanding(&self) -> usize {
@@ -501,10 +541,13 @@ mod native {
         }
 
         pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
-            self.buffer_pool
+            let count = self
+                .buffer_pool
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
-                .recycle_dropped_lease(recycle)
+                .recycle_dropped_lease(recycle)?;
+            self.verify_shared_rx_state()?;
+            Ok(count)
         }
 
         pub(crate) fn acquire_tx_window(&mut self, length: usize) -> Result<TxWindowLease> {
@@ -535,10 +578,40 @@ mod native {
             &mut self,
             lease: RegisteredRxWindowLease,
         ) -> Result<usize> {
-            self.buffer_pool
+            let count = self
+                .buffer_pool
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
-                .recycle_rx_lease(lease)
+                .recycle_rx_lease(lease)?;
+            self.verify_shared_rx_state()?;
+            Ok(count)
+        }
+
+        fn shared_rx_state(&self) -> Result<SharedRxStateSnapshot> {
+            let physical = self
+                .buffer_pool
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .rx_state_counts();
+            Ok(SharedRxStateSnapshot {
+                physical,
+                posted_wrs: self.completions.outstanding_recv(),
+                logical_credits: self.completions.logical_rx_credits(),
+            })
+        }
+
+        fn verify_shared_rx_state(&self) -> Result<()> {
+            let snapshot = self.shared_rx_state()?;
+            snapshot.validate()?;
+            collect_urma_rx_state_metrics(
+                snapshot.physical.free,
+                snapshot.physical.allocated,
+                snapshot.physical.posted,
+                snapshot.physical.ready,
+                snapshot.physical.leased,
+                snapshot.logical_credits,
+            );
+            Ok(())
         }
 
         pub(crate) fn transport_type(&self) -> u32 {
@@ -576,8 +649,9 @@ mod native {
         fn reap_drained_lanes(&mut self) -> Result<()> {
             // Per-peer retirement needs no endpoint flush: the shared Jetty
             // keeps serving other peers, and a PeerTarget is reaped once its
-            // own outstanding WRs (SEND plus the RECV window it posted) have
-            // all completed.
+            // own outstanding SEND WRs have completed. Shared-JFR receive WRs
+            // are anonymous endpoint resources and never hold a PeerTarget
+            // open.
             let drained = self
                 .lanes
                 .iter()
@@ -747,11 +821,10 @@ mod native {
                 "device does not advertise the resources required by a duplex Jetty".into(),
             ));
         }
-        if capability.transport_modes & config.transport_mode as u32 == 0 {
-            return Err(Error::InvalidConfiguration(format!(
-                "device does not advertise URMA {:?} transport mode",
-                config.transport_mode
-            )));
+        if capability.transport_modes & TransportMode::Rm as u32 == 0 {
+            return Err(Error::InvalidConfiguration(
+                "device does not advertise URMA RM transport mode".into(),
+            ));
         }
         for (name, value, maximum) in [
             ("send_depth", config.send_depth, capability.max_jfs_depth),
@@ -769,19 +842,6 @@ mod native {
             return Err(Error::InvalidConfiguration(
                 "device does not advertise a remote-SGE capability".into(),
             ));
-        }
-        if config.post_list_size == 0 || config.post_list_size > ffi::MAX_POST_LIST {
-            return Err(Error::InvalidConfiguration(format!(
-                "Jetty post_list_size={} is outside 1..={}",
-                config.post_list_size,
-                ffi::MAX_POST_LIST
-            )));
-        }
-        if !(1..=2).contains(&config.pipeline_depth) {
-            return Err(Error::InvalidConfiguration(format!(
-                "Jetty pipeline_depth={} is outside 1..=2",
-                config.pipeline_depth
-            )));
         }
         Ok(())
     }
@@ -849,6 +909,24 @@ pub(crate) use native::UrmaRuntime;
 mod tests {
     use super::*;
 
+    fn capability_for_depths(send: u32, recv: u32) -> UrmaDeviceCapability {
+        UrmaDeviceCapability {
+            transport_type: 0,
+            transport_modes: crate::urma::TransportMode::Rm as u32,
+            max_jfc: 2,
+            max_jfs: 1,
+            max_jfr: 1,
+            max_jetty: 1,
+            max_jfc_depth: send.max(recv),
+            max_jfs_depth: send,
+            max_jfr_depth: recv,
+            max_jfs_sge: 1,
+            max_jfs_rsge: 1,
+            max_jfr_sge: 1,
+            max_msg_size: u64::MAX,
+        }
+    }
+
     #[test]
     fn runtime_config_keeps_device_selection_and_m1_defaults() {
         let config = RuntimeConfig::new("urma0", 2);
@@ -886,5 +964,20 @@ mod tests {
             effective_max_message_size(4 * 1024 * 1024, 64 * 1024).unwrap(),
             64 * 1024
         );
+    }
+
+    #[test]
+    fn shared_endpoint_depth_is_process_owned_not_peer_configured() {
+        let mut runtime = RuntimeConfig::new("urma0", 0);
+        runtime.send_jfc_depth = 96;
+        runtime.recv_jfc_depth = 384;
+        runtime.buffer_pool.tx_slot_count = 64;
+        runtime.buffer_pool.rx_slot_count = 256;
+
+        let endpoint = shared_endpoint_config(&runtime, &capability_for_depths(80, 300));
+        assert_eq!(endpoint.send_depth, 64);
+        assert_eq!(endpoint.recv_depth, 256);
+        assert_eq!(endpoint.max_send_sge, 1);
+        assert_eq!(endpoint.max_recv_sge, 1);
     }
 }

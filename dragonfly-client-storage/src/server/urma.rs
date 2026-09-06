@@ -136,13 +136,11 @@ async fn acquire_process_transfer(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SendDepths {
     window_chunks: u32,
-    lane_depth: u32,
 }
 
 fn send_depths(
     configured_window_chunks: u32,
     registered_window_capacity: u32,
-    max_concurrent_transfers: u32,
     native_capacity: u32,
 ) -> SendDepths {
     let native_capacity = native_capacity.max(1);
@@ -150,13 +148,7 @@ fn send_depths(
         .max(1)
         .min(registered_window_capacity.max(1))
         .min(native_capacity);
-    SendDepths {
-        window_chunks,
-        lane_depth: window_chunks
-            .saturating_mul(max_concurrent_transfers.max(1))
-            .min(native_capacity)
-            .max(window_chunks),
-    }
+    SendDepths { window_chunks }
 }
 
 struct RequiredTxWaiter<'a> {
@@ -324,7 +316,7 @@ impl UrmaServer {
         )
         .map_err(client_error)?;
         let transport_mode = TransportMode::Rm;
-        if !fabric.supports_transport_mode(transport_mode) {
+        if !fabric.supports_rm() {
             return Err(ClientError::Unsupported(format!(
                 "URMA device does not advertise {transport_mode:?} mode"
             )));
@@ -351,19 +343,15 @@ impl UrmaServer {
         let depths = send_depths(
             urma_config.max_inflight_chunks,
             fabric.max_tx_window_chunks(urma_config.pipeline_depth),
-            urma_config.max_concurrent_transfers,
             fabric.max_native_send_depth(),
         );
         let lane_config = UrmaLaneConfig {
-            transport_mode: capability.transport_mode,
-            send_depth: depths.lane_depth,
-            recv_depth: urma_config.max_inflight_chunks,
             post_list_size: urma_config.post_list_size,
             pipeline_depth: urma_config.pipeline_depth,
             ..Default::default()
         };
         info!(
-            native_send_depth = depths.lane_depth,
+            native_send_depth = fabric.max_native_send_depth(),
             piece_window_chunks = depths.window_chunks,
             max_concurrent_transfers = urma_config.max_concurrent_transfers,
             pipeline_depth = urma_config.pipeline_depth,
@@ -1211,35 +1199,10 @@ mod tests {
     }
 
     #[test]
-    fn send_depths_separate_piece_window_from_lane_capacity() {
-        assert_eq!(
-            send_depths(32, 64, 16, 128),
-            SendDepths {
-                window_chunks: 32,
-                lane_depth: 128,
-            }
-        );
-        assert_eq!(
-            send_depths(32, 64, 1, 128),
-            SendDepths {
-                window_chunks: 32,
-                lane_depth: 32,
-            }
-        );
-        assert_eq!(
-            send_depths(32, 16, 16, 128),
-            SendDepths {
-                window_chunks: 16,
-                lane_depth: 128,
-            }
-        );
-        assert_eq!(
-            send_depths(32, 64, 16, 8),
-            SendDepths {
-                window_chunks: 8,
-                lane_depth: 8,
-            }
-        );
+    fn send_window_is_bounded_by_registered_and_shared_capacity() {
+        assert_eq!(send_depths(32, 64, 128), SendDepths { window_chunks: 32 });
+        assert_eq!(send_depths(32, 16, 128), SendDepths { window_chunks: 16 });
+        assert_eq!(send_depths(32, 64, 8), SendDepths { window_chunks: 8 });
     }
 
     #[test]

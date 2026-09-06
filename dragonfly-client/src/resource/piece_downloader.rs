@@ -253,7 +253,7 @@ pub mod urma {
             ) {
                 Ok(fabric) => {
                     let transport_mode = TransportMode::Rm;
-                    if !fabric.supports_transport_mode(transport_mode) {
+                    if !fabric.supports_rm() {
                         *state = FabricState::Failed(Instant::now());
                         return Err(Error::Unsupported(format!(
                             "URMA device does not advertise {transport_mode:?} mode"

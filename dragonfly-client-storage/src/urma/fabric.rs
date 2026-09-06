@@ -12,7 +12,7 @@ use super::{
         RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
         RegisteredTxCompletionTx,
     },
-    lane::{JettyConfig, JettyDescriptor, TransportMode},
+    lane::{JettyDescriptor, TransportMode},
     runtime::{RuntimeConfig, UrmaRuntime},
     Error, Result,
 };
@@ -59,6 +59,67 @@ impl Drop for RequiredRxWaiter {
     }
 }
 
+fn try_acquire_optional_rx_permit(
+    required_waiters: &RequiredRxWaiters,
+    permits: Arc<Semaphore>,
+    requested: u32,
+) -> Result<OwnedSemaphorePermit> {
+    if required_waiters.has_waiters() {
+        return Err(Error::BufferUnavailable {
+            kind: "shared RX optional",
+            requested: requested as usize,
+            available: 0,
+        });
+    }
+    let permit =
+        permits
+            .try_acquire_many_owned(requested)
+            .map_err(|_| Error::BufferUnavailable {
+                kind: "shared RX optional",
+                requested: requested as usize,
+                available: 0,
+            })?;
+    // Close the check/acquire race as far as the async facade can: if a
+    // required first window appeared while the non-blocking acquire ran,
+    // immediately return the borrowed surplus. The later Fabric post gate
+    // performs the same check before submitting native work.
+    if required_waiters.has_waiters() {
+        drop(permit);
+        return Err(Error::BufferUnavailable {
+            kind: "shared RX optional",
+            requested: requested as usize,
+            available: 0,
+        });
+    }
+    Ok(permit)
+}
+
+#[derive(Default)]
+struct SharedDepthAdmission {
+    endpoint: Option<(u32, Arc<Semaphore>)>,
+}
+
+impl SharedDepthAdmission {
+    fn permits(&mut self, depth: u32, direction: &'static str) -> Result<Arc<Semaphore>> {
+        if depth == 0 {
+            return Err(Error::InvalidConfiguration(format!(
+                "shared RM {direction} depth must be non-zero"
+            )));
+        }
+        if let Some((active_depth, permits)) = &self.endpoint {
+            if *active_depth != depth {
+                return Err(Error::InvalidConfiguration(format!(
+                    "shared RM {direction} admission depth differs: active={active_depth} requested={depth}"
+                )));
+            }
+            return Ok(Arc::clone(permits));
+        }
+        let permits = Arc::new(Semaphore::new(depth as usize));
+        self.endpoint = Some((depth, Arc::clone(&permits)));
+        Ok(permits)
+    }
+}
+
 fn window_chunks_for_slots(slots: usize, pipeline_depth: u32) -> u32 {
     let depth = usize::try_from(pipeline_depth).unwrap_or(usize::MAX).max(1);
     u32::try_from((slots / depth).max(1)).unwrap_or(u32::MAX)
@@ -83,43 +144,35 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
 /// the owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UrmaLaneConfig {
-    pub(crate) transport_mode: TransportMode,
-    pub send_depth: u32,
-    pub recv_depth: u32,
-    pub max_send_sge: u32,
-    pub max_recv_sge: u32,
     pub post_list_size: u32,
     pub pipeline_depth: u32,
-    pub token: u32,
 }
 
 impl Default for UrmaLaneConfig {
     fn default() -> Self {
         Self {
-            transport_mode: TransportMode::Rm,
-            send_depth: 128,
-            recv_depth: 512,
-            max_send_sge: 1,
-            max_recv_sge: 1,
             post_list_size: 1,
             pipeline_depth: 2,
-            token: 0,
         }
     }
 }
 
-impl From<UrmaLaneConfig> for JettyConfig {
-    fn from(config: UrmaLaneConfig) -> Self {
-        Self {
-            transport_mode: config.transport_mode,
-            send_depth: config.send_depth,
-            recv_depth: config.recv_depth,
-            max_send_sge: config.max_send_sge,
-            max_recv_sge: config.max_recv_sge,
-            post_list_size: config.post_list_size,
-            pipeline_depth: config.pipeline_depth,
-            token: config.token,
+impl UrmaLaneConfig {
+    fn validate(self) -> Result<()> {
+        if self.post_list_size == 0 || self.post_list_size > crate::urma::ffi::MAX_POST_LIST {
+            return Err(Error::InvalidConfiguration(format!(
+                "RM PeerTarget post_list_size={} is outside 1..={}",
+                self.post_list_size,
+                crate::urma::ffi::MAX_POST_LIST
+            )));
         }
+        if !(1..=2).contains(&self.pipeline_depth) {
+            return Err(Error::InvalidConfiguration(format!(
+                "RM PeerTarget pipeline_depth={} is outside 1..=2",
+                self.pipeline_depth
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -243,6 +296,8 @@ impl UrmaFabric {
                     max_jfr_depth,
                     max_jfs_depth,
                     required_rx_waiters: RequiredRxWaiters::default(),
+                    shared_rx_admission: Mutex::new(SharedDepthAdmission::default()),
+                    shared_tx_admission: Mutex::new(SharedDepthAdmission::default()),
                     shutdown: AsyncMutex::new(()),
                     join: Mutex::new(Some(join)),
                 }),
@@ -324,8 +379,8 @@ impl UrmaFabricHandle {
     }
 
     /// Reports whether the provider advertised the selected transport mode.
-    pub fn supports_transport_mode(&self, mode: TransportMode) -> bool {
-        self.inner.transport_modes & mode as u32 != 0
+    pub fn supports_rm(&self) -> bool {
+        self.inner.transport_modes & TransportMode::Rm as u32 != 0
     }
 
     /// max_message_size returns the effective single-message payload limit: the
@@ -362,20 +417,30 @@ impl UrmaFabricHandle {
         window_chunks_for_slots(slots, pipeline_depth)
     }
 
-    /// Maximum number of native RECV WRs one lane can keep outstanding,
-    /// bounded by both the provider JFR capability and registered RX slots.
+    /// Maximum number of native RECV WRs the process-wide shared JFR can keep
+    /// outstanding, bounded by provider capability and registered RX slots.
     pub(crate) fn max_native_receive_depth(&self) -> u32 {
-        self.inner.max_jfr_depth.min(
-            u32::try_from(self.inner.runtime_config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX),
-        )
+        self.inner
+            .runtime_config
+            .recv_jfc_depth
+            .min(self.inner.max_jfr_depth)
+            .min(
+                u32::try_from(self.inner.runtime_config.buffer_pool.rx_slot_count)
+                    .unwrap_or(u32::MAX),
+            )
     }
 
-    /// Maximum number of native SEND WRs one lane can keep outstanding,
-    /// bounded by both the provider JFS capability and registered TX slots.
+    /// Maximum number of native SEND WRs the process-wide shared JFS can keep
+    /// outstanding, bounded by provider capability and registered TX slots.
     pub(crate) fn max_native_send_depth(&self) -> u32 {
-        self.inner.max_jfs_depth.min(
-            u32::try_from(self.inner.runtime_config.buffer_pool.tx_slot_count).unwrap_or(u32::MAX),
-        )
+        self.inner
+            .runtime_config
+            .send_jfc_depth
+            .min(self.inner.max_jfs_depth)
+            .min(
+                u32::try_from(self.inner.runtime_config.buffer_pool.tx_slot_count)
+                    .unwrap_or(u32::MAX),
+            )
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -387,6 +452,7 @@ impl UrmaFabricHandle {
     /// Creates a local lane and returns its stable id plus the serialized local
     /// Jetty descriptor for the existing Dragonfly control plane.
     pub(crate) async fn create_lane(&self, config: UrmaLaneConfig) -> Result<(u16, Vec<u8>)> {
+        config.validate()?;
         self.submit(|reply| FabricCommand::CreateLane { config, reply })
             .await
     }
@@ -412,6 +478,36 @@ impl UrmaFabricHandle {
 
     pub(crate) fn required_rx_waiter(&self) -> impl Drop {
         self.inner.required_rx_waiters.enter()
+    }
+
+    /// Returns the one process-wide RX admission semaphore. Every client
+    /// PeerTarget shares it because all receive WRs consume the same RM JFR
+    /// and registered RX arena.
+    pub(crate) fn shared_rx_permits(&self, depth: u32) -> Result<Arc<Semaphore>> {
+        self.inner
+            .shared_rx_admission
+            .lock()
+            .unwrap()
+            .permits(depth, "receive")
+    }
+
+    /// Returns the one process-wide TX admission semaphore. PeerTargets share
+    /// the same RM JFS and registered TX arena, so per-peer semaphores would
+    /// multiply logical capacity beyond the native endpoint depth.
+    pub(crate) fn shared_tx_permits(&self, depth: u32) -> Result<Arc<Semaphore>> {
+        self.inner
+            .shared_tx_admission
+            .lock()
+            .unwrap()
+            .permits(depth, "send")
+    }
+
+    pub(crate) fn try_acquire_optional_rx_permit(
+        &self,
+        permits: Arc<Semaphore>,
+        requested: u32,
+    ) -> Result<OwnedSemaphorePermit> {
+        try_acquire_optional_rx_permit(&self.inner.required_rx_waiters, permits, requested)
     }
 
     pub(crate) async fn try_post_receive_window_registered(
@@ -683,6 +779,8 @@ struct FabricInner {
     max_jfr_depth: u32,
     max_jfs_depth: u32,
     required_rx_waiters: RequiredRxWaiters,
+    shared_rx_admission: Mutex<SharedDepthAdmission>,
+    shared_tx_admission: Mutex<SharedDepthAdmission>,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -888,7 +986,7 @@ fn handle_command(
     match command {
         FabricCommand::CreateLane { config, reply } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
-                let (lane_id, descriptor) = runtime.create_lane(config.into())?;
+                let (lane_id, descriptor) = runtime.create_lane(config.post_list_size)?;
                 match descriptor.serialize() {
                     Ok(descriptor) => Ok((lane_id, descriptor)),
                     Err(error) => {
@@ -1091,6 +1189,37 @@ mod tests {
     }
 
     #[test]
+    fn optional_rx_borrow_yields_to_required_waiters_and_capacity() {
+        let waiters = RequiredRxWaiters::default();
+        let permits = Arc::new(Semaphore::new(2));
+
+        let borrowed = try_acquire_optional_rx_permit(&waiters, permits.clone(), 2).unwrap();
+        assert!(try_acquire_optional_rx_permit(&waiters, permits.clone(), 1).is_err());
+        drop(borrowed);
+
+        let required = waiters.enter();
+        assert!(try_acquire_optional_rx_permit(&waiters, permits.clone(), 1).is_err());
+        assert_eq!(permits.available_permits(), 2);
+        drop(required);
+
+        assert!(try_acquire_optional_rx_permit(&waiters, permits, 1).is_ok());
+    }
+
+    #[test]
+    fn shared_rx_admission_reuses_one_global_semaphore_and_rejects_depth_changes() {
+        let mut admission = SharedDepthAdmission::default();
+        let first = admission.permits(8, "receive").unwrap();
+        let second = admission.permits(8, "receive").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let permit = first.clone().try_acquire_many_owned(8).unwrap();
+        assert!(second.clone().try_acquire_owned().is_err());
+        drop(permit);
+        assert!(second.try_acquire_owned().is_ok());
+        assert!(admission.permits(7, "receive").is_err());
+        assert!(SharedDepthAdmission::default().permits(0, "send").is_err());
+    }
+
+    #[test]
     fn dropped_registered_lease_uses_urgent_owner_command() {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
@@ -1131,26 +1260,20 @@ mod tests {
     }
 
     #[test]
-    fn lane_config_maps_to_native_jetty_config() {
+    fn lane_config_contains_only_peer_local_pipeline_policy() {
         let config = UrmaLaneConfig {
-            transport_mode: TransportMode::Rm,
-            send_depth: 1,
-            recv_depth: 2,
-            max_send_sge: 3,
-            max_recv_sge: 4,
             post_list_size: 5,
             pipeline_depth: 2,
-            token: 6,
         };
-        let native: JettyConfig = config.into();
-        assert_eq!(native.transport_mode, TransportMode::Rm);
-        assert_eq!(native.send_depth, 1);
-        assert_eq!(native.recv_depth, 2);
-        assert_eq!(native.post_list_size, 5);
-        assert_eq!(native.pipeline_depth, 2);
-        assert_eq!(native.max_send_sge, 3);
-        assert_eq!(native.max_recv_sge, 4);
-        assert_eq!(native.token, 6);
+        assert_eq!(config.post_list_size, 5);
+        assert_eq!(config.pipeline_depth, 2);
+        assert!(config.validate().is_ok());
+        assert!(UrmaLaneConfig {
+            pipeline_depth: 0,
+            ..config
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

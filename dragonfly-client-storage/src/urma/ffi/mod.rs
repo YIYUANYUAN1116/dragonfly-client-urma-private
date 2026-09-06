@@ -35,7 +35,6 @@ pub(crate) struct DeviceCapability {
 }
 
 pub(crate) struct JettyConfig {
-    pub transport_mode: u32,
     pub send_depth: u32,
     pub recv_depth: u32,
     pub max_send_sge: u32,
@@ -355,7 +354,6 @@ impl JettyHandle {
             .raw
             .ok_or(FfiError::Contract("recv JFC is closed"))?;
         let raw_config = sys::dfurma_jetty_config_t {
-            transport_mode: config.transport_mode,
             send_depth: config.send_depth,
             recv_depth: config.recv_depth,
             max_send_sge: config.max_send_sge,

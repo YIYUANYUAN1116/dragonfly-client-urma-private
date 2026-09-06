@@ -4,8 +4,10 @@ use super::{
     lane::{OperationType, WrToken},
     native_error,
     target::PeerTargetRegistry,
+    transfer::RoutingToken,
     Error, Result,
 };
+use dragonfly_client_metric::collect_urma_rx_anomaly_metrics;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -25,6 +27,41 @@ pub(crate) struct CompletionStats {
     pub(crate) poll_calls: u64,
     pub(crate) empty_polls: u64,
     pub(crate) max_outstanding: u64,
+    pub(crate) rx_unknown_source: u64,
+    pub(crate) rx_invalid_token: u64,
+    pub(crate) rx_stale_token: u64,
+    pub(crate) rx_over_credit: u64,
+    pub(crate) rx_ambiguous_token: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RxRouteFailure {
+    MissingSource,
+    UnauthorizedSource,
+    InvalidToken,
+    StaleToken,
+    OverCredit,
+    AmbiguousToken,
+}
+
+impl RxRouteFailure {
+    fn into_error(self) -> Error {
+        Error::Protocol(
+            match self {
+                Self::MissingSource => "receive CQE has no remote Jetty identity",
+                Self::UnauthorizedSource => "receive CQE source is not an authorized PeerTarget",
+                Self::InvalidToken => "receive CQE has an invalid routing token",
+                Self::StaleToken => "receive CQE routing token refers to no active transfer",
+                Self::OverCredit => {
+                    "receive CQE chunk exceeds its source PeerTarget transfer credit"
+                }
+                Self::AmbiguousToken => {
+                    "receive CQE routing token is ambiguous across PeerTarget aliases"
+                }
+            }
+            .into(),
+        )
+    }
 }
 
 pub(crate) struct RegisteredRxCompletion {
@@ -214,8 +251,7 @@ pub(crate) struct CompletionRouter {
     /// source through the PeerTargetRegistry because posted RECV WRs are
     /// anonymous on the shared receive queue.
     endpoint: Option<EndpointLifecycle>,
-    targets: PeerTargetRegistry,
-    registered_rx_by_identity: HashMap<(u16, u64), RegisteredRxCompletionTx>,
+    targets: PeerTargetRegistry<RegisteredRxCompletionTx>,
     failed_peers: Vec<u16>,
     stats: CompletionStats,
 }
@@ -236,7 +272,6 @@ impl CompletionRouter {
             outstanding_by_lane: HashMap::new(),
             endpoint: None,
             targets: PeerTargetRegistry::default(),
-            registered_rx_by_identity: HashMap::new(),
             failed_peers: Vec::new(),
             stats: CompletionStats::default(),
         })
@@ -261,19 +296,15 @@ impl CompletionRouter {
         // Per-peer retirement only marks the PeerTarget draining: the shared
         // Jetty must keep serving the remaining peers, so no flush is armed
         // here. Endpoint-level flush escalation lives in `begin_endpoint_flush`.
-        if self.targets.contains(lane_id) {
+        let completions = if self.targets.contains(lane_id) {
             self.targets.begin_draining(lane_id)?;
-        }
+            self.targets.drain_routing_tokens(lane_id)?
+        } else {
+            Vec::new()
+        };
         let error = Error::Protocol(format!("URMA PeerTarget {lane_id} is retiring"));
-        let identities = self
-            .registered_rx_by_identity
-            .keys()
-            .filter_map(|&(owner, sequence)| (owner == lane_id).then_some((owner, sequence)))
-            .collect::<Vec<_>>();
-        for identity in identities {
-            if let Some(completion) = self.registered_rx_by_identity.remove(&identity) {
-                let _ = completion.send(Err(error.clone()));
-            }
+        for completion in completions {
+            let _ = completion.send(Err(error.clone()));
         }
         tracing::debug!(lane_id, "waiting for URMA PeerTarget WRs to drain");
         Ok(())
@@ -304,30 +335,62 @@ impl CompletionRouter {
     /// shared receive queue the posting WR's token lane does not imply the
     /// data source: any peer's SEND may consume any posted RECV, so the
     /// source peer is resolved from the hardware-reported remote identity.
+    fn classify_source(
+        &self,
+        remote_id: Option<ffi::RemoteJettyId>,
+        routing_token: u64,
+    ) -> std::result::Result<u16, RxRouteFailure> {
+        let remote_id = remote_id.ok_or(RxRouteFailure::MissingSource)?;
+        let routing_token =
+            RoutingToken::decode(routing_token).map_err(|_| RxRouteFailure::InvalidToken)?;
+        let routes = self
+            .targets
+            .routes(remote_id)
+            .map_err(|_| RxRouteFailure::UnauthorizedSource)?;
+        let matches = routes
+            .iter()
+            .filter(|route| self.targets.contains_routing_token(route.id, routing_token))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [route] => Ok(route.id),
+            [] if routes
+                .iter()
+                .any(|route| self.targets.contains_transfer(route.id, routing_token)) =>
+            {
+                Err(RxRouteFailure::OverCredit)
+            }
+            [] => Err(RxRouteFailure::StaleToken),
+            _ => Err(RxRouteFailure::AmbiguousToken),
+        }
+    }
+
     fn resolve_source(
         &self,
         remote_id: Option<ffi::RemoteJettyId>,
         routing_token: u64,
     ) -> Result<u16> {
-        let remote_id = remote_id
-            .ok_or_else(|| Error::Protocol("receive CQE has no remote Jetty identity".into()))?;
-        let matches = self
-            .targets
-            .routes(remote_id)?
-            .into_iter()
-            .filter(|route| {
-                self.registered_rx_by_identity
-                    .contains_key(&(route.id, routing_token))
-            })
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [route] => Ok(route.id),
-            [] => Err(Error::Protocol(
-                "receive CQE routing token is not registered by its source PeerTarget".into(),
-            )),
-            _ => Err(Error::Protocol(
-                "receive CQE routing token is ambiguous across PeerTarget aliases".into(),
-            )),
+        self.classify_source(remote_id, routing_token)
+            .map_err(RxRouteFailure::into_error)
+    }
+
+    fn record_rx_route_failure(&mut self, failure: RxRouteFailure) {
+        let reason = match failure {
+            RxRouteFailure::MissingSource => "missing_source",
+            RxRouteFailure::UnauthorizedSource => "unknown_source",
+            RxRouteFailure::InvalidToken => "invalid_token",
+            RxRouteFailure::StaleToken => "stale_token",
+            RxRouteFailure::OverCredit => "over_credit",
+            RxRouteFailure::AmbiguousToken => "ambiguous_token",
+        };
+        collect_urma_rx_anomaly_metrics(reason);
+        match failure {
+            RxRouteFailure::MissingSource | RxRouteFailure::UnauthorizedSource => {
+                self.stats.rx_unknown_source += 1;
+            }
+            RxRouteFailure::InvalidToken => self.stats.rx_invalid_token += 1,
+            RxRouteFailure::StaleToken => self.stats.rx_stale_token += 1,
+            RxRouteFailure::OverCredit => self.stats.rx_over_credit += 1,
+            RxRouteFailure::AmbiguousToken => self.stats.rx_ambiguous_token += 1,
         }
     }
 
@@ -352,11 +415,7 @@ impl CompletionRouter {
     }
 
     pub(crate) fn unregister_lane(&mut self, lane_id: u16) -> Result<()> {
-        if self
-            .registered_rx_by_identity
-            .keys()
-            .any(|(registered_lane_id, _)| *registered_lane_id == lane_id)
-        {
+        if self.targets.has_routing_tokens(lane_id) {
             return Err(Error::Protocol(format!(
                 "cannot unregister lane {lane_id} with registered RX identities"
             )));
@@ -397,13 +456,9 @@ impl CompletionRouter {
                 "registered RX owner must be a PeerTarget".into(),
             ));
         }
-        let identity = (lane_id, sequence);
-        if self.registered_rx_by_identity.contains_key(&identity) {
-            return Err(Error::Protocol(format!(
-                "duplicate registered RX identity: lane_id={} sequence={sequence}",
-                lane_id
-            )));
-        }
+        let routing_token = RoutingToken::decode(sequence)?;
+        self.targets
+            .validate_routing_token(lane_id, routing_token)?;
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -411,13 +466,14 @@ impl CompletionRouter {
         if self.outstanding[slot].is_some() {
             return Err(Error::Protocol("duplicate outstanding slot".into()));
         }
+        self.targets
+            .register_routing_token(lane_id, routing_token, completion)?;
         self.outstanding[slot] = Some(OutstandingWr {
             user_ctx,
             handle,
             sequence: Some(sequence),
             completion: None,
         });
-        self.registered_rx_by_identity.insert(identity, completion);
         self.outstanding_total += 1;
         self.outstanding_recv += 1;
         self.stats.recv_post += 1;
@@ -440,14 +496,9 @@ impl CompletionRouter {
                     "duplicate RX identity in registered window: lane_id={lane_id} sequence={sequence}"
                 )));
             }
-            if self
-                .registered_rx_by_identity
-                .contains_key(&(lane_id, sequence))
-            {
-                return Err(Error::Protocol(format!(
-                    "registered RX identity is already active: lane_id={lane_id} sequence={sequence}"
-                )));
-            }
+            let routing_token = RoutingToken::decode(sequence)?;
+            self.targets
+                .validate_routing_token(lane_id, routing_token)?;
         }
         Ok(())
     }
@@ -495,8 +546,9 @@ impl CompletionRouter {
         lane_id: u16,
         imm_data: u64,
     ) -> Result<RegisteredRxCompletionTx> {
-        self.registered_rx_by_identity
-            .remove(&(lane_id, imm_data))
+        let routing_token = RoutingToken::decode(imm_data)?;
+        self.targets
+            .take_routing_token(lane_id, routing_token)
             .ok_or_else(|| {
                 Error::Protocol(format!(
                     "URMA SEND_IMM completion has no registered RX identity: lane_id={lane_id} sequence={imm_data}"
@@ -619,14 +671,16 @@ impl CompletionRouter {
                 Ok(routing_token) => routing_token,
                 Err(error) => {
                     self.stats.cqe_error += 1;
+                    self.record_rx_route_failure(RxRouteFailure::InvalidToken);
                     return Err(error);
                 }
             };
-            match self.resolve_source(record.remote_id, routing_token) {
+            match self.classify_source(record.remote_id, routing_token) {
                 Ok(source) => Some(source),
-                Err(error) => {
+                Err(failure) => {
                     self.stats.cqe_error += 1;
-                    return Err(error);
+                    self.record_rx_route_failure(failure);
+                    return Err(failure.into_error());
                 }
             }
         } else if expected_recv {
@@ -832,6 +886,14 @@ impl CompletionRouter {
         self.outstanding_total
     }
 
+    pub(crate) fn outstanding_recv(&self) -> usize {
+        self.outstanding_recv
+    }
+
+    pub(crate) fn logical_rx_credits(&self) -> usize {
+        self.targets.routing_token_count()
+    }
+
     pub(crate) fn outstanding_for_lane(&self, lane_id: u16) -> usize {
         self.outstanding_by_lane
             .get(&lane_id)
@@ -847,7 +909,7 @@ impl CompletionRouter {
     /// releasing native WR or buffer ownership. Later CQEs still retire those
     /// resources through the normal route path.
     pub(crate) fn fail_pending(&mut self, error: &Error) {
-        for (_, completion) in self.registered_rx_by_identity.drain() {
+        for completion in self.targets.drain_all_routing_tokens() {
             let _ = completion.send(Err(error.clone()));
         }
         for outstanding in self.outstanding.iter_mut().flatten() {
@@ -896,6 +958,20 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
+    fn authorize_test_peer(router: &mut CompletionRouter, lane_id: u16) {
+        router
+            .authorize_remote(
+                lane_id,
+                1,
+                ffi::RemoteJettyId {
+                    eid: [lane_id as u8; ffi::EID_SIZE],
+                    uasid: u32::from(lane_id),
+                    id: u32::from(lane_id),
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn deadline_helper_expires() {
         assert!(deadline_expired(Instant::now()));
@@ -910,6 +986,7 @@ mod tests {
     #[test]
     fn shared_jfr_capacity_is_global_across_logical_peers() {
         let mut router = CompletionRouter::new(4).unwrap();
+        authorize_test_peer(&mut router, 1);
         let context = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
             .encode()
             .unwrap();
@@ -918,7 +995,7 @@ mod tests {
                 1,
                 context,
                 ffi::WrHandle::without_native(),
-                Some(1),
+                Some((1u64 << 32) | 1),
                 oneshot::channel().0,
             )
             .unwrap();
@@ -946,7 +1023,7 @@ mod tests {
                 7,
                 context,
                 ffi::WrHandle::without_native(),
-                Some(11),
+                Some((1u64 << 32) | 11),
                 completion,
             )
             .unwrap();
@@ -1016,6 +1093,7 @@ mod tests {
     #[test]
     fn registered_rx_identity_routes_across_posted_wr_ownership() {
         let mut router = CompletionRouter::new(4).unwrap();
+        authorize_test_peer(&mut router, 1);
         let sequence_a = (7u64 << 32) | 3;
         let sequence_b = (8u64 << 32) | 5;
         let context_a = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
@@ -1086,6 +1164,7 @@ mod tests {
     #[test]
     fn registered_rx_identity_preflight_is_lane_scoped_and_fails_pending() {
         let mut router = CompletionRouter::new(4).unwrap();
+        authorize_test_peer(&mut router, 1);
         let sequence = (7u64 << 32) | 3;
         assert!(router
             .validate_registered_rx_identities(1, &[sequence, sequence])
@@ -1299,6 +1378,7 @@ mod tests {
     fn recv_cqe_fails_closed_on_unknown_native_jetty() {
         let mut router = CompletionRouter::new(4).unwrap();
         router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
 
         let recv_ctx = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
             .encode()
@@ -1308,7 +1388,7 @@ mod tests {
                 1,
                 recv_ctx,
                 ffi::WrHandle::without_native(),
-                Some(1),
+                Some((1u64 << 32) | 1),
                 oneshot::channel().0,
             )
             .unwrap();
@@ -1481,6 +1561,8 @@ mod tests {
     #[test]
     fn receive_source_authorization_is_full_identity_and_fail_closed() {
         let mut router = CompletionRouter::new(4).unwrap();
+        let token_a = (7u64 << 32) | 99;
+        let token_b = (8u64 << 32) | 100;
         let expected = ffi::RemoteJettyId {
             eid: [7; ffi::EID_SIZE],
             uasid: 11,
@@ -1491,38 +1573,124 @@ mod tests {
         // Without an authorized PeerTarget the remote identity resolves to
         // nothing: fail closed.
         assert!(matches!(
-            router.resolve_source(Some(expected), 99),
+            router.resolve_source(Some(expected), token_a),
             Err(Error::Protocol(_))
         ));
         router.authorize_remote(1, 1, expected).unwrap();
         router
-            .registered_rx_by_identity
-            .insert((1, 99), oneshot::channel().0);
-        assert_eq!(router.resolve_source(Some(expected), 99).unwrap(), 1);
+            .targets
+            .register_routing_token(
+                1,
+                RoutingToken::decode(token_a).unwrap(),
+                oneshot::channel().0,
+            )
+            .unwrap();
+        assert_eq!(router.resolve_source(Some(expected), token_a).unwrap(), 1);
         assert!(matches!(
-            router.resolve_source(None, 99),
+            router.resolve_source(None, token_a),
             Err(Error::Protocol(_))
         ));
         assert!(matches!(
-            router.resolve_source(Some(different), 99),
+            router.resolve_source(Some(different), token_a),
             Err(Error::Protocol(_))
         ));
         // An unassigned remote identity (id 0) must also fail closed.
         assert!(matches!(
-            router.resolve_source(Some(ffi::RemoteJettyId { id: 0, ..expected }), 99),
+            router.resolve_source(Some(ffi::RemoteJettyId { id: 0, ..expected }), token_a),
             Err(Error::Protocol(_))
         ));
 
         // Rebinding the same PeerTarget to a new remote identity for a new
         // generation is rejected while the old binding stays authoritative.
         assert!(router.authorize_remote(1, 2, different).is_err());
-        assert_eq!(router.resolve_source(Some(expected), 99).unwrap(), 1);
+        assert_eq!(router.resolve_source(Some(expected), token_a).unwrap(), 1);
         // A second control session may alias the same process-wide endpoint;
         // its distinct routing tokens disambiguate receive ownership.
         router.authorize_remote(2, 1, expected).unwrap();
         router
-            .registered_rx_by_identity
-            .insert((2, 100), oneshot::channel().0);
-        assert_eq!(router.resolve_source(Some(expected), 100).unwrap(), 2);
+            .targets
+            .register_routing_token(
+                2,
+                RoutingToken::decode(token_b).unwrap(),
+                oneshot::channel().0,
+            )
+            .unwrap();
+        assert_eq!(router.resolve_source(Some(expected), token_b).unwrap(), 2);
+        router
+            .targets
+            .register_routing_token(
+                2,
+                RoutingToken::decode(token_a).unwrap(),
+                oneshot::channel().0,
+            )
+            .unwrap();
+        assert!(matches!(
+            router.resolve_source(Some(expected), token_a),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn receive_route_failures_are_classified_without_peer_cardinality() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        let remote = ffi::RemoteJettyId {
+            eid: [9; ffi::EID_SIZE],
+            uasid: 9,
+            id: 9,
+        };
+        let token = RoutingToken::encode(4, 2).unwrap();
+
+        assert_eq!(
+            router.classify_source(None, token),
+            Err(RxRouteFailure::MissingSource)
+        );
+        assert_eq!(
+            router.classify_source(Some(remote), token),
+            Err(RxRouteFailure::UnauthorizedSource)
+        );
+        router.authorize_remote(1, 1, remote).unwrap();
+        assert_eq!(
+            router.classify_source(Some(remote), token),
+            Err(RxRouteFailure::StaleToken)
+        );
+        assert_eq!(
+            router.classify_source(Some(remote), 2),
+            Err(RxRouteFailure::InvalidToken)
+        );
+        router.authorize_remote(2, 1, remote).unwrap();
+        let decoded = RoutingToken::decode(token).unwrap();
+        router
+            .targets
+            .register_routing_token(1, decoded, oneshot::channel().0)
+            .unwrap();
+        assert_eq!(
+            router.classify_source(Some(remote), RoutingToken::encode(4, 3).unwrap()),
+            Err(RxRouteFailure::OverCredit)
+        );
+        router
+            .targets
+            .register_routing_token(2, decoded, oneshot::channel().0)
+            .unwrap();
+        assert_eq!(
+            router.classify_source(Some(remote), token),
+            Err(RxRouteFailure::AmbiguousToken)
+        );
+
+        for failure in [
+            RxRouteFailure::MissingSource,
+            RxRouteFailure::UnauthorizedSource,
+            RxRouteFailure::InvalidToken,
+            RxRouteFailure::StaleToken,
+            RxRouteFailure::OverCredit,
+            RxRouteFailure::AmbiguousToken,
+        ] {
+            router.record_rx_route_failure(failure);
+        }
+        let stats = router.stats();
+        assert_eq!(stats.rx_unknown_source, 2);
+        assert_eq!(stats.rx_invalid_token, 1);
+        assert_eq!(stats.rx_stale_token, 1);
+        assert_eq!(stats.rx_over_credit, 1);
+        assert_eq!(stats.rx_ambiguous_token, 1);
     }
 }

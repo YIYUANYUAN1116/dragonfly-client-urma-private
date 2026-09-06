@@ -80,13 +80,11 @@ const TRANSPORT_ONLY_PROFILE: &str = "transport-only";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReceiveDepths {
     window_chunks: u32,
-    lane_depth: u32,
 }
 
 fn receive_depths(
     configured_window_chunks: u32,
     pipeline_depth: u32,
-    max_concurrent_transfers: u32,
     native_capacity: u32,
 ) -> ReceiveDepths {
     let pipeline_depth = pipeline_depth.max(1);
@@ -94,13 +92,7 @@ fn receive_depths(
     let window_chunks = configured_window_chunks
         .max(1)
         .min((native_capacity / pipeline_depth).max(1));
-    let desired_lane_depth = window_chunks
-        .saturating_mul(pipeline_depth)
-        .saturating_mul(max_concurrent_transfers.max(1));
-    ReceiveDepths {
-        window_chunks,
-        lane_depth: desired_lane_depth.min(native_capacity).max(window_chunks),
-    }
+    ReceiveDepths { window_chunks }
 }
 
 #[cfg(any(feature = "urma-test-failpoints", test))]
@@ -166,27 +158,14 @@ mod tests {
     }
 
     #[test]
-    fn receive_depths_separate_piece_window_from_lane_capacity() {
+    fn receive_window_is_bounded_by_shared_capacity_and_pipeline() {
         assert_eq!(
-            receive_depths(32, 2, 16, 512),
-            ReceiveDepths {
-                window_chunks: 32,
-                lane_depth: 512,
-            }
+            receive_depths(32, 2, 512),
+            ReceiveDepths { window_chunks: 32 }
         );
         assert_eq!(
-            receive_depths(32, 2, 1, 512),
-            ReceiveDepths {
-                window_chunks: 32,
-                lane_depth: 64,
-            }
-        );
-        assert_eq!(
-            receive_depths(32, 2, 16, 32),
-            ReceiveDepths {
-                window_chunks: 16,
-                lane_depth: 32,
-            }
+            receive_depths(32, 2, 32),
+            ReceiveDepths { window_chunks: 16 }
         );
     }
 
@@ -465,16 +444,13 @@ impl UrmaClient {
         let depths = receive_depths(
             config.storage.server.urma.max_inflight_chunks,
             config.storage.server.urma.pipeline_depth,
-            config.storage.server.urma.max_concurrent_transfers,
             fabric.max_native_receive_depth(),
         );
         let mut lane_config = UrmaLaneConfig::default();
-        lane_config.transport_mode = capability.transport_mode;
-        lane_config.recv_depth = depths.lane_depth;
         lane_config.post_list_size = config.storage.server.urma.post_list_size;
         lane_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
         debug!(
-            native_recv_depth = depths.lane_depth,
+            native_recv_depth = fabric.max_native_receive_depth(),
             piece_window_chunks = depths.window_chunks,
             max_concurrent_transfers = config.storage.server.urma.max_concurrent_transfers,
             pipeline_depth = config.storage.server.urma.pipeline_depth,

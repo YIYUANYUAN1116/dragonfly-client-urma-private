@@ -59,7 +59,6 @@ struct dfurma_jetty {
     dfurma_runtime_t *runtime;
     urma_jfr_t *jfr;
     urma_jetty_t *jetty;
-    urma_transport_mode_t transport_mode;
     int jetty_error;
     int jfr_error;
     uint32_t outstanding_wr_count;
@@ -377,7 +376,6 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
         recv_jfc == NULL || config == NULL || out == NULL ||
         send_jfc->runtime != runtime || recv_jfc->runtime != runtime ||
         send_jfc->jfc == NULL || recv_jfc->jfc == NULL ||
-        config->transport_mode != URMA_TM_RM ||
         config->send_depth == 0 || config->recv_depth == 0 ||
         config->max_send_sge == 0 || config->max_send_sge > UINT8_MAX ||
         config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX) {
@@ -410,7 +408,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jfs_cfg.depth = config->send_depth;
-    jfs_cfg.trans_mode = (urma_transport_mode_t)config->transport_mode;
+    jfs_cfg.trans_mode = URMA_TM_RM;
     jfs_cfg.priority = rtp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
     jfs_cfg.max_rsge = 1;
@@ -422,7 +420,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     jfr_cfg.depth = config->recv_depth;
     jfr_cfg.flag.value = 0;
     jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    jfr_cfg.trans_mode = (urma_transport_mode_t)config->transport_mode;
+    jfr_cfg.trans_mode = URMA_TM_RM;
     jfr_cfg.max_sge = (uint8_t)config->max_recv_sge;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     jfr_cfg.jfc = recv_jfc->jfc;
@@ -455,7 +453,6 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jetty->runtime = runtime;
-    jetty->transport_mode = (urma_transport_mode_t)config->transport_mode;
     runtime->jetty_count++;
     *out = jetty;
     return 0;
@@ -573,7 +570,7 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
     }
     (void)memcpy(rjetty, opaque_data, opaque_len);
     if (rjetty->jetty_id.id != meta->jetty_id ||
-        rjetty->trans_mode != jetty->transport_mode ||
+        rjetty->trans_mode != URMA_TM_RM ||
         rjetty->type != URMA_JETTY) {
         free(rjetty);
         return -EPROTO;
