@@ -238,7 +238,7 @@ struct EndpointLifecycle {
 }
 
 /// The single completion consumer for the process-shared JFCs. A JFC must not
-/// be polled independently by individual lanes because any poll may return a
+/// be polled independently by individual PeerTargets because any poll may return a
 /// completion belonging to any Jetty attached to that JFC.
 pub(crate) struct CompletionRouter {
     batch: usize,
@@ -246,7 +246,7 @@ pub(crate) struct CompletionRouter {
     outstanding_total: usize,
     outstanding_send: usize,
     outstanding_recv: usize,
-    outstanding_by_lane: HashMap<u16, usize>,
+    outstanding_by_peer: HashMap<u16, usize>,
     /// The one process-shared RM endpoint; receive CQEs must resolve their
     /// source through the PeerTargetRegistry because posted RECV WRs are
     /// anonymous on the shared receive queue.
@@ -269,7 +269,7 @@ impl CompletionRouter {
             outstanding_total: 0,
             outstanding_send: 0,
             outstanding_recv: 0,
-            outstanding_by_lane: HashMap::new(),
+            outstanding_by_peer: HashMap::new(),
             endpoint: None,
             targets: PeerTargetRegistry::default(),
             failed_peers: Vec::new(),
@@ -292,21 +292,21 @@ impl CompletionRouter {
         Ok(())
     }
 
-    pub(crate) fn begin_lane_retirement(&mut self, lane_id: u16) -> Result<()> {
+    pub(crate) fn begin_peer_retirement(&mut self, peer_id: u16) -> Result<()> {
         // Per-peer retirement only marks the PeerTarget draining: the shared
         // Jetty must keep serving the remaining peers, so no flush is armed
         // here. Endpoint-level flush escalation lives in `begin_endpoint_flush`.
-        let completions = if self.targets.contains(lane_id) {
-            self.targets.begin_draining(lane_id)?;
-            self.targets.drain_routing_tokens(lane_id)?
+        let completions = if self.targets.contains(peer_id) {
+            self.targets.begin_draining(peer_id)?;
+            self.targets.drain_routing_tokens(peer_id)?
         } else {
             Vec::new()
         };
-        let error = Error::Protocol(format!("URMA PeerTarget {lane_id} is retiring"));
+        let error = Error::Protocol(format!("URMA PeerTarget {peer_id} is retiring"));
         for completion in completions {
             let _ = completion.send(Err(error.clone()));
         }
-        tracing::debug!(lane_id, "waiting for URMA PeerTarget WRs to drain");
+        tracing::debug!(peer_id, "waiting for URMA PeerTarget WRs to drain");
         Ok(())
     }
 
@@ -324,11 +324,11 @@ impl CompletionRouter {
 
     pub(crate) fn authorize_remote(
         &mut self,
-        lane_id: u16,
+        peer_id: u16,
         generation: u8,
         remote_id: ffi::RemoteJettyId,
     ) -> Result<()> {
-        self.targets.register(lane_id, generation, remote_id)
+        self.targets.register(peer_id, generation, remote_id)
     }
 
     /// Resolves the authorized PeerTarget that sourced a receive CQE. On the
@@ -414,14 +414,14 @@ impl CompletionRouter {
                 .is_none_or(|endpoint| !endpoint.waiting_for_flush || endpoint.flush_done)
     }
 
-    pub(crate) fn unregister_lane(&mut self, lane_id: u16) -> Result<()> {
-        if self.targets.has_routing_tokens(lane_id) {
+    pub(crate) fn unregister_peer(&mut self, peer_id: u16) -> Result<()> {
+        if self.targets.has_routing_tokens(peer_id) {
             return Err(Error::Protocol(format!(
-                "cannot unregister lane {lane_id} with registered RX identities"
+                "cannot unregister PeerTarget {peer_id} with registered RX identities"
             )));
         }
-        if self.targets.contains(lane_id) {
-            self.targets.remove(lane_id)?;
+        if self.targets.contains(peer_id) {
+            self.targets.remove(peer_id)?;
         }
         Ok(())
     }
@@ -434,7 +434,7 @@ impl CompletionRouter {
 
     pub(crate) fn track_registered_rx(
         &mut self,
-        lane_id: u16,
+        peer_id: u16,
         user_ctx: u64,
         handle: ffi::WrHandle,
         sequence: Option<u64>,
@@ -451,14 +451,14 @@ impl CompletionRouter {
                 "registered RX completion requires a SEND_IMM identity".into(),
             )
         })?;
-        if lane_id == 0 {
+        if peer_id == 0 {
             return Err(Error::InvalidConfiguration(
                 "registered RX owner must be a PeerTarget".into(),
             ));
         }
         let routing_token = RoutingToken::decode(sequence)?;
         self.targets
-            .validate_routing_token(lane_id, routing_token)?;
+            .validate_routing_token(peer_id, routing_token)?;
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -467,7 +467,7 @@ impl CompletionRouter {
             return Err(Error::Protocol("duplicate outstanding slot".into()));
         }
         self.targets
-            .register_routing_token(lane_id, routing_token, completion)?;
+            .register_routing_token(peer_id, routing_token, completion)?;
         self.outstanding[slot] = Some(OutstandingWr {
             user_ctx,
             handle,
@@ -486,21 +486,25 @@ impl CompletionRouter {
 
     pub(crate) fn validate_registered_rx_identities(
         &self,
-        lane_id: u16,
+        peer_id: u16,
         sequences: &[u64],
     ) -> Result<()> {
         let mut identities = std::collections::HashSet::with_capacity(sequences.len());
         for &sequence in sequences {
             if !identities.insert(sequence) {
                 return Err(Error::Protocol(format!(
-                    "duplicate RX identity in registered window: lane_id={lane_id} sequence={sequence}"
+                    "duplicate RX identity in registered window: peer_id={peer_id} sequence={sequence}"
                 )));
             }
             let routing_token = RoutingToken::decode(sequence)?;
             self.targets
-                .validate_routing_token(lane_id, routing_token)?;
+                .validate_routing_token(peer_id, routing_token)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_send_owner(&self, peer_id: u16, generation: u8) -> Result<()> {
+        self.targets.validate_active_generation(peer_id, generation)
     }
 
     pub(crate) fn track_registered_tx(
@@ -516,6 +520,7 @@ impl CompletionRouter {
                 "registered TX completion requires a SEND WR".into(),
             ));
         }
+        self.validate_send_owner(token.peer_id, token.generation)?;
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -532,7 +537,7 @@ impl CompletionRouter {
         });
         self.outstanding_total += 1;
         self.outstanding_send += 1;
-        *self.outstanding_by_lane.entry(token.lane_id).or_default() += 1;
+        *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
         self.stats.send_post += 1;
         self.stats.max_outstanding = self
             .stats
@@ -543,15 +548,15 @@ impl CompletionRouter {
 
     fn take_registered_rx(
         &mut self,
-        lane_id: u16,
+        peer_id: u16,
         imm_data: u64,
     ) -> Result<RegisteredRxCompletionTx> {
         let routing_token = RoutingToken::decode(imm_data)?;
         self.targets
-            .take_routing_token(lane_id, routing_token)
+            .take_routing_token(peer_id, routing_token)
             .ok_or_else(|| {
                 Error::Protocol(format!(
-                    "URMA SEND_IMM completion has no registered RX identity: lane_id={lane_id} sequence={imm_data}"
+                    "URMA SEND_IMM completion has no registered RX identity: peer_id={peer_id} sequence={imm_data}"
                 ))
             })
     }
@@ -691,8 +696,8 @@ impl CompletionRouter {
                 .remote_id
                 .filter(|_| record.opcode == ffi::CR_OPCODE_SEND_WITH_IMM && record.imm_data_valid)
                 .and_then(|remote_id| self.resolve_source(Some(remote_id), record.imm_data).ok())
-        } else if self.targets.contains(token.lane_id) {
-            Some(token.lane_id)
+        } else if self.targets.contains(token.peer_id) {
+            Some(token.peer_id)
         } else {
             None
         };
@@ -862,14 +867,14 @@ impl CompletionRouter {
             return Err(Error::Protocol("CQE has no outstanding WR".into()));
         }
         self.outstanding_total -= 1;
-        if token.lane_id != 0 {
-            let lane_count = self
-                .outstanding_by_lane
-                .get_mut(&token.lane_id)
-                .ok_or_else(|| Error::Protocol("CQE lane has no outstanding WR".into()))?;
-            *lane_count -= 1;
-            if *lane_count == 0 {
-                self.outstanding_by_lane.remove(&token.lane_id);
+        if token.peer_id != 0 {
+            let peer_count = self
+                .outstanding_by_peer
+                .get_mut(&token.peer_id)
+                .ok_or_else(|| Error::Protocol("CQE PeerTarget has no outstanding WR".into()))?;
+            *peer_count -= 1;
+            if *peer_count == 0 {
+                self.outstanding_by_peer.remove(&token.peer_id);
             }
         }
         Ok(entry.take().expect("entry checked above"))
@@ -894,9 +899,9 @@ impl CompletionRouter {
         self.targets.routing_token_count()
     }
 
-    pub(crate) fn outstanding_for_lane(&self, lane_id: u16) -> usize {
-        self.outstanding_by_lane
-            .get(&lane_id)
+    pub(crate) fn outstanding_for_peer(&self, peer_id: u16) -> usize {
+        self.outstanding_by_peer
+            .get(&peer_id)
             .copied()
             .unwrap_or_default()
     }
@@ -1002,7 +1007,7 @@ mod tests {
 
         assert!(router.ensure_recv_capacity(1, 1).is_err());
         assert!(router.ensure_recv_capacity(1, 2).is_ok());
-        assert_eq!(router.outstanding_for_lane(1), 0);
+        assert_eq!(router.outstanding_for_peer(1), 0);
     }
 
     #[test]
@@ -1028,13 +1033,13 @@ mod tests {
             )
             .unwrap();
 
-        router.begin_lane_retirement(7).unwrap();
+        router.begin_peer_retirement(7).unwrap();
         assert!(matches!(
             receiver.blocking_recv().unwrap(),
             Err(Error::Protocol(_))
         ));
-        assert_eq!(router.outstanding_for_lane(7), 0);
-        router.unregister_lane(7).unwrap();
+        assert_eq!(router.outstanding_for_peer(7), 0);
+        router.unregister_peer(7).unwrap();
         assert_eq!(router.outstanding(), 1);
     }
 
@@ -1318,6 +1323,71 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_waits_for_anonymous_rx_and_flush_after_peer_retirement() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        let recv_ctx = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
+            .encode()
+            .unwrap();
+        let (completion, receiver) = oneshot::channel();
+        router
+            .track_registered_rx(
+                1,
+                recv_ctx,
+                ffi::WrHandle::without_native(),
+                Some(RoutingToken::encode(1, 1).unwrap()),
+                completion,
+            )
+            .unwrap();
+
+        // Peer retirement cancels only logical routing ownership. The
+        // anonymous native RQE remains endpoint-owned until its flush CQE.
+        router.begin_peer_retirement(1).unwrap();
+        assert!(matches!(
+            receiver.blocking_recv().unwrap(),
+            Err(Error::Protocol(_))
+        ));
+        router.unregister_peer(1).unwrap();
+        assert_eq!(router.outstanding(), 1);
+        assert!(router.begin_endpoint_flush());
+        assert!(!router.endpoint_ready_to_close());
+
+        let mut pool =
+            UrmaBufferPool::from_test_slot_states(&[(SlotKind::Rx, SlotState::PostedRecv)]);
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 11,
+                    user_ctx: recv_ctx,
+                    user_ctx_valid: true,
+                    is_recv: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                true,
+                &mut pool,
+            )
+            .unwrap();
+        assert_eq!(router.outstanding(), 0);
+        assert!(!router.endpoint_ready_to_close());
+
+        router
+            .route_flush_done(
+                ffi::CompletionRecord {
+                    status: 13,
+                    local_id: 101,
+                    event_kind: ffi::CompletionEventKind::FlushErrorDone,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert!(router.endpoint_ready_to_close());
+    }
+
+    #[test]
     fn send_cqe_fails_closed_on_unknown_native_jetty() {
         // UMDK stamps local_id = jetty->jetty_id.id with is_jetty=1 on both
         // SEND and RECV CQEs of the shared-JFR endpoint, so a CQE whose
@@ -1327,9 +1397,10 @@ mod tests {
         // user_ctx; the poll error then fails the fabric owner.
         let mut router = CompletionRouter::new(4).unwrap();
         router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
 
         let send_ctx = WrToken {
-            lane_id: 1,
+            peer_id: 1,
             generation: 1,
             operation: OperationType::Send,
             slot: SlotId::new(0, 1).unwrap(),
@@ -1371,7 +1442,7 @@ mod tests {
             .expect_err("unknown native Jetty identity must fail closed");
         assert!(matches!(error, Error::Protocol(_)), "{error:?}");
         assert_eq!(router.outstanding(), 1);
-        assert_eq!(router.outstanding_for_lane(1), 1);
+        assert_eq!(router.outstanding_for_peer(1), 1);
     }
 
     #[test]
@@ -1413,16 +1484,17 @@ mod tests {
             .expect_err("unknown native Jetty identity must fail closed");
         assert!(matches!(error, Error::Protocol(_)), "{error:?}");
         assert_eq!(router.outstanding(), 1);
-        assert_eq!(router.outstanding_for_lane(1), 0);
+        assert_eq!(router.outstanding_for_peer(1), 0);
     }
 
     #[test]
     fn send_cqe_routes_when_native_jetty_matches_shared_endpoint() {
         let mut router = CompletionRouter::new(4).unwrap();
         router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
 
         let send_ctx = WrToken {
-            lane_id: 1,
+            peer_id: 1,
             generation: 1,
             operation: OperationType::Send,
             slot: SlotId::new(0, 1).unwrap(),
@@ -1464,50 +1536,69 @@ mod tests {
     }
 
     #[test]
-    fn peer_send_error_is_reported_without_failing_shared_completion_polling() {
+    fn peer_send_error_retires_only_that_peer_while_sibling_continues() {
         let mut router = CompletionRouter::new(4).unwrap();
         router.register_endpoint(101, 201).unwrap();
-        router
-            .authorize_remote(
-                1,
-                1,
-                ffi::RemoteJettyId {
-                    eid: [1; ffi::EID_SIZE],
-                    uasid: 2,
-                    id: 3,
-                },
-            )
-            .unwrap();
-        let send_ctx = WrToken {
-            lane_id: 1,
+        authorize_test_peer(&mut router, 1);
+        authorize_test_peer(&mut router, 2);
+        let peer_1_ctx = WrToken {
+            peer_id: 1,
             generation: 1,
             operation: OperationType::Send,
             slot: SlotId::new(0, 1).unwrap(),
         }
         .encode()
         .unwrap();
-        let (completion, receiver) = oneshot::channel();
+        let peer_2_ctx = WrToken {
+            peer_id: 2,
+            generation: 1,
+            operation: OperationType::Send,
+            slot: SlotId::new(1, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let (peer_1_completion, peer_1_receiver) = oneshot::channel();
+        let peer_1_state = RegisteredTxWindowState::new(
+            1,
+            vec![7],
+            TxWindowLease::from_test_lengths(vec![8]),
+            peer_1_completion,
+        );
         router
             .track_registered_tx(
-                send_ctx,
+                peer_1_ctx,
                 ffi::WrHandle::without_native(),
                 7,
-                RegisteredTxWindowState::new(
-                    1,
-                    vec![7],
-                    TxWindowLease::from_test_lengths(vec![8]),
-                    completion,
-                ),
+                peer_1_state.clone(),
             )
             .unwrap();
-        let mut pool =
-            UrmaBufferPool::from_test_slot_states(&[(SlotKind::Tx, SlotState::SendPosted)]);
+        peer_1_state.finish_posting(None);
+        let (peer_2_completion, peer_2_receiver) = oneshot::channel();
+        let peer_2_state = RegisteredTxWindowState::new(
+            2,
+            vec![8],
+            TxWindowLease::from_test_lengths(vec![8]),
+            peer_2_completion,
+        );
+        router
+            .track_registered_tx(
+                peer_2_ctx,
+                ffi::WrHandle::without_native(),
+                8,
+                peer_2_state.clone(),
+            )
+            .unwrap();
+        peer_2_state.finish_posting(None);
+        let mut pool = UrmaBufferPool::from_test_slot_states(&[
+            (SlotKind::Tx, SlotState::SendPosted),
+            (SlotKind::Tx, SlotState::SendPosted),
+        ]);
 
         router
             .route(
                 ffi::CompletionRecord {
                     status: 9,
-                    user_ctx: send_ctx,
+                    user_ctx: peer_1_ctx,
                     user_ctx_valid: true,
                     is_jetty: true,
                     local_id: 101,
@@ -1519,10 +1610,148 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            receiver.blocking_recv().unwrap(),
+            peer_1_receiver.blocking_recv().unwrap(),
             Err(Error::Completion { status: 9, .. })
         ));
         assert_eq!(router.take_failed_peers(), vec![1]);
+        assert_eq!(router.outstanding_for_peer(1), 0);
+        assert_eq!(router.outstanding_for_peer(2), 1);
+
+        router.begin_peer_retirement(1).unwrap();
+        assert!(router.validate_send_owner(1, 1).is_err());
+        router.validate_send_owner(2, 1).unwrap();
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx: peer_2_ctx,
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .unwrap();
+
+        let peer_2_completion = peer_2_receiver.blocking_recv().unwrap().unwrap();
+        assert_eq!(peer_2_completion.lane_id, 2);
+        assert_eq!(router.outstanding(), 0);
+        router.unregister_peer(1).unwrap();
+        router.validate_send_owner(2, 1).unwrap();
+    }
+
+    #[test]
+    fn stale_send_generation_is_rejected_before_outstanding_registration() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        authorize_test_peer(&mut router, 7);
+        let stale_ctx = WrToken {
+            peer_id: 7,
+            generation: 2,
+            operation: OperationType::Send,
+            slot: SlotId::new(0, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+
+        assert!(router
+            .track_registered_tx(
+                stale_ctx,
+                ffi::WrHandle::without_native(),
+                9,
+                RegisteredTxWindowState::new(
+                    7,
+                    vec![9],
+                    TxWindowLease::from_test_lengths(vec![8]),
+                    oneshot::channel().0,
+                ),
+            )
+            .is_err());
+        assert_eq!(router.outstanding(), 0);
+        assert_eq!(router.outstanding_for_peer(7), 0);
+    }
+
+    #[test]
+    fn late_send_cqe_cannot_consume_current_generation_ownership() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        router
+            .authorize_remote(
+                7,
+                2,
+                ffi::RemoteJettyId {
+                    eid: [7; ffi::EID_SIZE],
+                    uasid: 7,
+                    id: 7,
+                },
+            )
+            .unwrap();
+        let current_ctx = WrToken {
+            peer_id: 7,
+            generation: 2,
+            operation: OperationType::Send,
+            slot: SlotId::new(0, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let late_ctx = WrToken {
+            generation: 1,
+            ..WrToken::decode(current_ctx).unwrap()
+        }
+        .encode()
+        .unwrap();
+        let (completion, receiver) = oneshot::channel();
+        let state = RegisteredTxWindowState::new(
+            7,
+            vec![9],
+            TxWindowLease::from_test_lengths(vec![8]),
+            completion,
+        );
+        router
+            .track_registered_tx(
+                current_ctx,
+                ffi::WrHandle::without_native(),
+                9,
+                state.clone(),
+            )
+            .unwrap();
+        state.finish_posting(None);
+        let mut pool =
+            UrmaBufferPool::from_test_slot_states(&[(SlotKind::Tx, SlotState::SendPosted)]);
+
+        assert!(router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx: late_ctx,
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .is_err());
+        assert_eq!(router.outstanding(), 1);
+        assert_eq!(router.outstanding_for_peer(7), 1);
+
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx: current_ctx,
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .unwrap();
+        assert_eq!(receiver.blocking_recv().unwrap().unwrap().lane_id, 7);
         assert_eq!(router.outstanding(), 0);
     }
 

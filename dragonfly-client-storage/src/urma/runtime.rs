@@ -105,7 +105,7 @@ mod native {
             RegisteredTxCompletionTx,
         },
         ffi::{self, NativeRuntime},
-        lane::{JettyConfig, JettyDescriptor, TransportMode, UrmaJetty, UrmaLane},
+        lane::{JettyConfig, JettyDescriptor, PeerTarget, TransportMode, UrmaJetty},
         native_error,
     };
     use std::{
@@ -124,7 +124,7 @@ mod native {
     }
 
     /// Safe owner of one native JFC. It remains part of the process-level
-    /// Runtime resource tree and is never owned by a lane.
+    /// Runtime resource tree and is never owned by a PeerTarget.
     struct UrmaJfc {
         kind: JfcKind,
         handle: ffi::JfcHandle,
@@ -237,8 +237,8 @@ mod native {
         endpoint: Option<SharedRmEndpoint>,
         accepting: bool,
         poisoned: bool,
-        next_lane_id: u16,
-        lanes: HashMap<u16, UrmaLane>,
+        next_peer_id: u16,
+        peers: HashMap<u16, PeerTarget>,
         completions: CompletionRouter,
         _not_send_sync: PhantomData<Rc<()>>,
     }
@@ -347,14 +347,14 @@ mod native {
                 endpoint: None,
                 accepting: true,
                 poisoned: false,
-                next_lane_id: 1,
-                lanes: HashMap::new(),
+                next_peer_id: 1,
+                peers: HashMap::new(),
                 completions: CompletionRouter::new(16)?,
                 _not_send_sync: PhantomData,
             })
         }
 
-        pub(crate) fn create_lane(
+        pub(crate) fn create_peer_target(
             &mut self,
             post_list_size: u32,
         ) -> Result<(u16, JettyDescriptor)> {
@@ -370,12 +370,14 @@ mod native {
                 )));
             }
             let capability = self.capability.clone();
-            let lane_id = self.next_lane_id;
-            self.next_lane_id = self
-                .next_lane_id
+            let peer_id = self.next_peer_id;
+            self.next_peer_id = self
+                .next_peer_id
                 .checked_add(1)
                 .filter(|id| *id != 0)
-                .ok_or_else(|| Error::InvalidConfiguration("lane id space exhausted".into()))?;
+                .ok_or_else(|| {
+                    Error::InvalidConfiguration("PeerTarget id space exhausted".into())
+                })?;
 
             if self.endpoint.is_none() {
                 // First peer: create the one process-shared RM endpoint.
@@ -404,9 +406,9 @@ mod native {
             let endpoint = self
                 .endpoint
                 .as_ref()
-                .expect("shared endpoint exists after create_lane");
-            let lane = UrmaLane::new(
-                lane_id,
+                .expect("shared endpoint exists after create_peer_target");
+            let peer = PeerTarget::new(
+                peer_id,
                 1,
                 capability,
                 post_list_size
@@ -414,35 +416,35 @@ mod native {
                     .min(self.endpoint_config.recv_depth)
                     .min(self.max_post_list_size),
             )?;
-            self.lanes.insert(lane_id, lane);
-            Ok((lane_id, endpoint.descriptor.clone()))
+            self.peers.insert(peer_id, peer);
+            Ok((peer_id, endpoint.descriptor.clone()))
         }
 
-        pub(crate) fn connect_lane(
+        pub(crate) fn connect_peer_target(
             &mut self,
-            lane_id: u16,
+            peer_id: u16,
             descriptor: &JettyDescriptor,
         ) -> Result<()> {
-            // Split borrows: the endpoint Jetty and the lane map are distinct
+            // Split borrows: the endpoint Jetty and PeerTarget map are distinct
             // fields of Runtime.
             let Self {
-                endpoint, lanes, ..
+                endpoint, peers, ..
             } = self;
             let endpoint = endpoint
                 .as_mut()
                 .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
-            let lane = lanes
-                .get_mut(&lane_id)
-                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?;
-            lane.import_remote(&mut endpoint.jetty, descriptor)?;
-            let (generation, remote_id) = (lane.generation(), lane.remote_id()?);
+            let peer = peers
+                .get_mut(&peer_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))?;
+            peer.import_remote(&mut endpoint.jetty, descriptor)?;
+            let (generation, remote_id) = (peer.generation(), peer.remote_id()?);
             self.completions
-                .authorize_remote(lane_id, generation, remote_id)
+                .authorize_remote(peer_id, generation, remote_id)
         }
 
         pub(crate) fn post_receive_window_registered(
             &mut self,
-            lane_id: u16,
+            peer_id: u16,
             sequences: Vec<u64>,
             completion_txs: Vec<RegisteredRxCompletionTx>,
         ) -> Result<()> {
@@ -455,9 +457,9 @@ mod native {
                 .endpoint
                 .as_mut()
                 .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
-            self.lanes
-                .get_mut(&lane_id)
-                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
+            self.peers
+                .get_mut(&peer_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))?
                 .post_receive_window_registered(
                     &mut endpoint.jetty,
                     self.endpoint_config.recv_depth as usize,
@@ -469,13 +471,13 @@ mod native {
             self.verify_shared_rx_state()
         }
 
-        pub(crate) fn grant_send_credit(&mut self, lane_id: u16, count: u32) -> Result<()> {
-            self.lane_mut(lane_id)?.grant_send_credit(count)
+        pub(crate) fn grant_send_credit(&mut self, peer_id: u16, count: u32) -> Result<()> {
+            self.peer_mut(peer_id)?.grant_send_credit(count)
         }
 
         pub(crate) fn send_registered_window(
             &mut self,
-            lane_id: u16,
+            peer_id: u16,
             lease: TxWindowLease,
             sequences: Vec<u64>,
             completion: RegisteredTxCompletionTx,
@@ -489,9 +491,9 @@ mod native {
                 .endpoint
                 .as_mut()
                 .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
-            self.lanes
-                .get_mut(&lane_id)
-                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))?
+            self.peers
+                .get_mut(&peer_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))?
                 .send_registered_window(
                     &mut endpoint.jetty,
                     pool,
@@ -522,12 +524,12 @@ mod native {
                 self.completions.fail_pending(error);
             }
             let failed_peers = self.completions.take_failed_peers();
-            for lane_id in failed_peers {
-                if self.lanes.contains_key(&lane_id) {
-                    self.abort_lane(lane_id)?;
+            for peer_id in failed_peers {
+                if self.peers.contains_key(&peer_id) {
+                    self.abort_peer_target(peer_id)?;
                 }
             }
-            let reap = self.reap_drained_lanes();
+            let reap = self.reap_drained_peers();
             let count = match (progress, reap) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(count), Ok(())) => Ok(count),
@@ -634,47 +636,47 @@ mod native {
             self.capability.max_jfs_depth
         }
 
-        pub(crate) fn close_lane(&mut self, lane_id: u16) -> Result<()> {
-            // Close is asynchronous at the provider boundary. The lane stays
-            // owned by Runtime until `reap_drained_lanes` observes both gates.
-            self.abort_lane(lane_id)
+        pub(crate) fn close_peer_target(&mut self, peer_id: u16) -> Result<()> {
+            // Close is asynchronous at the provider boundary. The PeerTarget stays
+            // owned by Runtime until `reap_drained_peers` observes both gates.
+            self.abort_peer_target(peer_id)
         }
 
-        pub(crate) fn abort_lane(&mut self, lane_id: u16) -> Result<()> {
-            self.completions.begin_lane_retirement(lane_id)?;
-            self.lane_mut(lane_id)?.begin_draining()?;
-            self.reap_drained_lanes()
+        pub(crate) fn abort_peer_target(&mut self, peer_id: u16) -> Result<()> {
+            self.completions.begin_peer_retirement(peer_id)?;
+            self.peer_mut(peer_id)?.begin_draining()?;
+            self.reap_drained_peers()
         }
 
-        fn reap_drained_lanes(&mut self) -> Result<()> {
+        fn reap_drained_peers(&mut self) -> Result<()> {
             // Per-peer retirement needs no endpoint flush: the shared Jetty
             // keeps serving other peers, and a PeerTarget is reaped once its
             // own outstanding SEND WRs have completed. Shared-JFR receive WRs
             // are anonymous endpoint resources and never hold a PeerTarget
             // open.
             let drained = self
-                .lanes
+                .peers
                 .iter()
-                .filter_map(|(&lane_id, lane)| {
-                    (lane.is_draining()
-                        && lane.is_retirement_armed()
-                        && self.completions.outstanding_for_lane(lane_id) == 0)
-                        .then_some(lane_id)
+                .filter_map(|(&peer_id, peer)| {
+                    (peer.is_draining()
+                        && peer.is_retirement_armed()
+                        && self.completions.outstanding_for_peer(peer_id) == 0)
+                        .then_some(peer_id)
                 })
                 .collect::<Vec<_>>();
-            for lane_id in drained {
-                let outstanding = self.completions.outstanding_for_lane(lane_id);
-                self.lane_mut(lane_id)?.close(outstanding)?;
-                self.completions.unregister_lane(lane_id)?;
-                self.lanes.remove(&lane_id);
+            for peer_id in drained {
+                let outstanding = self.completions.outstanding_for_peer(peer_id);
+                self.peer_mut(peer_id)?.close(outstanding)?;
+                self.completions.unregister_peer(peer_id)?;
+                self.peers.remove(&peer_id);
             }
             Ok(())
         }
 
-        fn lane_mut(&mut self, lane_id: u16) -> Result<&mut UrmaLane> {
-            self.lanes
-                .get_mut(&lane_id)
-                .ok_or_else(|| Error::Protocol(format!("unknown URMA lane {lane_id}")))
+        fn peer_mut(&mut self, peer_id: u16) -> Result<&mut PeerTarget> {
+            self.peers
+                .get_mut(&peer_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))
         }
 
         pub(crate) fn shutdown(mut self) -> Result<()> {
@@ -690,21 +692,21 @@ mod native {
             self.accepting = false;
             let mut failures = Vec::new();
 
-            let lane_ids = self.lanes.keys().copied().collect::<Vec<_>>();
-            for lane_id in lane_ids {
-                if let Err(error) = self.abort_lane(lane_id) {
+            let peer_ids = self.peers.keys().copied().collect::<Vec<_>>();
+            for peer_id in peer_ids {
+                if let Err(error) = self.abort_peer_target(peer_id) {
                     failures.push(error.to_string());
                 }
             }
             let drain_deadline = deadline_after(Duration::from_secs(1));
-            while !self.lanes.is_empty() && !deadline_expired(drain_deadline) {
+            while !self.peers.is_empty() && !deadline_expired(drain_deadline) {
                 if let Err(error) = self.poll_once() {
                     if !matches!(error, Error::Completion { .. }) {
                         failures.push(error.to_string());
                     }
                 }
             }
-            if !self.lanes.is_empty() || self.completions.outstanding() != 0 {
+            if !self.peers.is_empty() || self.completions.outstanding() != 0 {
                 // Fatal escalation: the process is going away, so force every
                 // stranded WR on the shared endpoint to complete with an
                 // error (Jetty mark_error + WR_FLUSH_ERR_DONE) and keep
@@ -717,7 +719,7 @@ mod native {
                     }
                 }
                 let flush_deadline = deadline_after(Duration::from_secs(5));
-                while (!self.lanes.is_empty() || !self.completions.endpoint_ready_to_close())
+                while (!self.peers.is_empty() || !self.completions.endpoint_ready_to_close())
                     && !deadline_expired(flush_deadline)
                 {
                     if let Err(error) = self.poll_once() {
@@ -726,16 +728,16 @@ mod native {
                         }
                     }
                 }
-                if !self.lanes.is_empty() || !self.completions.endpoint_ready_to_close() {
+                if !self.peers.is_empty() || !self.completions.endpoint_ready_to_close() {
                     failures.push(format!(
-                        "timed out retiring {} URMA lanes with {} endpoint WRs even after endpoint flush",
-                        self.lanes.len(),
+                        "timed out retiring {} URMA PeerTargets with {} endpoint WRs even after endpoint flush",
+                        self.peers.len(),
                         self.completions.outstanding(),
                     ));
                 }
             }
 
-            if self.lanes.is_empty() && self.completions.endpoint_ready_to_close() {
+            if self.peers.is_empty() && self.completions.endpoint_ready_to_close() {
                 if let Some(mut endpoint) = self.endpoint.take() {
                     if let Err(error) = endpoint.jetty.close() {
                         failures.push(error.to_string());

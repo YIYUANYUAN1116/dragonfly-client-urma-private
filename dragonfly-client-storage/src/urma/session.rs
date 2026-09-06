@@ -8,7 +8,8 @@ use super::{
     buffer::{RegisteredRxWindowLease, TxWindowLease},
     completion::RegisteredRxCompletion,
     control::{LaneControl, TransferControl},
-    fabric::{UrmaFabricHandle, UrmaLaneConfig, UrmaRegisteredRxOpHandle},
+    credit::PeerCreditPermit,
+    fabric::{PeerTargetConfig, UrmaFabricHandle, UrmaRegisteredRxOpHandle},
     rendezvous::{
         read_frame, write_frame, CommonPieceRequest, Frame, LaneConnect, LaneConnected,
         PieceMetadata, ReceiveWindow, RendezvousError, TransferId, UrmaCapability,
@@ -244,7 +245,7 @@ struct NativeReceiveAdmissionState {
 }
 
 struct NativeReceiveWindowPermit {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<PeerCreditPermit>,
     state: Arc<Mutex<NativeReceiveAdmissionState>>,
     lane_id: u16,
     transfer_id: TransferId,
@@ -253,7 +254,7 @@ struct NativeReceiveWindowPermit {
 
 impl NativeReceiveWindowPermit {
     fn new(
-        permit: OwnedSemaphorePermit,
+        permit: PeerCreditPermit,
         state: Arc<Mutex<NativeReceiveAdmissionState>>,
         lane_id: u16,
         transfer_id: TransferId,
@@ -287,7 +288,7 @@ impl NativeReceiveWindowPermit {
         }
     }
 
-    fn into_permit(mut self) -> OwnedSemaphorePermit {
+    fn into_permit(mut self) -> PeerCreditPermit {
         self.permit
             .take()
             .expect("native receive permit is handed off once")
@@ -430,7 +431,6 @@ struct ClientLane {
     receive_pipeline_depth: usize,
     control_timeout: Duration,
     failed: AtomicBool,
-    native_receive_permits: Arc<Semaphore>,
     native_receive_admission_state: Arc<Mutex<NativeReceiveAdmissionState>>,
 }
 
@@ -441,6 +441,7 @@ impl Drop for ClientLane {
             lane_id = self.lane_id,
             "dropping urma peer lane"
         );
+        let _ = self.fabric.retire_rx_peer(self.lane_id);
         self.control.abort("URMA client lane owner was dropped");
         let _ = self.fabric.try_abort_lane(self.lane_id);
     }
@@ -464,7 +465,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
     pub(crate) async fn connect(
         mut stream: S,
         fabric: UrmaFabricHandle,
-        lane_config: UrmaLaneConfig,
+        peer_config: PeerTargetConfig,
         local_capability: UrmaCapability,
         remote_capability: &UrmaCapability,
         control_timeout: Duration,
@@ -483,7 +484,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         let max_message_size = local_capability
             .max_message_size
             .min(remote_capability.max_message_size);
-        let (lane_id, client_descriptor) = fabric.create_lane(lane_config).await?;
+        let (lane_id, client_descriptor) = fabric.create_lane(peer_config).await?;
+        if let Err(error) = fabric.register_rx_peer(lane_id, peer_config.guaranteed_rx_credits) {
+            let _ = fabric.abort_lane(lane_id).await;
+            return Err(error);
+        }
         let handshake = async {
             write_control(
                 &mut stream,
@@ -506,12 +511,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         }
         .await;
         if let Err(error) = handshake {
+            let _ = fabric.retire_rx_peer(lane_id);
             let _ = fabric.abort_lane(lane_id).await;
             return Err(error);
         }
-        let native_receive_permits = match fabric.shared_rx_permits(shared_receive_depth) {
-            Ok(permits) => permits,
+        let control = match LaneControl::spawn(stream, max_concurrent_transfers) {
+            Ok(control) => control,
             Err(error) => {
+                let _ = fabric.retire_rx_peer(lane_id);
                 let _ = fabric.abort_lane(lane_id).await;
                 return Err(error);
             }
@@ -519,15 +526,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         info!(role = "client", lane_id, "urma peer lane established");
         Ok(Self {
             lane: Arc::new(ClientLane {
-                control: LaneControl::spawn(stream, max_concurrent_transfers)?,
+                control,
                 fabric,
                 lane_id,
                 max_message_size,
                 max_receive_inflight,
-                receive_pipeline_depth: lane_config.pipeline_depth as usize,
+                receive_pipeline_depth: peer_config.pipeline_depth as usize,
                 control_timeout,
                 failed: AtomicBool::new(false),
-                native_receive_permits,
                 native_receive_admission_state: Arc::new(Mutex::new(
                     NativeReceiveAdmissionState::default(),
                 )),
@@ -643,6 +649,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
         self.lane.failed.store(true, Ordering::Release);
         self.lane.control.abort(error.to_string());
         warn!(role = "client", lane_id = self.lane.lane_id, %error, "aborting urma peer lane");
+        let _ = self.lane.fabric.retire_rx_peer(self.lane.lane_id);
         let _ = self.lane.fabric.abort_lane(self.lane.lane_id).await;
         Err(error)
     }
@@ -696,14 +703,13 @@ impl UrmaClientTransfer {
             };
             let native_receive_credit = if pending_count == 0 {
                 let requested = window.chunk_count;
-                let available_before = self.lane.native_receive_permits.available_permits();
+                let available_before = self.lane.fabric.shared_rx_available();
                 let admission_start = time::Instant::now();
                 let result = time::timeout(
                     timeout,
                     self.lane
-                        .native_receive_permits
-                        .clone()
-                        .acquire_many_owned(requested),
+                        .fabric
+                        .acquire_required_rx_permit(lane_id, requested),
                 )
                 .await;
                 if available_before < requested as usize {
@@ -719,13 +725,7 @@ impl UrmaClientTransfer {
                 }
                 match result {
                     Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => {
-                        return self
-                            .abort(Error::Shutdown {
-                                failures: vec!["URMA native RX admission is closed".into()],
-                            })
-                            .await;
-                    }
+                    Ok(Err(error)) => return self.abort(error).await,
                     Err(_) => {
                         collect_urma_budget_pressure_metrics("rx", "required");
                         return self
@@ -739,16 +739,17 @@ impl UrmaClientTransfer {
                     }
                 }
             } else {
-                match self.lane.fabric.try_acquire_optional_rx_permit(
-                    self.lane.native_receive_permits.clone(),
-                    window.chunk_count,
-                ) {
+                match self
+                    .lane
+                    .fabric
+                    .try_acquire_optional_rx_permit(lane_id, window.chunk_count)
+                {
                     Ok(permit) => permit,
                     Err(_) => {
                         debug!(
                             lane_id,
                             requested = window.chunk_count,
-                            available = self.lane.native_receive_permits.available_permits(),
+                            available = self.lane.fabric.shared_rx_available(),
                             "URMA RX second window unavailable at native JFR admission; continuing with one-window pipeline"
                         );
                         collect_urma_budget_pressure_metrics("rx", "optional");
@@ -973,6 +974,7 @@ impl UrmaClientTransfer {
         self.lane.failed.store(true, Ordering::Release);
         self.lane.control.abort(error.to_string());
         warn!(role = "client", lane_id = self.lane.lane_id, %error, "aborting urma peer lane");
+        let _ = self.lane.fabric.retire_rx_peer(self.lane.lane_id);
         let _ = self.lane.fabric.abort_lane(self.lane.lane_id).await;
         Err(error)
     }
@@ -1028,7 +1030,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
     pub(crate) async fn accept(
         mut stream: S,
         fabric: UrmaFabricHandle,
-        lane_config: UrmaLaneConfig,
+        peer_config: PeerTargetConfig,
         local_capability: &UrmaCapability,
         control_timeout: Duration,
         max_concurrent_transfers: usize,
@@ -1059,7 +1061,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
                 "URMA per-Piece send inflight {max_send_inflight} exceeds shared send depth {shared_send_depth}",
             )));
         }
-        let (lane_id, server_descriptor) = fabric.create_lane(lane_config).await?;
+        let (lane_id, server_descriptor) = fabric.create_lane(peer_config).await?;
         let handshake = async {
             fabric
                 .connect_lane(lane_id, connect.client_descriptor)
@@ -1084,10 +1086,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaServerSession<S> {
                 return Err(error);
             }
         };
+        let control = match LaneControl::spawn(stream, max_concurrent_transfers) {
+            Ok(control) => control,
+            Err(error) => {
+                let _ = fabric.abort_lane(lane_id).await;
+                return Err(error);
+            }
+        };
         info!(role = "server", lane_id, "urma peer lane established");
         Ok(Self {
             lane: Arc::new(ServerLane {
-                control: LaneControl::spawn(stream, max_concurrent_transfers)?,
+                control,
                 fabric,
                 lane_id,
                 max_message_size,
@@ -1702,10 +1711,11 @@ mod tests {
 
     #[test]
     fn native_rx_admission_tracks_distinct_concurrent_transfers() {
-        let permits = Arc::new(Semaphore::new(3));
+        let admission = crate::urma::credit::PeerCreditAdmission::new(3).unwrap();
+        admission.register_peer(4, 0).unwrap();
         let state = Arc::new(Mutex::new(NativeReceiveAdmissionState::default()));
         let first = NativeReceiveWindowPermit::new(
-            permits.clone().try_acquire_owned().unwrap(),
+            admission.try_acquire(4, 1).unwrap(),
             Arc::clone(&state),
             4,
             7,
@@ -1715,7 +1725,7 @@ mod tests {
             },
         );
         let same_transfer = NativeReceiveWindowPermit::new(
-            permits.clone().try_acquire_owned().unwrap(),
+            admission.try_acquire(4, 1).unwrap(),
             Arc::clone(&state),
             4,
             7,
@@ -1725,7 +1735,7 @@ mod tests {
             },
         );
         let other_transfer = NativeReceiveWindowPermit::new(
-            permits.try_acquire_owned().unwrap(),
+            admission.try_acquire(4, 1).unwrap(),
             Arc::clone(&state),
             4,
             8,

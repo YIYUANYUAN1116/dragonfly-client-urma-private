@@ -1,5 +1,9 @@
 use super::{target::PeerTargetId, Error, Result};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Logical receive-credit state for one RM PeerTarget. This is deliberately
 /// independent of native WR ownership: shared-JFR RQEs remain anonymous.
@@ -44,6 +48,34 @@ pub(crate) struct PeerCreditRegistry {
     guaranteed_total: usize,
     outstanding: usize,
     peers: HashMap<PeerTargetId, PeerCredit>,
+}
+
+struct PeerCreditAdmissionState {
+    credits: PeerCreditRegistry,
+    retiring: HashSet<PeerTargetId>,
+}
+
+struct PeerCreditAdmissionInner {
+    permits: Arc<Semaphore>,
+    state: Mutex<PeerCreditAdmissionState>,
+    required_queue: AsyncMutex<()>,
+    changed: Notify,
+}
+
+/// Process-wide RX admission shared by every RM PeerTarget. The semaphore
+/// owns physical depth while `PeerCreditRegistry` protects unused per-peer
+/// guarantees from surplus borrowers.
+#[derive(Clone)]
+pub(crate) struct PeerCreditAdmission {
+    inner: Arc<PeerCreditAdmissionInner>,
+}
+
+/// One admitted RX window. Dropping it atomically returns both its physical
+/// shared-JFR permits and logical guaranteed/borrowed grant.
+pub(crate) struct PeerCreditPermit {
+    inner: Arc<PeerCreditAdmissionInner>,
+    grant: Option<PeerCreditGrant>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PeerCreditRegistry {
@@ -157,13 +189,10 @@ impl PeerCreditRegistry {
 
         let guaranteed = count.min(account.guaranteed_limit.saturating_sub(account.guaranteed));
         let borrowed = count - guaranteed;
-        let unused_other_guarantees = self
-            .peers
-            .iter()
-            .filter(|(id, _)| **id != peer_id)
-            .map(|(_, peer)| peer.guaranteed_limit.saturating_sub(peer.guaranteed))
-            .sum::<usize>();
-        let borrowable = available.saturating_sub(unused_other_guarantees);
+        // `available` still contains the caller's unused guarantee. The
+        // guaranteed portion above consumes it, while only capacity beyond
+        // every currently-unused guarantee is borrowable surplus.
+        let borrowable = available.saturating_sub(self.unused_guarantees());
         if borrowed > borrowable {
             return Err(Error::BufferUnavailable {
                 kind: "shared RM surplus",
@@ -244,6 +273,185 @@ impl PeerCreditRegistry {
                     .map(|peer| peer.guaranteed_limit)
                     .sum::<usize>()
             && self.outstanding + self.unused_guarantees() <= self.capacity
+    }
+}
+
+impl PeerCreditAdmission {
+    pub(crate) fn new(capacity: u32) -> Result<Self> {
+        let capacity = usize::try_from(capacity).map_err(|_| {
+            Error::InvalidConfiguration("shared RM credit depth does not fit usize".into())
+        })?;
+        Ok(Self {
+            inner: Arc::new(PeerCreditAdmissionInner {
+                permits: Arc::new(Semaphore::new(capacity)),
+                state: Mutex::new(PeerCreditAdmissionState {
+                    credits: PeerCreditRegistry::new(capacity)?,
+                    retiring: HashSet::new(),
+                }),
+                required_queue: AsyncMutex::new(()),
+                changed: Notify::new(),
+            }),
+        })
+    }
+
+    pub(crate) fn register_peer(&self, peer_id: PeerTargetId, guaranteed_limit: u32) -> Result<()> {
+        let guaranteed_limit = usize::try_from(guaranteed_limit).map_err(|_| {
+            Error::InvalidConfiguration("RM PeerTarget guarantee does not fit usize".into())
+        })?;
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .credits
+            .register_peer(peer_id, guaranteed_limit)
+    }
+
+    /// Stops new grants immediately. Account removal is deferred until every
+    /// lease-held permit for the Peer has been dropped.
+    pub(crate) fn retire_peer(&self, peer_id: PeerTargetId) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let account = state
+            .credits
+            .peer(peer_id)
+            .ok_or_else(|| Error::Protocol(format!("unknown PeerTarget {peer_id}")))?;
+        if account.outstanding == 0 {
+            state.credits.unregister_peer(peer_id)?;
+        } else {
+            state.retiring.insert(peer_id);
+        }
+        drop(state);
+        self.inner.changed.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        peer_id: PeerTargetId,
+        count: u32,
+    ) -> Result<PeerCreditPermit> {
+        // Tokio's Mutex queues lock attempts in FIFO order. Keep the guard
+        // while logical capacity is unavailable so required windows cannot
+        // repeatedly race each other on Notify wakeups.
+        let _queue = self.inner.required_queue.lock().await;
+        loop {
+            // Subscribe before checking state so a concurrent release cannot
+            // be lost between a failed grant and the await.
+            let changed = self.inner.changed.notified();
+            match self.reserve(peer_id, count) {
+                Ok(mut credit) => {
+                    let permit = self
+                        .inner
+                        .permits
+                        .clone()
+                        .acquire_many_owned(count)
+                        .await
+                        .map_err(|_| Error::Shutdown {
+                            failures: vec!["shared RM RX admission is closed".into()],
+                        })?;
+                    credit.permit = Some(permit);
+                    return Ok(credit);
+                }
+                Err(Error::BufferUnavailable { .. }) => changed.await,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn try_acquire(
+        &self,
+        peer_id: PeerTargetId,
+        count: u32,
+    ) -> Result<PeerCreditPermit> {
+        let mut credit = self.reserve(peer_id, count)?;
+        let available = self.inner.permits.available_permits();
+        let permit = self
+            .inner
+            .permits
+            .clone()
+            .try_acquire_many_owned(count)
+            .map_err(|_| Error::BufferUnavailable {
+                kind: "shared RM physical RX",
+                requested: count as usize,
+                available,
+            })?;
+        credit.permit = Some(permit);
+        Ok(credit)
+    }
+
+    pub(crate) fn available_permits(&self) -> usize {
+        self.inner.permits.available_permits()
+    }
+
+    fn reserve(&self, peer_id: PeerTargetId, count: u32) -> Result<PeerCreditPermit> {
+        let count = usize::try_from(count).map_err(|_| {
+            Error::InvalidConfiguration("RM credit request does not fit usize".into())
+        })?;
+        let grant = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.retiring.contains(&peer_id) {
+                return Err(Error::Protocol(format!(
+                    "PeerTarget {peer_id} is retiring and rejects RX credit"
+                )));
+            }
+            state.credits.try_grant(peer_id, count)?
+        };
+        Ok(PeerCreditPermit {
+            inner: Arc::clone(&self.inner),
+            grant: Some(grant),
+            permit: None,
+        })
+    }
+}
+
+impl PeerCreditPermit {
+    pub(crate) fn count(&self) -> usize {
+        self.grant
+            .as_ref()
+            .map(PeerCreditGrant::count)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for PeerCreditPermit {
+    fn drop(&mut self) {
+        // Return physical capacity before waking logical waiters. A borrower
+        // racing in this small interval still sees its grant reserved and
+        // waits for the notification below.
+        drop(self.permit.take());
+        let Some(grant) = self.grant.take() else {
+            return;
+        };
+        let peer_id = grant.peer_id();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let release = state.credits.release(grant);
+        debug_assert!(release.is_ok(), "PeerCreditPermit release must balance");
+        if release.is_ok()
+            && state.retiring.contains(&peer_id)
+            && state
+                .credits
+                .peer(peer_id)
+                .is_some_and(|account| account.outstanding == 0)
+        {
+            let unregister = state.credits.unregister_peer(peer_id);
+            debug_assert!(unregister.is_ok(), "retired PeerCredit must unregister");
+            if unregister.is_ok() {
+                state.retiring.remove(&peer_id);
+            }
+        }
+        drop(state);
+        self.inner.changed.notify_waiters();
     }
 }
 
@@ -333,5 +541,87 @@ mod tests {
         assert!(credits.try_grant(2, 1).is_err());
 
         credits.release(borrowed).unwrap();
+    }
+
+    #[test]
+    fn admission_preserves_guarantees_while_lending_real_surplus() {
+        let admission = PeerCreditAdmission::new(6).unwrap();
+        admission.register_peer(1, 2).unwrap();
+        admission.register_peer(2, 2).unwrap();
+
+        let peer_1 = admission.try_acquire(1, 4).unwrap();
+        assert_eq!(peer_1.count(), 4);
+        let peer_2 = admission.try_acquire(2, 2).unwrap();
+        assert_eq!(peer_2.count(), 2);
+        assert_eq!(admission.available_permits(), 0);
+        assert!(admission.try_acquire(1, 1).is_err());
+
+        drop(peer_1);
+        drop(peer_2);
+        assert_eq!(admission.available_permits(), 6);
+    }
+
+    #[tokio::test]
+    async fn required_admission_wakes_after_lease_held_credit_returns() {
+        let admission = PeerCreditAdmission::new(1).unwrap();
+        admission.register_peer(1, 0).unwrap();
+        admission.register_peer(2, 0).unwrap();
+        let peer_1 = admission.acquire(1, 1).await.unwrap();
+
+        let waiter = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(2, 1).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(peer_1);
+
+        let peer_2 = waiter.await.unwrap().unwrap();
+        assert_eq!(peer_2.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_required_acquire_returns_reserved_logical_credit() {
+        let admission = PeerCreditAdmission::new(1).unwrap();
+        admission.register_peer(1, 0).unwrap();
+
+        // Hold only the physical permit to force `acquire` into the narrow
+        // state where its logical grant exists but semaphore acquisition is
+        // pending. Cancelling the future must drop that grant.
+        let physical = admission
+            .inner
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let waiter = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire(1, 1).await }
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        match waiter.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted RM admission unexpectedly completed"),
+        }
+
+        drop(physical);
+        assert!(admission.try_acquire(1, 1).is_ok());
+    }
+
+    #[test]
+    fn retiring_account_rejects_new_grants_and_unregisters_after_drop() {
+        let admission = PeerCreditAdmission::new(2).unwrap();
+        admission.register_peer(7, 1).unwrap();
+        let permit = admission.try_acquire(7, 1).unwrap();
+
+        admission.retire_peer(7).unwrap();
+        assert!(admission.try_acquire(7, 1).is_err());
+        drop(permit);
+
+        // Deferred retirement removed the old account, so the same logical
+        // id can be registered again by a future generation.
+        admission.register_peer(7, 1).unwrap();
     }
 }

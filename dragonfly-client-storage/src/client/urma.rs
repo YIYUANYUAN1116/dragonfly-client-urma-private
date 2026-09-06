@@ -16,7 +16,7 @@
 
 use super::PieceContentStream;
 use crate::rendezvous::{PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INCOMPATIBLE};
-use crate::urma::fabric::{UrmaFabricHandle, UrmaLaneConfig};
+use crate::urma::fabric::{PeerTargetConfig, UrmaFabricHandle};
 use crate::urma::rendezvous::{
     read_frame, write_frame, CommonPieceRequest, Frame, UrmaAdvertisement, UrmaCapability,
 };
@@ -397,11 +397,11 @@ pub struct UrmaClient {
     /// capability is the local side of capability negotiation.
     capability: UrmaCapability,
 
-    /// lane_config sizes the persistent Jetty shared by Piece transfers.
-    lane_config: UrmaLaneConfig,
+    /// peer_config controls PeerTarget post batching and Piece pipelining.
+    peer_config: PeerTargetConfig,
 
     /// Maximum number of chunks in one logical Piece receive window. This is
-    /// independent of the aggregate native JFR depth in `lane_config`.
+    /// independent of the process-wide native JFR depth owned by the Fabric.
     max_receive_inflight: u32,
 
     /// remote_capability is the parent's advertised capability from `discover`.
@@ -446,14 +446,16 @@ impl UrmaClient {
             config.storage.server.urma.pipeline_depth,
             fabric.max_native_receive_depth(),
         );
-        let mut lane_config = UrmaLaneConfig::default();
-        lane_config.post_list_size = config.storage.server.urma.post_list_size;
-        lane_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
+        let mut peer_config = PeerTargetConfig::default();
+        peer_config.post_list_size = config.storage.server.urma.post_list_size;
+        peer_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
+        peer_config.guaranteed_rx_credits = config.storage.server.urma.peer_guaranteed_rx_credits;
         debug!(
             native_recv_depth = fabric.max_native_receive_depth(),
             piece_window_chunks = depths.window_chunks,
             max_concurrent_transfers = config.storage.server.urma.max_concurrent_transfers,
             pipeline_depth = config.storage.server.urma.pipeline_depth,
+            peer_guaranteed_rx_credits = config.storage.server.urma.peer_guaranteed_rx_credits,
             "configured URMA client receive depths"
         );
         let fail_after_recv_windows = fail_after_recv_windows();
@@ -468,7 +470,7 @@ impl UrmaClient {
             config,
             fabric,
             capability,
-            lane_config,
+            peer_config,
             max_receive_inflight: depths.window_chunks,
             remote_capability,
             addr,
@@ -636,7 +638,7 @@ impl UrmaClient {
                 let session = UrmaClientSession::connect(
                     stream,
                     self.fabric.clone(),
-                    self.lane_config,
+                    self.peer_config,
                     self.capability.clone(),
                     &self.remote_capability,
                     self.control_timeout,
@@ -694,14 +696,14 @@ impl UrmaClient {
         );
 
         let (mut window_tx, window_rx) = mpsc::channel::<io::Result<RegisteredRxWindowLease>>(
-            self.lane_config.pipeline_depth as usize,
+            self.peer_config.pipeline_depth as usize,
         );
         let reader = UrmaStreamReader::new(window_rx, self.fabric.clone());
         let transfer_timeout = self.transfer_timeout;
         let piece_timeout = self.config.download.piece_timeout;
         let transfer_outcomes = self.transfer_outcomes.clone();
         let fail_after_recv_windows = self.fail_after_recv_windows;
-        let configured_pipeline_depth = self.lane_config.pipeline_depth;
+        let configured_pipeline_depth = self.peer_config.pipeline_depth;
         let max_window_chunks = self.max_receive_inflight;
         let log_task_id = task_id.to_string();
         tokio::spawn(async move {

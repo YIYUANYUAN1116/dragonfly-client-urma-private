@@ -18,7 +18,7 @@ use crate::content::MappedPiece;
 use crate::rendezvous::{
     PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
-use crate::urma::fabric::{FabricReadiness, UrmaFabric, UrmaFabricHandle, UrmaLaneConfig};
+use crate::urma::fabric::{FabricReadiness, PeerTargetConfig, UrmaFabric, UrmaFabricHandle};
 use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
     UrmaAdvertisement, UrmaCapability, SESSION_TRANSFER_ID,
@@ -345,10 +345,12 @@ impl UrmaServer {
             fabric.max_tx_window_chunks(urma_config.pipeline_depth),
             fabric.max_native_send_depth(),
         );
-        let lane_config = UrmaLaneConfig {
+        let peer_config = PeerTargetConfig {
             post_list_size: urma_config.post_list_size,
             pipeline_depth: urma_config.pipeline_depth,
-            ..Default::default()
+            // This side only posts SEND. RX guarantees are registered by the
+            // downloader-side PeerTarget created in `UrmaClientSession`.
+            guaranteed_rx_credits: 0,
         };
         info!(
             native_send_depth = fabric.max_native_send_depth(),
@@ -362,7 +364,7 @@ impl UrmaServer {
             self.upload_bandwidth_limiter.clone(),
             fabric.clone(),
             capability.clone(),
-            lane_config,
+            peer_config,
             depths.window_chunks,
             urma_config.transfer_timeout,
             urma_config.transfer_timeout,
@@ -491,7 +493,7 @@ struct UrmaServerHandler {
     upload_bandwidth_limiter: Arc<RateLimiter>,
     fabric: UrmaFabricHandle,
     capability: UrmaCapability,
-    lane_config: UrmaLaneConfig,
+    peer_config: PeerTargetConfig,
     max_send_inflight: u32,
     control_timeout: Duration,
     session_idle_timeout: Duration,
@@ -510,7 +512,7 @@ impl UrmaServerHandler {
         upload_bandwidth_limiter: Arc<RateLimiter>,
         fabric: UrmaFabricHandle,
         capability: UrmaCapability,
-        lane_config: UrmaLaneConfig,
+        peer_config: PeerTargetConfig,
         max_send_inflight: u32,
         control_timeout: Duration,
         transfer_timeout: Duration,
@@ -523,7 +525,7 @@ impl UrmaServerHandler {
             upload_bandwidth_limiter,
             fabric,
             capability,
-            lane_config,
+            peer_config,
             max_send_inflight,
             control_timeout,
             session_idle_timeout: server_session_idle_timeout(control_timeout),
@@ -548,7 +550,7 @@ impl UrmaServerHandler {
         let session = UrmaServerSession::accept(
             stream,
             self.fabric.clone(),
-            self.lane_config,
+            self.peer_config,
             &self.capability,
             self.control_timeout,
             self.max_concurrent_transfers,
@@ -878,7 +880,7 @@ impl UrmaServerHandler {
         let mut tx_optional_acquire_attempts = 0u64;
         let mut tx_optional_acquire_ns = 0u64;
         let mut tx_optional_pool_acquire_ns = 0u64;
-        let mut spare = if self.lane_config.pipeline_depth > 1
+        let mut spare = if self.peer_config.pipeline_depth > 1
             && first_window_len < piece.length
             && self.required_tx_waiters.load(Ordering::Acquire) == 0
         {
@@ -919,7 +921,7 @@ impl UrmaServerHandler {
                 }
             }
         } else {
-            if self.lane_config.pipeline_depth > 1
+            if self.peer_config.pipeline_depth > 1
                 && first_window_len < piece.length
                 && self.required_tx_waiters.load(Ordering::Acquire) != 0
             {
@@ -1097,7 +1099,7 @@ impl UrmaServerHandler {
             tx_ring_depth,
             tx_overlap_windows,
             tx_second_lease_fallback,
-            configured_pipeline_depth = self.lane_config.pipeline_depth,
+            configured_pipeline_depth = self.peer_config.pipeline_depth,
             max_window_chunks = self.max_send_inflight,
             limiter_wait_ns,
             source_open_ns,

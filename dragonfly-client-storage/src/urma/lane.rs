@@ -56,7 +56,7 @@ impl TryFrom<u8> for OperationType {
 /// learns the logical PeerTarget from completion remote_id + routing token.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WrToken {
-    pub(crate) lane_id: u16,
+    pub(crate) peer_id: u16,
     pub(crate) generation: u8,
     pub(crate) operation: OperationType,
     pub(crate) slot: SlotId,
@@ -65,7 +65,7 @@ pub(crate) struct WrToken {
 impl WrToken {
     pub(crate) fn anonymous_recv(slot: SlotId) -> Self {
         Self {
-            lane_id: 0,
+            peer_id: 0,
             generation: 1,
             operation: OperationType::Recv,
             slot,
@@ -73,24 +73,24 @@ impl WrToken {
     }
 
     pub(crate) fn encode(self) -> Result<u64> {
-        if self.generation == 0 || (self.lane_id == 0 && self.operation != OperationType::Recv) {
+        if self.generation == 0 || (self.peer_id == 0 && self.operation != OperationType::Recv) {
             return Err(Error::InvalidConfiguration("WR identity is invalid".into()));
         }
-        Ok((u64::from(self.lane_id) << 48)
+        Ok((u64::from(self.peer_id) << 48)
             | (u64::from(self.generation) << 40)
             | (u64::from(self.operation as u8) << 32)
             | u64::from(self.slot.encode()))
     }
 
     pub(crate) fn decode(value: u64) -> Result<Self> {
-        let lane_id = (value >> 48) as u16;
+        let peer_id = (value >> 48) as u16;
         let generation = ((value >> 40) & 0xff) as u8;
         let operation = OperationType::try_from(((value >> 32) & 0xff) as u8)?;
-        if generation == 0 || (lane_id == 0 && operation != OperationType::Recv) {
+        if generation == 0 || (peer_id == 0 && operation != OperationType::Recv) {
             return Err(Error::Protocol("CQE user_ctx has a zero identity".into()));
         }
         Ok(Self {
-            lane_id,
+            peer_id,
             generation,
             operation,
             slot: SlotId::decode((value & 0xffff_ffff) as u32)?,
@@ -99,11 +99,11 @@ impl WrToken {
 }
 
 #[derive(Default)]
-struct LaneCredits {
+struct PeerSendCredits {
     remote_receives_available: usize,
 }
 
-impl LaneCredits {
+impl PeerSendCredits {
     fn grant_remote_receives(&mut self, count: u32) -> Result<()> {
         if count == 0 {
             return Err(Error::Protocol(
@@ -416,7 +416,7 @@ impl Drop for UrmaJetty {
 
 /// Lifecycle of one PeerTarget on the shared RM endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LaneState {
+pub(crate) enum PeerTargetLifecycle {
     Created,
     Ready,
     Draining,
@@ -427,18 +427,18 @@ pub(crate) enum LaneState {
 /// An owned PeerTarget. The native Jetty/JFR live in the Runtime's shared
 /// endpoint and are borrowed only for individual posts; a PeerTarget owns
 /// only its imported target identity, logical credits, and lifecycle state.
-pub(crate) struct UrmaLane {
+pub(crate) struct PeerTarget {
     id: u16,
     generation: u8,
-    state: LaneState,
+    state: PeerTargetLifecycle,
     capability: UrmaDeviceCapability,
     target: Option<ffi::TargetHandle>,
-    credits: LaneCredits,
+    credits: PeerSendCredits,
     post_list_size: usize,
     retirement_armed: bool,
 }
 
-impl UrmaLane {
+impl PeerTarget {
     pub(crate) fn new(
         id: u16,
         generation: u8,
@@ -447,16 +447,16 @@ impl UrmaLane {
     ) -> Result<Self> {
         if id == 0 || generation == 0 {
             return Err(Error::InvalidConfiguration(
-                "lane id and generation must be non-zero".into(),
+                "PeerTarget id and generation must be non-zero".into(),
             ));
         }
         Ok(Self {
             id,
             generation,
-            state: LaneState::Created,
+            state: PeerTargetLifecycle::Created,
             capability,
             target: None,
-            credits: LaneCredits::default(),
+            credits: PeerSendCredits::default(),
             post_list_size: post_list_size as usize,
             retirement_armed: false,
         })
@@ -471,13 +471,13 @@ impl UrmaLane {
     }
 
     /// Imports the remote Jetty descriptor as this PeerTarget's own target on
-    /// the shared endpoint and moves the lane to Ready.
+    /// the shared endpoint and moves the PeerTarget to Ready.
     pub(crate) fn import_remote(
         &mut self,
         jetty: &mut UrmaJetty,
         descriptor: &JettyDescriptor,
     ) -> Result<()> {
-        if self.state != LaneState::Created {
+        if self.state != PeerTargetLifecycle::Created {
             return Err(self.state_error("import descriptor"));
         }
         let local_transport = u32::try_from(self.capability.transport_type)
@@ -489,7 +489,7 @@ impl UrmaLane {
             )));
         }
         self.target = Some(jetty.import_target(descriptor)?);
-        self.state = LaneState::Ready;
+        self.state = PeerTargetLifecycle::Ready;
         Ok(())
     }
 
@@ -502,7 +502,7 @@ impl UrmaLane {
     }
 
     pub(crate) fn grant_send_credit(&mut self, count: u32) -> Result<()> {
-        self.require(LaneState::Ready)?;
+        self.require(PeerTargetLifecycle::Ready)?;
         self.credits.grant_remote_receives(count)
     }
 
@@ -515,7 +515,7 @@ impl UrmaLane {
         sequences: Vec<u64>,
         completion_txs: Vec<RegisteredRxCompletionTx>,
     ) -> Result<()> {
-        self.require(LaneState::Ready)?;
+        self.require(PeerTargetLifecycle::Ready)?;
         if sequences.is_empty() || sequences.len() != completion_txs.len() {
             return Err(Error::InvalidConfiguration(
                 "registered RX window requires matching non-empty sequences and completions".into(),
@@ -627,12 +627,16 @@ impl UrmaLane {
         sequences: Vec<u64>,
         completion: RegisteredTxCompletionTx,
     ) -> Result<()> {
-        self.require(LaneState::Ready)?;
+        self.require(PeerTargetLifecycle::Ready)?;
         if sequences.len() != lease.chunk_count() || sequences.is_empty() {
             return Err(Error::InvalidConfiguration(
                 "registered TX window requires one sequence per chunk".into(),
             ));
         }
+        // Validate the logical PeerTarget immediately before touching native
+        // TX ownership. This rejects both retirement races and stale target
+        // generations on the shared RM endpoint.
+        completions.validate_send_owner(self.id, self.generation)?;
         self.credits.require_remote_receives(sequences.len())?;
         let layouts = pool.tx_lease_layouts(&lease)?;
         let state = RegisteredTxWindowState::new(self.id, sequences.clone(), lease, completion);
@@ -709,7 +713,7 @@ impl UrmaLane {
     }
 
     pub(crate) fn begin_draining(&mut self) -> Result<()> {
-        if self.state == LaneState::Closed {
+        if self.state == PeerTargetLifecycle::Closed {
             return Ok(());
         }
         // The shared endpoint must stay healthy for the other PeerTargets, so
@@ -717,13 +721,14 @@ impl UrmaLane {
         // only converges once this target's outstanding WRs complete on their
         // own; a peer that strands WRs requires the endpoint-level flush
         // escalation in Runtime shutdown (per-target flush is pending RM0).
-        self.state = LaneState::Draining;
+        self.credits.clear();
+        self.state = PeerTargetLifecycle::Draining;
         self.retirement_armed = true;
         Ok(())
     }
 
     pub(crate) fn is_draining(&self) -> bool {
-        self.state == LaneState::Draining
+        self.state == PeerTargetLifecycle::Draining
     }
 
     pub(crate) fn is_retirement_armed(&self) -> bool {
@@ -731,12 +736,12 @@ impl UrmaLane {
     }
 
     pub(crate) fn close(&mut self, outstanding: usize) -> Result<()> {
-        if self.state == LaneState::Closed {
+        if self.state == PeerTargetLifecycle::Closed {
             return Ok(());
         }
         if outstanding != 0 {
             return Err(Error::Protocol(format!(
-                "cannot close lane {} with {outstanding} outstanding WRs",
+                "cannot close PeerTarget {} with {outstanding} outstanding WRs",
                 self.id
             )));
         }
@@ -753,11 +758,11 @@ impl UrmaLane {
         match result {
             Ok(()) => {
                 self.credits.clear();
-                self.state = LaneState::Closed;
+                self.state = PeerTargetLifecycle::Closed;
                 Ok(())
             }
             Err(error) => {
-                self.state = LaneState::Failed;
+                self.state = PeerTargetLifecycle::Failed;
                 Err(error)
             }
         }
@@ -765,19 +770,19 @@ impl UrmaLane {
 
     fn token(&self, operation: OperationType, slot: SlotId) -> WrToken {
         WrToken {
-            lane_id: self.id,
+            peer_id: self.id,
             generation: self.generation,
             operation,
             slot,
         }
     }
 
-    fn require(&self, expected: LaneState) -> Result<()> {
+    fn require(&self, expected: PeerTargetLifecycle) -> Result<()> {
         if self.state == expected {
             Ok(())
         } else {
             Err(Error::Protocol(format!(
-                "lane {} is {:?}, expected {:?}",
+                "PeerTarget {} is {:?}, expected {:?}",
                 self.id, self.state, expected
             )))
         }
@@ -785,7 +790,7 @@ impl UrmaLane {
 
     fn state_error(&self, operation: &str) -> Error {
         Error::Protocol(format!(
-            "cannot {operation} while lane {} is {:?}",
+            "cannot {operation} while PeerTarget {} is {:?}",
             self.id, self.state
         ))
     }
@@ -794,6 +799,24 @@ impl UrmaLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capability() -> UrmaDeviceCapability {
+        UrmaDeviceCapability {
+            transport_type: 0,
+            transport_modes: TransportMode::Rm as u32,
+            max_jfc: 2,
+            max_jfs: 1,
+            max_jfr: 1,
+            max_jetty: 1,
+            max_jfc_depth: 8,
+            max_jfs_depth: 8,
+            max_jfr_depth: 8,
+            max_jfs_sge: 1,
+            max_jfs_rsge: 1,
+            max_jfr_sge: 1,
+            max_msg_size: 64 * 1024,
+        }
+    }
 
     fn descriptor() -> JettyDescriptor {
         JettyDescriptor {
@@ -823,7 +846,7 @@ mod tests {
     #[test]
     fn user_context_round_trip_is_pointer_free() {
         let token = WrToken {
-            lane_id: 9,
+            peer_id: 9,
             generation: 2,
             operation: OperationType::Recv,
             slot: SlotId::new(1234, 7).unwrap(),
@@ -833,7 +856,7 @@ mod tests {
 
     #[test]
     fn send_requires_remote_recv_posted_credit() {
-        let mut credits = LaneCredits::default();
+        let mut credits = PeerSendCredits::default();
         assert!(credits.require_remote_receives(1).is_err());
         assert!(credits.grant_remote_receives(0).is_err());
 
@@ -845,10 +868,30 @@ mod tests {
 
     #[test]
     fn partial_post_consumes_only_the_submitted_credit_prefix() {
-        let mut credits = LaneCredits::default();
+        let mut credits = PeerSendCredits::default();
         credits.grant_remote_receives(5).unwrap();
         credits.consume_remote_receives(3);
         assert!(credits.require_remote_receives(2).is_ok());
         assert!(credits.require_remote_receives(3).is_err());
+    }
+
+    #[test]
+    fn draining_peer_rejects_new_credit_and_requires_send_drain_before_close() {
+        let mut peer = PeerTarget::new(7, 2, capability(), 1).unwrap();
+        // Native import is independently covered at the FFI boundary. Set the
+        // pure lifecycle state directly so this test needs no provider.
+        peer.state = PeerTargetLifecycle::Ready;
+        peer.grant_send_credit(2).unwrap();
+
+        peer.begin_draining().unwrap();
+        assert_eq!(peer.state, PeerTargetLifecycle::Draining);
+        assert!(peer.grant_send_credit(1).is_err());
+        assert!(peer.credits.require_remote_receives(1).is_err());
+        assert!(peer.close(1).is_err());
+        assert_eq!(peer.state, PeerTargetLifecycle::Draining);
+
+        peer.close(0).unwrap();
+        assert_eq!(peer.state, PeerTargetLifecycle::Closed);
+        assert!(peer.grant_send_credit(1).is_err());
     }
 }

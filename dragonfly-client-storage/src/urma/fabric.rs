@@ -12,6 +12,7 @@ use super::{
         RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
         RegisteredTxCompletionTx,
     },
+    credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
     runtime::{RuntimeConfig, UrmaRuntime},
     Error, Result,
@@ -61,9 +62,10 @@ impl Drop for RequiredRxWaiter {
 
 fn try_acquire_optional_rx_permit(
     required_waiters: &RequiredRxWaiters,
-    permits: Arc<Semaphore>,
+    admission: &PeerCreditAdmission,
+    peer_id: u16,
     requested: u32,
-) -> Result<OwnedSemaphorePermit> {
+) -> Result<PeerCreditPermit> {
     if required_waiters.has_waiters() {
         return Err(Error::BufferUnavailable {
             kind: "shared RX optional",
@@ -71,14 +73,7 @@ fn try_acquire_optional_rx_permit(
             available: 0,
         });
     }
-    let permit =
-        permits
-            .try_acquire_many_owned(requested)
-            .map_err(|_| Error::BufferUnavailable {
-                kind: "shared RX optional",
-                requested: requested as usize,
-                available: 0,
-            })?;
+    let permit = admission.try_acquire(peer_id, requested)?;
     // Close the check/acquire race as far as the async facade can: if a
     // required first window appeared while the non-blocking acquire ran,
     // immediately return the borrowed surplus. The later Fabric post gate
@@ -140,24 +135,26 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
     )))
 }
 
-/// Dragonfly-facing Jetty sizing. Native tokens and handles remain private to
-/// the owner thread.
+/// Dragonfly-facing PeerTarget batching and Piece pipeline policy. Native
+/// endpoint sizing, tokens, and handles remain private to the owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct UrmaLaneConfig {
+pub(crate) struct PeerTargetConfig {
     pub post_list_size: u32,
     pub pipeline_depth: u32,
+    pub guaranteed_rx_credits: u32,
 }
 
-impl Default for UrmaLaneConfig {
+impl Default for PeerTargetConfig {
     fn default() -> Self {
         Self {
             post_list_size: 1,
             pipeline_depth: 2,
+            guaranteed_rx_credits: 0,
         }
     }
 }
 
-impl UrmaLaneConfig {
+impl PeerTargetConfig {
     fn validate(self) -> Result<()> {
         if self.post_list_size == 0 || self.post_list_size > crate::urma::ffi::MAX_POST_LIST {
             return Err(Error::InvalidConfiguration(format!(
@@ -284,24 +281,29 @@ impl UrmaFabric {
                 max_message_size,
                 max_jfr_depth,
                 max_jfs_depth,
-            ))) => Ok(UrmaFabricHandle {
-                inner: Arc::new(FabricInner {
-                    command_tx: Mutex::new(Some(command_tx)),
-                    command_slots,
-                    readiness: readiness_rx,
-                    runtime_config,
-                    transport_type,
-                    transport_modes,
-                    max_message_size,
-                    max_jfr_depth,
-                    max_jfs_depth,
-                    required_rx_waiters: RequiredRxWaiters::default(),
-                    shared_rx_admission: Mutex::new(SharedDepthAdmission::default()),
-                    shared_tx_admission: Mutex::new(SharedDepthAdmission::default()),
-                    shutdown: AsyncMutex::new(()),
-                    join: Mutex::new(Some(join)),
-                }),
-            }),
+            ))) => {
+                let shared_rx_depth = runtime_config.recv_jfc_depth.min(max_jfr_depth).min(
+                    u32::try_from(runtime_config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX),
+                );
+                Ok(UrmaFabricHandle {
+                    inner: Arc::new(FabricInner {
+                        command_tx: Mutex::new(Some(command_tx)),
+                        command_slots,
+                        readiness: readiness_rx,
+                        runtime_config,
+                        transport_type,
+                        transport_modes,
+                        max_message_size,
+                        max_jfr_depth,
+                        max_jfs_depth,
+                        required_rx_waiters: RequiredRxWaiters::default(),
+                        shared_rx_admission: PeerCreditAdmission::new(shared_rx_depth)?,
+                        shared_tx_admission: Mutex::new(SharedDepthAdmission::default()),
+                        shutdown: AsyncMutex::new(()),
+                        join: Mutex::new(Some(join)),
+                    }),
+                })
+            }
             Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error)
@@ -451,7 +453,7 @@ impl UrmaFabricHandle {
 
     /// Creates a local lane and returns its stable id plus the serialized local
     /// Jetty descriptor for the existing Dragonfly control plane.
-    pub(crate) async fn create_lane(&self, config: UrmaLaneConfig) -> Result<(u16, Vec<u8>)> {
+    pub(crate) async fn create_lane(&self, config: PeerTargetConfig) -> Result<(u16, Vec<u8>)> {
         config.validate()?;
         self.submit(|reply| FabricCommand::CreateLane { config, reply })
             .await
@@ -480,15 +482,29 @@ impl UrmaFabricHandle {
         self.inner.required_rx_waiters.enter()
     }
 
-    /// Returns the one process-wide RX admission semaphore. Every client
-    /// PeerTarget shares it because all receive WRs consume the same RM JFR
-    /// and registered RX arena.
-    pub(crate) fn shared_rx_permits(&self, depth: u32) -> Result<Arc<Semaphore>> {
+    pub(crate) fn register_rx_peer(&self, peer_id: u16, guaranteed_credits: u32) -> Result<()> {
         self.inner
             .shared_rx_admission
-            .lock()
-            .unwrap()
-            .permits(depth, "receive")
+            .register_peer(peer_id, guaranteed_credits)
+    }
+
+    pub(crate) fn retire_rx_peer(&self, peer_id: u16) -> Result<()> {
+        self.inner.shared_rx_admission.retire_peer(peer_id)
+    }
+
+    pub(crate) async fn acquire_required_rx_permit(
+        &self,
+        peer_id: u16,
+        requested: u32,
+    ) -> Result<PeerCreditPermit> {
+        self.inner
+            .shared_rx_admission
+            .acquire(peer_id, requested)
+            .await
+    }
+
+    pub(crate) fn shared_rx_available(&self) -> usize {
+        self.inner.shared_rx_admission.available_permits()
     }
 
     /// Returns the one process-wide TX admission semaphore. PeerTargets share
@@ -504,10 +520,15 @@ impl UrmaFabricHandle {
 
     pub(crate) fn try_acquire_optional_rx_permit(
         &self,
-        permits: Arc<Semaphore>,
+        peer_id: u16,
         requested: u32,
-    ) -> Result<OwnedSemaphorePermit> {
-        try_acquire_optional_rx_permit(&self.inner.required_rx_waiters, permits, requested)
+    ) -> Result<PeerCreditPermit> {
+        try_acquire_optional_rx_permit(
+            &self.inner.required_rx_waiters,
+            &self.inner.shared_rx_admission,
+            peer_id,
+            requested,
+        )
     }
 
     pub(crate) async fn try_post_receive_window_registered(
@@ -779,7 +800,7 @@ struct FabricInner {
     max_jfr_depth: u32,
     max_jfs_depth: u32,
     required_rx_waiters: RequiredRxWaiters,
-    shared_rx_admission: Mutex<SharedDepthAdmission>,
+    shared_rx_admission: PeerCreditAdmission,
     shared_tx_admission: Mutex<SharedDepthAdmission>,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -801,7 +822,7 @@ impl Drop for FabricInner {
 
 enum FabricCommand {
     CreateLane {
-        config: UrmaLaneConfig,
+        config: PeerTargetConfig,
         reply: oneshot::Sender<Result<(u16, Vec<u8>)>>,
     },
     ConnectLane {
@@ -986,11 +1007,11 @@ fn handle_command(
     match command {
         FabricCommand::CreateLane { config, reply } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
-                let (lane_id, descriptor) = runtime.create_lane(config.post_list_size)?;
+                let (lane_id, descriptor) = runtime.create_peer_target(config.post_list_size)?;
                 match descriptor.serialize() {
                     Ok(descriptor) => Ok((lane_id, descriptor)),
                     Err(error) => {
-                        let _ = runtime.close_lane(lane_id);
+                        let _ = runtime.close_peer_target(lane_id);
                         Err(error)
                     }
                 }
@@ -1005,7 +1026,7 @@ fn handle_command(
         } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
                 let descriptor = JettyDescriptor::deserialize(&descriptor)?;
-                runtime.connect_lane(lane_id, &descriptor)
+                runtime.connect_peer_target(lane_id, &descriptor)
             });
             let _ = reply.send(result);
             OwnerControl::Continue
@@ -1069,11 +1090,11 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::CloseLane { lane_id, reply } => {
-            let _ = reply.send(runtime.close_lane(lane_id));
+            let _ = reply.send(runtime.close_peer_target(lane_id));
             OwnerControl::Continue
         }
         FabricCommand::AbortLane { lane_id, reply } => {
-            let _ = reply.send(runtime.abort_lane(lane_id));
+            let _ = reply.send(runtime.abort_peer_target(lane_id));
             OwnerControl::Continue
         }
         FabricCommand::RecycleLease { recycle } => {
@@ -1191,25 +1212,26 @@ mod tests {
     #[test]
     fn optional_rx_borrow_yields_to_required_waiters_and_capacity() {
         let waiters = RequiredRxWaiters::default();
-        let permits = Arc::new(Semaphore::new(2));
+        let admission = PeerCreditAdmission::new(2).unwrap();
+        admission.register_peer(1, 0).unwrap();
 
-        let borrowed = try_acquire_optional_rx_permit(&waiters, permits.clone(), 2).unwrap();
-        assert!(try_acquire_optional_rx_permit(&waiters, permits.clone(), 1).is_err());
+        let borrowed = try_acquire_optional_rx_permit(&waiters, &admission, 1, 2).unwrap();
+        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_err());
         drop(borrowed);
 
         let required = waiters.enter();
-        assert!(try_acquire_optional_rx_permit(&waiters, permits.clone(), 1).is_err());
-        assert_eq!(permits.available_permits(), 2);
+        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_err());
+        assert_eq!(admission.available_permits(), 2);
         drop(required);
 
-        assert!(try_acquire_optional_rx_permit(&waiters, permits, 1).is_ok());
+        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_ok());
     }
 
     #[test]
-    fn shared_rx_admission_reuses_one_global_semaphore_and_rejects_depth_changes() {
+    fn shared_depth_admission_reuses_one_global_semaphore_and_rejects_depth_changes() {
         let mut admission = SharedDepthAdmission::default();
-        let first = admission.permits(8, "receive").unwrap();
-        let second = admission.permits(8, "receive").unwrap();
+        let first = admission.permits(8, "send").unwrap();
+        let second = admission.permits(8, "send").unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         let permit = first.clone().try_acquire_many_owned(8).unwrap();
         assert!(second.clone().try_acquire_owned().is_err());
@@ -1260,15 +1282,17 @@ mod tests {
     }
 
     #[test]
-    fn lane_config_contains_only_peer_local_pipeline_policy() {
-        let config = UrmaLaneConfig {
+    fn peer_target_config_contains_only_peer_local_pipeline_policy() {
+        let config = PeerTargetConfig {
             post_list_size: 5,
             pipeline_depth: 2,
+            guaranteed_rx_credits: 3,
         };
         assert_eq!(config.post_list_size, 5);
         assert_eq!(config.pipeline_depth, 2);
+        assert_eq!(config.guaranteed_rx_credits, 3);
         assert!(config.validate().is_ok());
-        assert!(UrmaLaneConfig {
+        assert!(PeerTargetConfig {
             pipeline_depth: 0,
             ..config
         }

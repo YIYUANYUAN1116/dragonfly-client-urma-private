@@ -9,10 +9,6 @@ use std::time::Duration;
 mod buffer;
 mod completion;
 pub(crate) mod control;
-// The guaranteed/borrowed planner stays test-only until a concrete active-Peer
-// quota and async admission policy is selected. The production data path still
-// uses work-conserving process-wide admission.
-#[cfg(test)]
 mod credit;
 mod error;
 pub mod fabric;

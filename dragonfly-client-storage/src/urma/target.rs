@@ -104,6 +104,29 @@ impl<T> PeerTargetRegistry<T> {
         Ok(())
     }
 
+    pub(crate) fn validate_active_generation(
+        &self,
+        id: PeerTargetId,
+        generation: u8,
+    ) -> Result<()> {
+        let entry = self
+            .by_id
+            .get(&id)
+            .ok_or_else(|| Error::Protocol(format!("unknown PeerTarget {id}")))?;
+        if entry.route.generation != generation {
+            return Err(Error::Protocol(format!(
+                "stale PeerTarget generation: id={id} active={} received={generation}",
+                entry.route.generation
+            )));
+        }
+        if entry.route.state != PeerTargetState::Active {
+            return Err(Error::Protocol(format!(
+                "PeerTarget {id} is draining and rejects new work"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn contains_routing_token(&self, id: PeerTargetId, token: RoutingToken) -> bool {
         self.by_id
             .get(&id)
@@ -286,5 +309,18 @@ mod tests {
         assert_eq!(registry.drain_routing_tokens(1).unwrap(), vec!["peer-1"]);
         registry.remove(1).unwrap();
         assert_eq!(registry.take_routing_token(2, token), Some("peer-2"));
+    }
+
+    #[test]
+    fn active_generation_gate_rejects_stale_and_draining_peer_work() {
+        let mut registry = PeerTargetRegistry::<()>::default();
+        registry.register(7, 3, remote(7, 7)).unwrap();
+
+        registry.validate_active_generation(7, 3).unwrap();
+        assert!(registry.validate_active_generation(7, 2).is_err());
+        assert!(registry.validate_active_generation(8, 3).is_err());
+
+        registry.begin_draining(7).unwrap();
+        assert!(registry.validate_active_generation(7, 3).is_err());
     }
 }

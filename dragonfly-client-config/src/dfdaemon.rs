@@ -297,6 +297,10 @@ fn default_storage_server_urma_max_concurrent_transfers() -> u32 {
     64
 }
 
+fn default_storage_server_urma_peer_guaranteed_rx_credits() -> u32 {
+    0
+}
+
 fn default_storage_server_urma_transfer_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -1066,6 +1070,12 @@ pub struct UrmaServer {
     #[validate(range(min = 1, max = 65535))]
     pub max_concurrent_transfers: u32,
 
+    /// Process-wide shared-JFR credits reserved for each active download
+    /// PeerTarget. Zero keeps work-conserving admission without static quota.
+    #[serde(default = "default_storage_server_urma_peer_guaranteed_rx_credits")]
+    #[validate(range(max = 4096))]
+    pub peer_guaranteed_rx_credits: u32,
+
     #[serde(
         default = "default_storage_server_urma_transfer_timeout",
         with = "humantime_serde"
@@ -1122,6 +1132,7 @@ impl Default for UrmaServer {
             post_list_size: default_storage_server_urma_post_list_size(),
             pipeline_depth: default_storage_server_urma_pipeline_depth(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
+            peer_guaranteed_rx_credits: default_storage_server_urma_peer_guaranteed_rx_credits(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
             mmap_content: false,
         }
@@ -2662,13 +2673,16 @@ mod urma_config_tests {
         assert_eq!(urma.post_list_size, 1);
         assert_eq!(urma.pipeline_depth, 2);
         assert_eq!(urma.max_concurrent_transfers, 64);
+        assert_eq!(urma.peer_guaranteed_rx_credits, 0);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn deserialize_rm_mode_explicitly() {
-        let urma: UrmaServer = serde_yaml::from_str("transportMode: rm").unwrap();
+        let urma: UrmaServer =
+            serde_yaml::from_str("transportMode: rm\npeerGuaranteedRxCredits: 8").unwrap();
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
+        assert_eq!(urma.peer_guaranteed_rx_credits, 8);
     }
 
     #[test]
@@ -2717,6 +2731,12 @@ mod urma_config_tests {
         }
         assert!(UrmaServer {
             max_concurrent_transfers: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(UrmaServer {
+            peer_guaranteed_rx_credits: 4097,
             ..Default::default()
         }
         .validate()

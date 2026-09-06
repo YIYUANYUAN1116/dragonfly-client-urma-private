@@ -1,4 +1,4 @@
-use super::{native_error, Error, Result};
+use super::{credit::PeerCreditPermit, native_error, Error, Result};
 use std::{
     collections::HashMap,
     ptr::NonNull,
@@ -277,7 +277,7 @@ pub(crate) struct RegisteredRxWindowLease {
     length: usize,
     cores: Vec<LeaseCore>,
     pipeline_permit: Option<OwnedSemaphorePermit>,
-    shared_rx_permit: Option<OwnedSemaphorePermit>,
+    shared_rx_permit: Option<PeerCreditPermit>,
     #[cfg(test)]
     _test_backing: Vec<Box<[u8]>>,
 }
@@ -346,7 +346,7 @@ impl RegisteredRxWindowLease {
 
     /// Keeps process-wide shared-JFR capacity reserved until Storage releases
     /// the registered RX lease and its slots can be reused.
-    pub(crate) fn with_shared_rx_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+    pub(crate) fn with_shared_rx_permit(mut self, permit: PeerCreditPermit) -> Self {
         self.shared_rx_permit = Some(permit);
         self
     }
@@ -1381,8 +1381,9 @@ mod tests {
             RegisteredRxWindowLease::from_test_parts(vec![vec![5, 6]], second, notifier);
         let pipeline_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let pipeline_permit = pipeline_permits.clone().try_acquire_owned().unwrap();
-        let shared_rx_permits = Arc::new(tokio::sync::Semaphore::new(2));
-        let shared_rx_permit = shared_rx_permits.clone().try_acquire_many_owned(2).unwrap();
+        let shared_rx_admission = crate::urma::credit::PeerCreditAdmission::new(2).unwrap();
+        shared_rx_admission.register_peer(1, 0).unwrap();
+        let shared_rx_permit = shared_rx_admission.try_acquire(1, 2).unwrap();
         let window = RegisteredRxWindowLease::merge(vec![first_window, tail_window])
             .unwrap()
             .with_pipeline_permit(pipeline_permit)
@@ -1394,10 +1395,10 @@ mod tests {
             vec![&[1, 2, 3, 4][..], &[5, 6][..]]
         );
         assert!(pipeline_permits.clone().try_acquire_owned().is_err());
-        assert!(shared_rx_permits.clone().try_acquire_owned().is_err());
+        assert_eq!(shared_rx_admission.available_permits(), 0);
         drop(window);
         assert!(pipeline_permits.try_acquire_owned().is_ok());
-        assert!(shared_rx_permits.try_acquire_owned().is_ok());
+        assert_eq!(shared_rx_admission.available_permits(), 2);
         let mut actual = returned.lock().unwrap().clone();
         actual.sort_by_key(|recycle| recycle.lease_id);
         assert_eq!(actual, vec![first, second]);
