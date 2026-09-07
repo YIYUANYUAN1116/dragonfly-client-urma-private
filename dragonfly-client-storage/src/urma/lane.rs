@@ -521,28 +521,31 @@ impl PeerTarget {
                 "registered RX window requires matching non-empty sequences and completions".into(),
             ));
         }
-        completions.ensure_recv_capacity(sequences.len(), shared_recv_depth)?;
         // Reject duplicate logical ownership before any native WR is posted.
-        // Once a RECV is visible to the provider, its SEND_IMM identity must
-        // already have exactly one waiter in this PeerTarget's TransferRegistry.
+        // The owner thread cannot poll while this command is running, so the
+        // preflight remains valid until the complete window is registered.
         completions.validate_registered_rx_identities(self.id, &sequences)?;
-        // Reserve the entire logical window before posting any native WR. A
-        // second pipeline window can therefore degrade cleanly when the global
-        // RX budget cannot satisfy it; no unmatched partial window is left on
-        // the receive queue.
-        let slots = pool.allocate_rx_window(sequences.len())?;
+        // Peer retirement can leave endpoint-owned anonymous RQEs without
+        // logical waiters. Reuse those first; only the deficit consumes new
+        // JFR depth and registered RX slots.
+        let reusable = completions.unassigned_recv_capacity()?.min(sequences.len());
+        let post_count = sequences.len() - reusable;
+        completions.ensure_recv_capacity(post_count, shared_recv_depth)?;
+        let slots = if post_count == 0 {
+            Vec::new()
+        } else {
+            pool.allocate_rx_window(post_count)?
+        };
         let mut pending: Vec<_> = slots
             .into_iter()
-            .zip(sequences)
-            .zip(completion_txs)
-            .map(|((slot, sequence), completion)| (slot, sequence, completion))
+            .zip(sequences.iter().copied().skip(reusable))
             .collect();
         while !pending.is_empty() {
             let batch_len = self.post_list_size.min(pending.len());
             let batch: Vec<_> = pending.drain(..batch_len).collect();
             let mut entries = Vec::with_capacity(batch_len);
             let prepare = (|| {
-                for (slot, _, _) in &batch {
+                for (slot, _) in &batch {
                     let (offset, length) = pool.recv_post_layout(*slot)?;
                     // Shared-JFR receive slots have no PeerTarget owner until
                     // the CQE supplies remote_id plus the routing token.
@@ -558,14 +561,14 @@ impl PeerTarget {
                 Ok(())
             })();
             if let Err(error) = prepare {
-                for (slot, _, _) in batch.iter().take(entries.len()) {
+                for (slot, _) in batch.iter().take(entries.len()) {
                     pool.rollback_post(*slot, SlotKind::Rx)?;
                 }
                 pool.release_unposted_rx_window(
                     batch
                         .into_iter()
-                        .map(|(slot, _, _)| slot)
-                        .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                        .map(|(slot, _)| slot)
+                        .chain(pending.into_iter().map(|(slot, _)| slot))
                         .collect(),
                 )?;
                 return Err(error);
@@ -573,14 +576,14 @@ impl PeerTarget {
             let posted = match jetty.post_recv_batch(pool.segment_handle()?, &entries) {
                 Ok(posted) => posted,
                 Err(error) => {
-                    for (slot, _, _) in &batch {
+                    for (slot, _) in &batch {
                         pool.rollback_post(*slot, SlotKind::Rx)?;
                     }
                     pool.release_unposted_rx_window(
                         batch
                             .into_iter()
-                            .map(|(slot, _, _)| slot)
-                            .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                            .map(|(slot, _)| slot)
+                            .chain(pending.into_iter().map(|(slot, _)| slot))
                             .collect(),
                     )?;
                     return Err(error);
@@ -591,16 +594,12 @@ impl PeerTarget {
             let mut first_error = posted
                 .error
                 .map(|error| native_error("post_jetty_recv_wr_list", error));
-            for (index, (slot, sequence, completion)) in batch.into_iter().enumerate() {
+            for (index, (slot, sequence)) in batch.into_iter().enumerate() {
                 if index < posted_len {
                     let wr = handles.next().expect("posted prefix handle count matches");
-                    if let Err(error) = completions.track_registered_rx(
-                        self.id,
-                        entries[index].user_ctx,
-                        wr,
-                        Some(sequence),
-                        completion,
-                    ) {
+                    if let Err(error) =
+                        completions.track_anonymous_rx(entries[index].user_ctx, wr, Some(sequence))
+                    {
                         first_error.get_or_insert(error);
                     }
                 } else {
@@ -610,12 +609,12 @@ impl PeerTarget {
             }
             if let Some(error) = first_error {
                 pool.release_unposted_rx_window(
-                    pending.into_iter().map(|(slot, _, _)| slot).collect(),
+                    pending.into_iter().map(|(slot, _)| slot).collect(),
                 )?;
                 return Err(error);
             }
         }
-        Ok(())
+        completions.register_rx_window(self.id, sequences, completion_txs)
     }
 
     pub(crate) fn send_registered_window(

@@ -1034,12 +1034,10 @@ int dfurma_jfc_poll(dfurma_jfc_t *jfc, uint32_t capacity,
             (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
              cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
         out[i].imm_data_valid =
-            (cr[i].flag.bs.s_r != 0 &&
+            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0 &&
              cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM);
         out[i].remote_id_valid =
-            (cr[i].flag.bs.s_r != 0 &&
-             cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
-             cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
+            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0);
         if (cr[i].status == URMA_CR_WR_SUSPEND_DONE) {
             out[i].event_kind = DFURMA_COMPLETION_WR_SUSPEND_DONE;
         } else if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {

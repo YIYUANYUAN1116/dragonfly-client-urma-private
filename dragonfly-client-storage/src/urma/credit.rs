@@ -333,15 +333,19 @@ impl PeerCreditAdmission {
         peer_id: PeerTargetId,
         count: u32,
     ) -> Result<PeerCreditPermit> {
-        // Tokio's Mutex queues lock attempts in FIFO order. Keep the guard
-        // while logical capacity is unavailable so required windows cannot
-        // repeatedly race each other on Notify wakeups.
-        let _queue = self.inner.required_queue.lock().await;
         loop {
             // Subscribe before checking state so a concurrent release cannot
             // be lost between a failed grant and the await.
             let changed = self.inner.changed.notified();
-            match self.reserve(peer_id, count) {
+            // Serialize each reservation attempt, but never hold the FIFO gate
+            // while waiting for another Peer's protected guarantee. Otherwise
+            // an oversized head request can prevent that Peer from consuming
+            // its own guarantee, leaving an entirely idle pool deadlocked.
+            let reserved = {
+                let _queue = self.inner.required_queue.lock().await;
+                self.reserve(peer_id, count)
+            };
+            match reserved {
                 Ok(mut credit) => {
                     let permit = self
                         .inner
@@ -578,6 +582,30 @@ mod tests {
 
         let peer_2 = waiter.await.unwrap().unwrap();
         assert_eq!(peer_2.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_head_waiter_does_not_block_another_peers_guarantee() {
+        let admission = PeerCreditAdmission::new(8).unwrap();
+        admission.register_peer(1, 4).unwrap();
+        admission.register_peer(2, 4).unwrap();
+
+        let blocked = {
+            let admission = admission.clone();
+            tokio::spawn(async move { admission.acquire(1, 8).await })
+        };
+        tokio::task::yield_now().await;
+
+        let peer_two = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            admission.acquire(2, 4),
+        )
+        .await
+        .expect("Peer 2 must pass the blocked oversized head waiter")
+        .unwrap();
+        assert_eq!(peer_two.count(), 4);
+        drop(peer_two);
+        blocked.abort();
     }
 
     #[tokio::test]

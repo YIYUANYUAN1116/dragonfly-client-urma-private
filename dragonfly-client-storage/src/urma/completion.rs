@@ -406,6 +406,19 @@ impl CompletionRouter {
         Ok(())
     }
 
+    /// Number of already-posted anonymous RQEs that currently have no logical
+    /// routing token. Peer retirement deliberately leaves these endpoint-owned
+    /// RQEs live, so later peers must reuse them instead of posting another RQE.
+    pub(crate) fn unassigned_recv_capacity(&self) -> Result<usize> {
+        let logical = self.targets.routing_token_count();
+        self.outstanding_recv.checked_sub(logical).ok_or_else(|| {
+            Error::Protocol(format!(
+                "shared RM logical RX credits exceed posted RQEs: logical={logical} posted={}",
+                self.outstanding_recv
+            ))
+        })
+    }
+
     pub(crate) fn endpoint_ready_to_close(&self) -> bool {
         self.outstanding_total == 0
             && self
@@ -432,6 +445,7 @@ impl CompletionRouter {
             .is_some_and(|endpoint| endpoint.waiting_for_flush && !endpoint.flush_done)
     }
 
+    #[cfg(test)]
     pub(crate) fn track_registered_rx(
         &mut self,
         peer_id: u16,
@@ -440,12 +454,6 @@ impl CompletionRouter {
         sequence: Option<u64>,
         completion: RegisteredRxCompletionTx,
     ) -> Result<()> {
-        let token = WrToken::decode(user_ctx)?;
-        if token.operation != OperationType::Recv {
-            return Err(Error::Protocol(
-                "registered RX completion requires a RECV WR".into(),
-            ));
-        }
         let sequence = sequence.ok_or_else(|| {
             Error::InvalidConfiguration(
                 "registered RX completion requires a SEND_IMM identity".into(),
@@ -459,6 +467,32 @@ impl CompletionRouter {
         let routing_token = RoutingToken::decode(sequence)?;
         self.targets
             .validate_routing_token(peer_id, routing_token)?;
+        self.targets
+            .register_routing_token(peer_id, routing_token, completion)?;
+        if let Err(error) = self.track_anonymous_rx(user_ctx, handle, Some(sequence)) {
+            // Registration was prevalidated and inserted only for this call.
+            // Roll it back if physical ownership could not be recorded.
+            let _ = self.targets.take_routing_token(peer_id, routing_token);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Records one provider-accepted anonymous receive WR. Logical ownership is
+    /// registered separately because an existing endpoint RQE may be reused by
+    /// a later PeerTarget after its original waiter is retired.
+    pub(crate) fn track_anonymous_rx(
+        &mut self,
+        user_ctx: u64,
+        handle: ffi::WrHandle,
+        posted_sequence: Option<u64>,
+    ) -> Result<()> {
+        let token = WrToken::decode(user_ctx)?;
+        if token.operation != OperationType::Recv || token.peer_id != 0 {
+            return Err(Error::Protocol(
+                "anonymous RX ownership requires a peerless RECV WR".into(),
+            ));
+        }
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -466,12 +500,10 @@ impl CompletionRouter {
         if self.outstanding[slot].is_some() {
             return Err(Error::Protocol("duplicate outstanding slot".into()));
         }
-        self.targets
-            .register_routing_token(peer_id, routing_token, completion)?;
         self.outstanding[slot] = Some(OutstandingWr {
             user_ctx,
             handle,
-            sequence: Some(sequence),
+            sequence: posted_sequence,
             completion: None,
         });
         self.outstanding_total += 1;
@@ -481,6 +513,39 @@ impl CompletionRouter {
             .stats
             .max_outstanding
             .max(self.outstanding_total as u64);
+        Ok(())
+    }
+
+    /// Registers logical receive consumers against the endpoint's anonymous
+    /// posted-RQE pool. Callers must ensure enough unassigned RQEs exist first.
+    pub(crate) fn register_rx_window(
+        &mut self,
+        peer_id: u16,
+        sequences: Vec<u64>,
+        completions: Vec<RegisteredRxCompletionTx>,
+    ) -> Result<()> {
+        if sequences.is_empty() || sequences.len() != completions.len() {
+            return Err(Error::InvalidConfiguration(
+                "registered RX window requires matching non-empty identities and completions"
+                    .into(),
+            ));
+        }
+        self.validate_registered_rx_identities(peer_id, &sequences)?;
+        let available = self.unassigned_recv_capacity()?;
+        if sequences.len() > available {
+            return Err(Error::BufferUnavailable {
+                kind: "shared RM anonymous RQE",
+                requested: sequences.len(),
+                available,
+            });
+        }
+        for (sequence, completion) in sequences.into_iter().zip(completions) {
+            let token = RoutingToken::decode(sequence)?;
+            // The whole window was prevalidated on this single owner thread,
+            // therefore insertion cannot conflict part-way through the loop.
+            self.targets
+                .register_routing_token(peer_id, token, completion)?;
+        }
         Ok(())
     }
 
@@ -666,18 +731,19 @@ impl CompletionRouter {
             )));
         }
         let expected_recv = token.operation == OperationType::Recv;
+        let recv_shape_valid = expected_recv && recv_queue && record.is_recv && record.is_jetty;
         // Resolve the data source from the hardware-reported remote identity.
         // With the shared receive queue, a CQE's posting WR (token lane) is
         // anonymous: any authorized peer's SEND may consume any posted RECV.
         // The source peer must still be an authorized PeerTarget; anything
         // else fails closed.
-        let source = if expected_recv && record.status == 0 {
+        let source = if recv_shape_valid && record.status == 0 {
             let routing_token = match validate_recv_immediate(record) {
                 Ok(routing_token) => routing_token,
                 Err(error) => {
                     self.stats.cqe_error += 1;
                     self.record_rx_route_failure(RxRouteFailure::InvalidToken);
-                    return Err(error);
+                    return self.retire_rejected_recv(record.user_ctx, pool, error);
                 }
             };
             match self.classify_source(record.remote_id, routing_token) {
@@ -685,7 +751,7 @@ impl CompletionRouter {
                 Err(failure) => {
                     self.stats.cqe_error += 1;
                     self.record_rx_route_failure(failure);
-                    return Err(failure.into_error());
+                    return self.retire_rejected_recv(record.user_ctx, pool, failure.into_error());
                 }
             }
         } else if expected_recv {
@@ -823,6 +889,34 @@ impl CompletionRouter {
         }
     }
 
+    /// A receive CQE has already consumed its provider-side RQE even when its
+    /// source or routing token is invalid. Retire the trusted local physical
+    /// ownership before propagating the logical routing failure; otherwise no
+    /// later CQE (including endpoint flush) can release this WR and slot.
+    fn retire_rejected_recv(
+        &mut self,
+        user_ctx: u64,
+        pool: &mut UrmaBufferPool,
+        error: Error,
+    ) -> Result<()> {
+        let token = WrToken::decode(user_ctx)?;
+        if token.operation != OperationType::Recv || token.peer_id != 0 {
+            return Err(Error::Protocol(
+                "rejected shared RX CQE does not reference an anonymous RECV WR".into(),
+            ));
+        }
+        let mut outstanding = self.take_outstanding(user_ctx)?;
+        outstanding.handle.complete();
+        self.outstanding_recv -= 1;
+        self.stats.recv_cqe += 1;
+        pool.complete_error(token.slot, OperationType::Recv)?;
+        pool.release(token.slot)?;
+        if let Some(completion) = outstanding.completion.take() {
+            completion.send(Err(error.clone()));
+        }
+        Err(error)
+    }
+
     fn route_flush_done(&mut self, record: ffi::CompletionRecord, recv_queue: bool) -> Result<()> {
         if recv_queue {
             self.stats.cqe_error += 1;
@@ -924,6 +1018,7 @@ impl CompletionRouter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> CompletionStats {
         self.stats
     }
@@ -1041,6 +1136,94 @@ mod tests {
         assert_eq!(router.outstanding_for_peer(7), 0);
         router.unregister_peer(7).unwrap();
         assert_eq!(router.outstanding(), 1);
+    }
+
+    #[test]
+    fn retired_peers_anonymous_rqe_can_be_reassigned_without_another_post() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        authorize_test_peer(&mut router, 2);
+        let context = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
+            .encode()
+            .unwrap();
+        let old_sequence = RoutingToken::encode(1, 0).unwrap();
+        router
+            .track_registered_rx(
+                1,
+                context,
+                ffi::WrHandle::without_native(),
+                Some(old_sequence),
+                oneshot::channel().0,
+            )
+            .unwrap();
+        router.begin_peer_retirement(1).unwrap();
+        router.unregister_peer(1).unwrap();
+        assert_eq!(router.unassigned_recv_capacity().unwrap(), 1);
+
+        let new_sequence = RoutingToken::encode(2, 0).unwrap();
+        let (completion, _receiver) = oneshot::channel();
+        router
+            .register_rx_window(2, vec![new_sequence], vec![completion])
+            .unwrap();
+        assert_eq!(router.unassigned_recv_capacity().unwrap(), 0);
+        assert_eq!(router.logical_rx_credits(), 1);
+        assert_eq!(router.outstanding_recv(), 1);
+    }
+
+    #[test]
+    fn rejected_receive_route_still_retires_consumed_physical_rqe() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        let context = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
+            .encode()
+            .unwrap();
+        let sequence = RoutingToken::encode(1, 0).unwrap();
+        let (completion, receiver) = oneshot::channel();
+        router
+            .track_registered_rx(
+                1,
+                context,
+                ffi::WrHandle::without_native(),
+                Some(sequence),
+                completion,
+            )
+            .unwrap();
+        let mut pool =
+            UrmaBufferPool::from_test_slot_states(&[(SlotKind::Rx, SlotState::PostedRecv)]);
+
+        assert!(router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    opcode: ffi::CR_OPCODE_SEND_WITH_IMM,
+                    user_ctx: context,
+                    imm_data: sequence,
+                    completion_len: 1,
+                    local_id: 101,
+                    remote_id: Some(ffi::RemoteJettyId {
+                        eid: [9; ffi::EID_SIZE],
+                        uasid: 9,
+                        id: 9,
+                    }),
+                    is_recv: true,
+                    is_jetty: true,
+                    user_ctx_valid: true,
+                    imm_data_valid: true,
+                    ..Default::default()
+                },
+                true,
+                &mut pool,
+            )
+            .is_err());
+        assert_eq!(router.outstanding_recv(), 0);
+        assert_eq!(pool.rx_state_counts().free, 1);
+        router.fail_pending(&Error::Protocol("fabric failed".into()));
+        assert!(matches!(
+            receiver.blocking_recv().unwrap(),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -1167,9 +1350,10 @@ mod tests {
     }
 
     #[test]
-    fn registered_rx_identity_preflight_is_lane_scoped_and_fails_pending() {
+    fn registered_rx_identity_preflight_is_peer_scoped_and_fails_pending() {
         let mut router = CompletionRouter::new(4).unwrap();
         authorize_test_peer(&mut router, 1);
+        authorize_test_peer(&mut router, 2);
         let sequence = (7u64 << 32) | 3;
         assert!(router
             .validate_registered_rx_identities(1, &[sequence, sequence])
