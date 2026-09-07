@@ -1,4 +1,7 @@
 use super::{target::PeerTargetId, Error, Result};
+use dragonfly_client_metric::{
+    collect_urma_rx_peer_credit_event_metrics, collect_urma_rx_peer_credit_metrics,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -53,6 +56,16 @@ pub(crate) struct PeerCreditRegistry {
 struct PeerCreditAdmissionState {
     credits: PeerCreditRegistry,
     retiring: HashSet<PeerTargetId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PeerCreditSnapshot {
+    active_peers: usize,
+    retiring_peers: usize,
+    guaranteed_limit: usize,
+    guaranteed: usize,
+    borrowed: usize,
+    outstanding: usize,
 }
 
 struct PeerCreditAdmissionInner {
@@ -247,6 +260,17 @@ impl PeerCreditRegistry {
         self.outstanding
     }
 
+    fn snapshot(&self, retiring_peers: usize) -> PeerCreditSnapshot {
+        PeerCreditSnapshot {
+            active_peers: self.peers.len().saturating_sub(retiring_peers),
+            retiring_peers,
+            guaranteed_limit: self.peers.values().map(|peer| peer.guaranteed_limit).sum(),
+            guaranteed: self.peers.values().map(|peer| peer.guaranteed).sum(),
+            borrowed: self.peers.values().map(|peer| peer.borrowed).sum(),
+            outstanding: self.outstanding,
+        }
+    }
+
     fn unused_guarantees(&self) -> usize {
         self.peers
             .values()
@@ -281,7 +305,7 @@ impl PeerCreditAdmission {
         let capacity = usize::try_from(capacity).map_err(|_| {
             Error::InvalidConfiguration("shared RM credit depth does not fit usize".into())
         })?;
-        Ok(Self {
+        let admission = Self {
             inner: Arc::new(PeerCreditAdmissionInner {
                 permits: Arc::new(Semaphore::new(capacity)),
                 state: Mutex::new(PeerCreditAdmissionState {
@@ -291,19 +315,39 @@ impl PeerCreditAdmission {
                 required_queue: AsyncMutex::new(()),
                 changed: Notify::new(),
             }),
-        })
+        };
+        publish_credit_snapshot(PeerCreditSnapshot::default());
+        Ok(admission)
     }
 
     pub(crate) fn register_peer(&self, peer_id: PeerTargetId, guaranteed_limit: u32) -> Result<()> {
         let guaranteed_limit = usize::try_from(guaranteed_limit).map_err(|_| {
             Error::InvalidConfiguration("RM PeerTarget guarantee does not fit usize".into())
         })?;
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .credits
-            .register_peer(peer_id, guaranteed_limit)
+        let (result, snapshot) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let result = state.credits.register_peer(peer_id, guaranteed_limit);
+            let snapshot = state.credits.snapshot(state.retiring.len());
+            (result, snapshot)
+        };
+        let event = match &result {
+            Ok(()) => "registered",
+            Err(Error::BufferUnavailable { .. }) => "register_rejected_capacity",
+            Err(Error::Protocol(_)) => "register_rejected_duplicate",
+            Err(Error::InvalidConfiguration(detail))
+                if detail.contains("exceeds shared capacity") =>
+            {
+                "register_rejected_capacity"
+            }
+            Err(_) => "register_rejected_configuration",
+        };
+        publish_credit_snapshot(snapshot);
+        collect_urma_rx_peer_credit_event_metrics(event);
+        result
     }
 
     /// Stops new grants immediately. Account removal is deferred until every
@@ -318,12 +362,21 @@ impl PeerCreditAdmission {
             .credits
             .peer(peer_id)
             .ok_or_else(|| Error::Protocol(format!("unknown PeerTarget {peer_id}")))?;
-        if account.outstanding == 0 {
+        let newly_retiring = if account.outstanding == 0 {
             state.credits.unregister_peer(peer_id)?;
+            false
         } else {
-            state.retiring.insert(peer_id);
-        }
+            state.retiring.insert(peer_id)
+        };
+        let snapshot = state.credits.snapshot(state.retiring.len());
         drop(state);
+        publish_credit_snapshot(snapshot);
+        if account.outstanding == 0 || newly_retiring {
+            collect_urma_rx_peer_credit_event_metrics("retiring");
+        }
+        if account.outstanding == 0 {
+            collect_urma_rx_peer_credit_event_metrics("unregistered");
+        }
         self.inner.changed.notify_waiters();
         Ok(())
     }
@@ -394,7 +447,7 @@ impl PeerCreditAdmission {
         let count = usize::try_from(count).map_err(|_| {
             Error::InvalidConfiguration("RM credit request does not fit usize".into())
         })?;
-        let grant = {
+        let (grant, snapshot) = {
             let mut state = self
                 .inner
                 .state
@@ -405,8 +458,12 @@ impl PeerCreditAdmission {
                     "PeerTarget {peer_id} is retiring and rejects RX credit"
                 )));
             }
-            state.credits.try_grant(peer_id, count)?
+            let grant = state.credits.try_grant(peer_id, count)?;
+            let snapshot = state.credits.snapshot(state.retiring.len());
+            (grant, snapshot)
         };
+        publish_credit_snapshot(snapshot);
+        collect_urma_rx_peer_credit_event_metrics("granted");
         Ok(PeerCreditPermit {
             inner: Arc::clone(&self.inner),
             grant: Some(grant),
@@ -441,7 +498,9 @@ impl Drop for PeerCreditPermit {
             .unwrap_or_else(|error| error.into_inner());
         let release = state.credits.release(grant);
         debug_assert!(release.is_ok(), "PeerCreditPermit release must balance");
-        if release.is_ok()
+        let released = release.is_ok();
+        let mut unregistered = false;
+        if released
             && state.retiring.contains(&peer_id)
             && state
                 .credits
@@ -452,11 +511,31 @@ impl Drop for PeerCreditPermit {
             debug_assert!(unregister.is_ok(), "retired PeerCredit must unregister");
             if unregister.is_ok() {
                 state.retiring.remove(&peer_id);
+                unregistered = true;
             }
         }
+        let snapshot = state.credits.snapshot(state.retiring.len());
         drop(state);
+        publish_credit_snapshot(snapshot);
+        if released {
+            collect_urma_rx_peer_credit_event_metrics("released");
+        }
+        if unregistered {
+            collect_urma_rx_peer_credit_event_metrics("unregistered");
+        }
         self.inner.changed.notify_waiters();
     }
+}
+
+fn publish_credit_snapshot(snapshot: PeerCreditSnapshot) {
+    collect_urma_rx_peer_credit_metrics(
+        snapshot.active_peers,
+        snapshot.retiring_peers,
+        snapshot.guaranteed_limit,
+        snapshot.guaranteed,
+        snapshot.borrowed,
+        snapshot.outstanding,
+    );
 }
 
 #[cfg(test)]
@@ -487,6 +566,17 @@ mod tests {
         assert_eq!(second.guaranteed(), 3);
         assert_eq!(second.borrowed(), 0);
         assert_eq!(credits.outstanding(), 11);
+        assert_eq!(
+            credits.snapshot(0),
+            PeerCreditSnapshot {
+                active_peers: 2,
+                retiring_peers: 0,
+                guaranteed_limit: 6,
+                guaranteed: 6,
+                borrowed: 5,
+                outstanding: 11,
+            }
+        );
 
         credits.release(first).unwrap();
         credits.release(second).unwrap();
@@ -609,6 +699,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hot_borrower_preserves_sibling_guarantees_during_concurrent_churn() {
+        let admission = PeerCreditAdmission::new(32).unwrap();
+        for peer_id in 1..=4 {
+            admission.register_peer(peer_id, 4).unwrap();
+        }
+
+        // Peer 1 consumes its guarantee plus every byte of real surplus. The
+        // remaining capacity is exactly the three sibling guarantees.
+        let hot = admission.try_acquire(1, 20).unwrap();
+        assert!(admission.try_acquire(1, 1).is_err());
+
+        let mut waiters = Vec::new();
+        for peer_id in 2..=4 {
+            let admission = admission.clone();
+            waiters.push(tokio::spawn(
+                async move { admission.acquire(peer_id, 4).await },
+            ));
+        }
+        let peer_2 = waiters.remove(0).await.unwrap().unwrap();
+        let peer_3 = waiters.remove(0).await.unwrap().unwrap();
+        let peer_4 = waiters.remove(0).await.unwrap().unwrap();
+        assert_eq!(admission.available_permits(), 0);
+
+        // Retirement remains deferred until Peer 2's lease-held credit is
+        // released, after which the same logical id can represent a new peer
+        // generation without colliding with the old account.
+        admission.retire_peer(2).unwrap();
+        drop(peer_2);
+        admission.register_peer(2, 4).unwrap();
+
+        drop(peer_3);
+        drop(peer_4);
+        drop(hot);
+        assert_eq!(admission.available_permits(), 32);
+        let peer_2 = admission.try_acquire(2, 4).unwrap();
+        assert_eq!(peer_2.count(), 4);
+    }
+
+    #[tokio::test]
     async fn cancelled_required_acquire_returns_reserved_logical_credit() {
         let admission = PeerCreditAdmission::new(1).unwrap();
         admission.register_peer(1, 0).unwrap();
@@ -646,10 +775,31 @@ mod tests {
 
         admission.retire_peer(7).unwrap();
         assert!(admission.try_acquire(7, 1).is_err());
+        {
+            let state = admission.inner.state.lock().unwrap();
+            assert_eq!(
+                state.credits.snapshot(state.retiring.len()),
+                PeerCreditSnapshot {
+                    active_peers: 0,
+                    retiring_peers: 1,
+                    guaranteed_limit: 1,
+                    guaranteed: 1,
+                    borrowed: 0,
+                    outstanding: 1,
+                }
+            );
+        }
         drop(permit);
 
         // Deferred retirement removed the old account, so the same logical
         // id can be registered again by a future generation.
+        {
+            let state = admission.inner.state.lock().unwrap();
+            assert_eq!(
+                state.credits.snapshot(state.retiring.len()),
+                PeerCreditSnapshot::default()
+            );
+        }
         admission.register_peer(7, 1).unwrap();
     }
 }

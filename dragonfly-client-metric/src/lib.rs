@@ -329,6 +329,35 @@ pub static URMA_RX_ANOMALY_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric can be created")
 });
 
+/// Process-wide aggregate of RM PeerTarget receive-credit accounts. Peer IDs
+/// are intentionally excluded to keep cardinality bounded.
+pub static URMA_RX_PEER_CREDIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "urma_rx_peer_credit",
+            "Gauge of process-wide RM PeerTarget receive-credit accounts.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["state"],
+    )
+    .expect("metric can be created")
+});
+
+/// Lifecycle and accounting events for process-wide RM PeerTarget RX credit.
+pub static URMA_RX_PEER_CREDIT_EVENT_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "urma_rx_peer_credit_event_total",
+            "Counter of process-wide RM PeerTarget receive-credit events.",
+        )
+        .namespace(dragonfly_client_config::SERVICE_NAME)
+        .subsystem(dragonfly_client_config::NAME),
+        &["event"],
+    )
+    .expect("metric can be created")
+});
+
 /// Used to record the download task duration.
 pub static DOWNLOAD_TASK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
@@ -767,6 +796,14 @@ fn register_custom_metrics() {
 
     REGISTRY
         .register(Box::new(URMA_RX_ANOMALY_COUNT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_RX_PEER_CREDIT.clone()))
+        .expect("metric can be registered");
+
+    REGISTRY
+        .register(Box::new(URMA_RX_PEER_CREDIT_EVENT_COUNT.clone()))
         .expect("metric can be registered");
 
     REGISTRY
@@ -1258,6 +1295,37 @@ pub fn collect_urma_rx_anomaly_metrics(reason: &str) {
     URMA_RX_ANOMALY_COUNT.with_label_values(&[reason]).inc();
 }
 
+/// Publishes one process-wide aggregate PeerTarget RX-credit snapshot. State
+/// names are fixed here and never include a PeerTarget or transfer identity.
+pub fn collect_urma_rx_peer_credit_metrics(
+    active_peers: usize,
+    retiring_peers: usize,
+    guaranteed_limit: usize,
+    guaranteed: usize,
+    borrowed: usize,
+    outstanding: usize,
+) {
+    for (state, value) in [
+        ("active_peers", active_peers),
+        ("retiring_peers", retiring_peers),
+        ("guaranteed_limit", guaranteed_limit),
+        ("guaranteed", guaranteed),
+        ("borrowed", borrowed),
+        ("outstanding", outstanding),
+    ] {
+        URMA_RX_PEER_CREDIT
+            .with_label_values(&[state])
+            .set(i64::try_from(value).unwrap_or(i64::MAX));
+    }
+}
+
+/// Counts one fixed-vocabulary PeerTarget RX-credit accounting event.
+pub fn collect_urma_rx_peer_credit_event_metrics(event: &str) {
+    URMA_RX_PEER_CREDIT_EVENT_COUNT
+        .with_label_values(&[event])
+        .inc();
+}
+
 /// Collects the upload piece failure metrics.
 pub fn collect_upload_piece_failure_metrics() {
     CONCURRENT_UPLOAD_PIECE_GAUGE.with_label_values(&[]).dec();
@@ -1611,6 +1679,35 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collect_urma_rx_peer_credit_metrics() {
+        collect_urma_rx_peer_credit_metrics(2, 1, 12, 5, 3, 8);
+        for (state, expected) in [
+            ("active_peers", 2),
+            ("retiring_peers", 1),
+            ("guaranteed_limit", 12),
+            ("guaranteed", 5),
+            ("borrowed", 3),
+            ("outstanding", 8),
+        ] {
+            assert_eq!(
+                URMA_RX_PEER_CREDIT.with_label_values(&[state]).get(),
+                expected
+            );
+        }
+
+        let before = URMA_RX_PEER_CREDIT_EVENT_COUNT
+            .with_label_values(&["registered"])
+            .get();
+        collect_urma_rx_peer_credit_event_metrics("registered");
+        assert_eq!(
+            URMA_RX_PEER_CREDIT_EVENT_COUNT
+                .with_label_values(&["registered"])
+                .get(),
+            before + 1
+        );
+    }
 
     #[test]
     fn test_task_size_calculate_size_level() {

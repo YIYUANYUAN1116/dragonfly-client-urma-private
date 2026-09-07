@@ -1172,6 +1172,35 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_rqe_survives_repeated_peer_churn_without_capacity_growth() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        let context = WrToken::anonymous_recv(SlotId::new(0, 1).unwrap())
+            .encode()
+            .unwrap();
+        router
+            .track_anonymous_rx(context, ffi::WrHandle::without_native(), None)
+            .unwrap();
+
+        for peer_id in 1..=32 {
+            authorize_test_peer(&mut router, peer_id);
+            let sequence = RoutingToken::encode(u32::from(peer_id), 0).unwrap();
+            router
+                .register_rx_window(peer_id, vec![sequence], vec![oneshot::channel().0])
+                .unwrap();
+            assert_eq!(router.outstanding_recv(), 1);
+            assert_eq!(router.logical_rx_credits(), 1);
+
+            router.begin_peer_retirement(peer_id).unwrap();
+            router.unregister_peer(peer_id).unwrap();
+            assert_eq!(router.unassigned_recv_capacity().unwrap(), 1);
+        }
+
+        assert_eq!(router.outstanding_recv(), 1);
+        assert_eq!(router.stats().recv_post, 1);
+    }
+
+    #[test]
     fn rejected_receive_route_still_retires_consumed_physical_rqe() {
         let mut router = CompletionRouter::new(4).unwrap();
         router.register_endpoint(101, 201).unwrap();
