@@ -14,6 +14,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) send_jfc_depth: u32,
     pub(crate) recv_jfc_depth: u32,
     pub(crate) buffer_pool: BufferPoolConfig,
+    pub(crate) tp_type: crate::urma::TpType,
 }
 
 impl RuntimeConfig {
@@ -24,6 +25,7 @@ impl RuntimeConfig {
             send_jfc_depth: 4096,
             recv_jfc_depth: 4096,
             buffer_pool: BufferPoolConfig::default(),
+            tp_type: crate::urma::TpType::default(),
         }
     }
 
@@ -51,6 +53,11 @@ impl RuntimeConfig {
         self.buffer_pool.total_len()?;
         Ok(self)
     }
+
+    pub(crate) fn with_tp_type(mut self, tp_type: crate::urma::TpType) -> Self {
+        self.tp_type = tp_type;
+        self
+    }
 }
 
 fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> {
@@ -75,6 +82,7 @@ fn shared_endpoint_config(
         max_send_sge: 1,
         max_recv_sge: 1,
         token: 0,
+        tp_type: runtime.tp_type,
     }
 }
 
@@ -936,6 +944,7 @@ mod tests {
         assert_eq!(config.eid_index, 2);
         assert_eq!(config.send_jfc_depth, 4096);
         assert_eq!(config.recv_jfc_depth, 4096);
+        assert_eq!(config.tp_type, crate::urma::TpType::Rtp);
         assert_eq!(config.buffer_pool, BufferPoolConfig::default());
         assert_eq!(config.buffer_pool.total_len().unwrap(), 40 * 1024 * 1024);
     }
@@ -981,5 +990,13 @@ mod tests {
         assert_eq!(endpoint.recv_depth, 256);
         assert_eq!(endpoint.max_send_sge, 1);
         assert_eq!(endpoint.max_recv_sge, 1);
+        assert_eq!(endpoint.tp_type, crate::urma::TpType::Rtp);
+    }
+
+    #[test]
+    fn shared_endpoint_uses_selected_ctp_type() {
+        let runtime = RuntimeConfig::new("urma0", 0).with_tp_type(crate::urma::TpType::Ctp);
+        let endpoint = shared_endpoint_config(&runtime, &capability_for_depths(8, 8));
+        assert_eq!(endpoint.tp_type, crate::urma::TpType::Ctp);
     }
 }

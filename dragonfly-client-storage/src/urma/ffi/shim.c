@@ -31,6 +31,8 @@ _Static_assert(URMA_CR_OPC_SEND_WITH_IMM == DFURMA_CR_OPC_SEND_WITH_IMM,
                "URMA SEND_WITH_IMM completion opcode changed");
 _Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
                "URMA EID size changed");
+_Static_assert(URMA_RTP == DFURMA_TP_RTP, "URMA RTP value changed");
+_Static_assert(URMA_CTP == DFURMA_TP_CTP, "URMA CTP value changed");
 
 struct dfurma_runtime {
     urma_device_t *device;
@@ -66,6 +68,8 @@ struct dfurma_jetty {
     dfurma_wr_t *wr_arena;
     dfurma_wr_t *free_wr;
     uint32_t wr_capacity;
+    urma_tp_type_t tp_type;
+    uint8_t priority;
 };
 
 struct dfurma_target {
@@ -92,15 +96,16 @@ static int dfurma_pointer_error(int fallback)
 
 /*
  * Match urma_perftest's provider-facing priority selection.  On current UB
- * devices the imported Jetty uses an RTP, whose service class is commonly
- * priority 0.  URMA_MAX_PRIORITY is only the largest valid numeric value; it
- * does not mean "fastest" and may select a different, rate-limited TP class.
+ * devices the selected TP type determines the service-class priority.
+ * URMA_MAX_PRIORITY is only the largest valid numeric value; it does not mean
+ * "fastest" and may select a different, rate-limited TP class.
  */
-static int dfurma_get_rtp_priority(dfurma_runtime_t *runtime,
-                                     uint8_t *priority)
+static int dfurma_get_tp_priority(dfurma_runtime_t *runtime,
+                                  urma_tp_type_t tp_type,
+                                  uint8_t *priority)
 {
     urma_device_attr_t attr = {0};
-    union urma_tp_type_en rtp = {0};
+    union urma_tp_type_en requested = {0};
     urma_status_t status;
 
     if (runtime == NULL || runtime->device == NULL ||
@@ -119,9 +124,15 @@ static int dfurma_get_rtp_priority(dfurma_runtime_t *runtime,
     if (status != URMA_SUCCESS) {
         return (int)status;
     }
-    rtp.bs.rtp = 1;
+    if (tp_type == URMA_RTP) {
+        requested.bs.rtp = 1;
+    } else if (tp_type == URMA_CTP) {
+        requested.bs.ctp = 1;
+    } else {
+        return -EINVAL;
+    }
     for (uint8_t i = 0; i <= URMA_MAX_PRIORITY; ++i) {
-        if (attr.dev_cap.priority_info[i].tp_type.value == rtp.value) {
+        if (attr.dev_cap.priority_info[i].tp_type.value == requested.value) {
             *priority = i;
             return 0;
         }
@@ -369,7 +380,8 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     urma_jfr_cfg_t jfr_cfg = {0};
     urma_jetty_cfg_t jetty_cfg = {0};
     dfurma_jetty_t *jetty;
-    uint8_t rtp_priority;
+    uint8_t tp_priority;
+    urma_tp_type_t tp_type;
     int priority_status;
 
     if (runtime == NULL || runtime->context == NULL || send_jfc == NULL ||
@@ -378,12 +390,18 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
         send_jfc->jfc == NULL || recv_jfc->jfc == NULL ||
         config->send_depth == 0 || config->recv_depth == 0 ||
         config->max_send_sge == 0 || config->max_send_sge > UINT8_MAX ||
-        config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX) {
+        config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX ||
+        (config->tp_type != DFURMA_TP_RTP &&
+         config->tp_type != DFURMA_TP_CTP)) {
         return -EINVAL;
     }
     *out = NULL;
 
-    priority_status = dfurma_get_rtp_priority(runtime, &rtp_priority);
+    tp_type = (urma_tp_type_t)config->tp_type;
+    if (tp_type == URMA_CTP && runtime->device->type != URMA_TRANSPORT_UB) {
+        return -ENOTSUP;
+    }
+    priority_status = dfurma_get_tp_priority(runtime, tp_type, &tp_priority);
     if (priority_status != 0) {
         return priority_status;
     }
@@ -409,7 +427,7 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
 
     jfs_cfg.depth = config->send_depth;
     jfs_cfg.trans_mode = URMA_TM_RM;
-    jfs_cfg.priority = rtp_priority;
+    jfs_cfg.priority = tp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
     jfs_cfg.max_rsge = 1;
     jfs_cfg.max_inline_data = 0;
@@ -453,6 +471,8 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jetty->runtime = runtime;
+    jetty->tp_type = tp_type;
+    jetty->priority = tp_priority;
     runtime->jetty_count++;
     *out = jetty;
     return 0;
@@ -531,6 +551,7 @@ int dfurma_jetty_export_descriptor(dfurma_jetty_t *jetty,
 
     *meta = (dfurma_jetty_descriptor_meta_t) {
         .transport_type = (uint32_t)jetty->runtime->device->type,
+        .tp_type = (uint32_t)jetty->tp_type,
         .eid_index = jetty->runtime->eid_index,
         .jetty_id = rjetty->jetty_id.id,
         .opaque_len = length,
@@ -559,7 +580,8 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
         meta == NULL || opaque_data == NULL || opaque_len == 0 ||
         opaque_len != meta->opaque_len || opaque_len < sizeof(urma_rjetty_t) ||
         out == NULL ||
-        meta->transport_type != (uint32_t)jetty->runtime->device->type) {
+        meta->transport_type != (uint32_t)jetty->runtime->device->type ||
+        meta->tp_type != (uint32_t)jetty->tp_type) {
         return -EINVAL;
     }
     *out = NULL;
@@ -575,6 +597,11 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
         free(rjetty);
         return -EPROTO;
     }
+
+    /* urma_perftest applies the locally selected TP type to the imported
+     * descriptor. Capability negotiation guarantees that the peer selected
+     * the same value before this provider-facing override. */
+    rjetty->tp_type = jetty->tp_type;
 
     target = calloc(1, sizeof(*target));
     if (target == NULL) {

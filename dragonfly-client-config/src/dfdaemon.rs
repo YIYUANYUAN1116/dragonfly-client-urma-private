@@ -1021,6 +1021,18 @@ pub enum UrmaTransportMode {
     Rm,
 }
 
+/// Transport-path type used by Reliable Message endpoints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UrmaTpType {
+    /// Reliable transport path. Kept as the default until CTP is validated
+    /// across nodes on the deployment provider.
+    #[default]
+    Rtp,
+    /// Connection transport path, selected by `urma_perftest --ctp`.
+    Ctp,
+}
+
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[validate(schema(function = "validate_urma_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
@@ -1029,6 +1041,9 @@ pub struct UrmaServer {
 
     #[serde(default)]
     pub transport_mode: UrmaTransportMode,
+
+    #[serde(default)]
+    pub tp_type: UrmaTpType,
 
     #[serde(default = "default_storage_server_urma_port")]
     #[validate(range(min = 1))]
@@ -1122,6 +1137,7 @@ impl Default for UrmaServer {
         Self {
             enable: false,
             transport_mode: UrmaTransportMode::default(),
+            tp_type: UrmaTpType::default(),
             port: default_storage_server_urma_port(),
             device: None,
             eid_index: default_storage_server_urma_eid_index(),
@@ -2665,6 +2681,7 @@ mod urma_config_tests {
         let urma = UrmaServer::default();
         assert!(!urma.enable);
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
+        assert_eq!(urma.tp_type, UrmaTpType::Rtp);
         assert_eq!(urma.port, 4008);
         assert!(urma.device.is_none());
         assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));
@@ -2680,8 +2697,10 @@ mod urma_config_tests {
     #[test]
     fn deserialize_rm_mode_explicitly() {
         let urma: UrmaServer =
-            serde_yaml::from_str("transportMode: rm\npeerGuaranteedRxCredits: 8").unwrap();
+            serde_yaml::from_str("transportMode: rm\ntpType: ctp\npeerGuaranteedRxCredits: 8")
+                .unwrap();
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
+        assert_eq!(urma.tp_type, UrmaTpType::Ctp);
         assert_eq!(urma.peer_guaranteed_rx_credits, 8);
     }
 

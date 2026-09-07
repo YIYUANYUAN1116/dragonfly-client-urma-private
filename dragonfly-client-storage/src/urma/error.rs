@@ -140,10 +140,18 @@ impl fmt::Display for Error {
                     "native operation {operation} succeeded without returning a handle"
                 ),
                 NativeFailure::Status(status) => {
-                    write!(
-                        f,
-                        "liburma operation {operation} failed with status {status}"
-                    )
+                    if *status < 0 {
+                        write!(
+                            f,
+                            "liburma operation {operation} failed with status {status} ({})",
+                            std::io::Error::from_raw_os_error(-status)
+                        )
+                    } else {
+                        write!(
+                            f,
+                            "liburma operation {operation} failed with status {status}"
+                        )
+                    }
                 }
             },
         }
@@ -151,3 +159,16 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_native_status_includes_errno_text() {
+        let error = native_error("import_jetty", FfiError::Status(-1));
+        let display = error.to_string();
+        assert!(display.contains("status -1"));
+        assert!(display.contains("Operation not permitted"));
+    }
+}

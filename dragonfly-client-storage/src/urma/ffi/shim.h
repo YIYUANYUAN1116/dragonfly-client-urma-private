@@ -53,14 +53,19 @@ typedef struct dfurma_jetty_config {
     uint32_t max_send_sge;
     uint32_t max_recv_sge;
     uint32_t token;
+    uint32_t tp_type;
 } dfurma_jetty_config_t;
 
 typedef struct dfurma_jetty_descriptor_meta {
     uint32_t transport_type;
+    uint32_t tp_type;
     uint32_t eid_index;
     uint32_t jetty_id;
     uint32_t opaque_len;
 } dfurma_jetty_descriptor_meta_t;
+
+#define DFURMA_TP_RTP 0U
+#define DFURMA_TP_CTP 1U
 
 #define DFURMA_EID_SIZE 16U
 

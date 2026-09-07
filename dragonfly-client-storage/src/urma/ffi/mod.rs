@@ -16,6 +16,8 @@ mod sys {
 
 pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM;
 pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
+pub(crate) const TP_RTP: u32 = sys::DFURMA_TP_RTP;
+pub(crate) const TP_CTP: u32 = sys::DFURMA_TP_CTP;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {
@@ -40,6 +42,7 @@ pub(crate) struct JettyConfig {
     pub max_send_sge: u32,
     pub max_recv_sge: u32,
     pub token: u32,
+    pub tp_type: u32,
 }
 
 pub(crate) const MAX_POST_LIST: u32 = sys::DFURMA_MAX_POST_LIST;
@@ -59,6 +62,7 @@ pub(crate) struct PostBatch {
 
 pub(crate) struct JettyDescriptorData {
     pub transport_type: u32,
+    pub tp_type: u32,
     pub eid_index: u32,
     pub jetty_id: u32,
     pub opaque_data: Vec<u8>,
@@ -359,6 +363,7 @@ impl JettyHandle {
             max_send_sge: config.max_send_sge,
             max_recv_sge: config.max_recv_sge,
             token: config.token,
+            tp_type: config.tp_type,
         };
         let mut raw = std::ptr::null_mut();
         // SAFETY: All three owners are live and `raw` is a valid out pointer.
@@ -411,6 +416,7 @@ impl JettyHandle {
             .map_err(|_| FfiError::Contract("descriptor length exceeds u32"))?;
         let meta = sys::dfurma_jetty_descriptor_meta_t {
             transport_type: descriptor.transport_type,
+            tp_type: descriptor.tp_type,
             eid_index: descriptor.eid_index,
             jetty_id: descriptor.jetty_id,
             opaque_len,
@@ -775,6 +781,7 @@ fn copy_descriptor(
     let opaque_data = unsafe { std::slice::from_raw_parts(opaque_data.as_ptr(), length) }.to_vec();
     Ok(JettyDescriptorData {
         transport_type: meta.transport_type,
+        tp_type: meta.tp_type,
         eid_index: meta.eid_index,
         jetty_id: meta.jetty_id,
         opaque_data,

@@ -26,8 +26,8 @@ use crate::urma::rendezvous::{
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
-use crate::urma::TransportMode;
 use crate::urma::TxWindowLease;
+use crate::urma::{TpType, TransportMode};
 use crate::Storage;
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -308,11 +308,16 @@ impl UrmaServer {
             ));
         };
 
-        let fabric = UrmaFabric::get_or_start_with_budget(
+        let tp_type = match urma_config.tp_type {
+            dragonfly_client_config::dfdaemon::UrmaTpType::Rtp => TpType::Rtp,
+            dragonfly_client_config::dfdaemon::UrmaTpType::Ctp => TpType::Ctp,
+        };
+        let fabric = UrmaFabric::get_or_start_with_budget_and_tp_type(
             device,
             urma_config.eid_index,
             urma_config.max_registered_bytes.as_u64(),
             urma_config.tx_registered_bytes.as_u64(),
+            tp_type,
         )
         .map_err(client_error)?;
         let transport_mode = TransportMode::Rm;
@@ -324,11 +329,13 @@ impl UrmaServer {
         let capability = UrmaCapability {
             transport_type: fabric.transport_type(),
             transport_mode,
+            tp_type: fabric.tp_type(),
             fabric_tag: fabric_tag.to_string(),
             max_message_size: fabric.max_message_size(),
         };
         info!(
             transport_mode = ?transport_mode,
+            tp_type = ?tp_type,
             registered_bytes = fabric.registered_bytes(),
             tx_registered_bytes = fabric.tx_registered_bytes(),
             rx_registered_bytes = fabric.rx_registered_bytes(),

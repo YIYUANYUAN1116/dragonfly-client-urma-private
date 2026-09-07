@@ -29,6 +29,36 @@ impl TransportMode {
     }
 }
 
+/// Provider transport-path type used by an RM Jetty.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TpType {
+    #[default]
+    Rtp = 0,
+    Ctp = 1,
+}
+
+impl TpType {
+    pub(crate) fn wire_value(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_wire(value: u8) -> std::result::Result<Self, String> {
+        match value {
+            0 => Ok(Self::Rtp),
+            1 => Ok(Self::Ctp),
+            _ => Err(format!("invalid URMA TP type {value}")),
+        }
+    }
+
+    fn ffi_value(self) -> u32 {
+        match self {
+            Self::Rtp => ffi::TP_RTP,
+            Self::Ctp => ffi::TP_CTP,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub(crate) enum OperationType {
@@ -139,7 +169,7 @@ impl PeerSendCredits {
     }
 }
 
-const JETTY_DESCRIPTOR_VERSION: u16 = 1;
+const JETTY_DESCRIPTOR_VERSION: u16 = 2;
 const MAX_JETTY_DESCRIPTOR_LEN: usize = 64 * 1024;
 
 /// Stable wire DTO around provider-owned remote-Jetty bytes.
@@ -147,6 +177,7 @@ const MAX_JETTY_DESCRIPTOR_LEN: usize = 64 * 1024;
 pub(crate) struct JettyDescriptor {
     pub(crate) version: u16,
     pub(crate) transport_type: u32,
+    pub(crate) tp_type: TpType,
     pub(crate) eid_index: u32,
     pub(crate) jetty_id: u32,
     pub(crate) opaque_len: u32,
@@ -154,7 +185,7 @@ pub(crate) struct JettyDescriptor {
 }
 
 impl JettyDescriptor {
-    const FIXED_LEN: usize = 2 + 4 + 4 + 4 + 4;
+    const FIXED_LEN: usize = 2 + 4 + 1 + 4 + 4 + 4;
 
     pub(crate) fn validate(&self) -> Result<()> {
         if self.version != JETTY_DESCRIPTOR_VERSION {
@@ -183,6 +214,7 @@ impl JettyDescriptor {
         let mut out = Vec::with_capacity(Self::FIXED_LEN + self.opaque_data.len());
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.transport_type.to_be_bytes());
+        out.push(self.tp_type.wire_value());
         out.extend_from_slice(&self.eid_index.to_be_bytes());
         out.extend_from_slice(&self.jetty_id.to_be_bytes());
         out.extend_from_slice(&self.opaque_len.to_be_bytes());
@@ -197,9 +229,10 @@ impl JettyDescriptor {
         let descriptor = Self {
             version: u16::from_be_bytes([input[0], input[1]]),
             transport_type: u32::from_be_bytes(input[2..6].try_into().expect("fixed slice")),
-            eid_index: u32::from_be_bytes(input[6..10].try_into().expect("fixed slice")),
-            jetty_id: u32::from_be_bytes(input[10..14].try_into().expect("fixed slice")),
-            opaque_len: u32::from_be_bytes(input[14..18].try_into().expect("fixed slice")),
+            tp_type: TpType::from_wire(input[6]).map_err(Error::Protocol)?,
+            eid_index: u32::from_be_bytes(input[7..11].try_into().expect("fixed slice")),
+            jetty_id: u32::from_be_bytes(input[11..15].try_into().expect("fixed slice")),
+            opaque_len: u32::from_be_bytes(input[15..19].try_into().expect("fixed slice")),
             opaque_data: input[Self::FIXED_LEN..].to_vec(),
         };
         descriptor.validate()?;
@@ -212,6 +245,11 @@ impl JettyDescriptor {
         let descriptor = Self {
             version: JETTY_DESCRIPTOR_VERSION,
             transport_type: raw.transport_type,
+            tp_type: TpType::from_wire(
+                u8::try_from(raw.tp_type)
+                    .map_err(|_| Error::Protocol("native TP type exceeds u8".into()))?,
+            )
+            .map_err(Error::Protocol)?,
             eid_index: raw.eid_index,
             jetty_id: raw.jetty_id,
             opaque_len,
@@ -225,6 +263,7 @@ impl JettyDescriptor {
         self.validate()?;
         Ok(ffi::JettyDescriptorData {
             transport_type: self.transport_type,
+            tp_type: self.tp_type.ffi_value(),
             eid_index: self.eid_index,
             jetty_id: self.jetty_id,
             opaque_data: self.opaque_data.clone(),
@@ -240,6 +279,7 @@ pub(crate) struct JettyConfig {
     pub(crate) max_send_sge: u32,
     pub(crate) max_recv_sge: u32,
     pub(crate) token: u32,
+    pub(crate) tp_type: TpType,
 }
 
 impl Default for JettyConfig {
@@ -250,6 +290,7 @@ impl Default for JettyConfig {
             max_send_sge: 1,
             max_recv_sge: 1,
             token: 0,
+            tp_type: TpType::default(),
         }
     }
 }
@@ -263,6 +304,7 @@ pub(crate) struct UrmaJetty {
     local_jetty_id: u32,
     local_jfr_id: u32,
     token: u32,
+    tp_type: TpType,
 }
 
 impl UrmaJetty {
@@ -278,6 +320,7 @@ impl UrmaJetty {
             max_send_sge: config.max_send_sge,
             max_recv_sge: config.max_recv_sge,
             token: config.token,
+            tp_type: config.tp_type.ffi_value(),
         };
         let handle = ffi::JettyHandle::create(runtime, send_jfc, recv_jfc, &ffi_config)
             .map_err(|error| native_error("create_jetty", error))?;
@@ -289,6 +332,7 @@ impl UrmaJetty {
             local_jetty_id,
             local_jfr_id,
             token: config.token,
+            tp_type: config.tp_type,
         })
     }
 
@@ -306,9 +350,26 @@ impl UrmaJetty {
         &mut self,
         descriptor: &JettyDescriptor,
     ) -> Result<ffi::TargetHandle> {
+        if descriptor.tp_type != self.tp_type {
+            return Err(Error::Protocol(format!(
+                "remote Jetty TP type {:?} does not match local {:?}",
+                descriptor.tp_type, self.tp_type
+            )));
+        }
         self.handle
             .import_target(&descriptor.to_ffi()?, self.token)
-            .map_err(|error| native_error("import_jetty", error))
+            .map_err(|error| {
+                Error::Protocol(format!(
+                    "import_jetty failed: tp_type={:?} transport_type={} local_jetty_id={} local_jfr_id={} remote_eid_index={} remote_jetty_id={} native={}",
+                    self.tp_type,
+                    descriptor.transport_type,
+                    self.local_jetty_id,
+                    self.local_jfr_id,
+                    descriptor.eid_index,
+                    descriptor.jetty_id,
+                    native_error("import_jetty", error)
+                ))
+            })
     }
 
     pub(crate) fn mark_error(&mut self) -> Result<()> {
@@ -821,6 +882,7 @@ mod tests {
         JettyDescriptor {
             version: JETTY_DESCRIPTOR_VERSION,
             transport_type: 0,
+            tp_type: TpType::Rtp,
             eid_index: 3,
             jetty_id: 42,
             opaque_len: 4,
@@ -840,6 +902,18 @@ mod tests {
         let mut descriptor = descriptor();
         descriptor.version += 1;
         assert!(descriptor.serialize().is_err());
+    }
+
+    #[test]
+    fn descriptor_round_trips_ctp_and_rejects_unknown_tp_type() {
+        let mut descriptor = descriptor();
+        descriptor.tp_type = TpType::Ctp;
+        let bytes = descriptor.serialize().unwrap();
+        assert_eq!(JettyDescriptor::deserialize(&bytes), Ok(descriptor));
+
+        let mut unknown = bytes;
+        unknown[6] = 2;
+        assert!(JettyDescriptor::deserialize(&unknown).is_err());
     }
 
     #[test]

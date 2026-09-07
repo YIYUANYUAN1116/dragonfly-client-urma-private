@@ -71,7 +71,7 @@ pub mod urma {
     use dragonfly_client_storage::client::urma::{discover, UrmaClient, UrmaStreamReader};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
-    use dragonfly_client_storage::urma::{TransportMode, PEER_SESSION_IDLE_TIMEOUT};
+    use dragonfly_client_storage::urma::{TpType, TransportMode, PEER_SESSION_IDLE_TIMEOUT};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,11 +245,16 @@ pub mod urma {
                 ));
             };
 
-            match UrmaFabric::get_or_start_with_budget(
+            let tp_type = match urma_config.tp_type {
+                dragonfly_client_config::dfdaemon::UrmaTpType::Rtp => TpType::Rtp,
+                dragonfly_client_config::dfdaemon::UrmaTpType::Ctp => TpType::Ctp,
+            };
+            match UrmaFabric::get_or_start_with_budget_and_tp_type(
                 device,
                 urma_config.eid_index,
                 urma_config.max_registered_bytes.as_u64(),
                 urma_config.tx_registered_bytes.as_u64(),
+                tp_type,
             ) {
                 Ok(fabric) => {
                     let transport_mode = TransportMode::Rm;
@@ -266,11 +271,13 @@ pub mod urma {
                     let capability = UrmaCapability {
                         transport_type: fabric.transport_type(),
                         transport_mode,
+                        tp_type: fabric.tp_type(),
                         fabric_tag: fabric_tag.to_string(),
                         max_message_size: fabric.max_message_size(),
                     };
                     info!(
                         transport_mode = ?transport_mode,
+                        tp_type = ?tp_type,
                         registered_bytes = fabric.registered_bytes(),
                         tx_registered_bytes = fabric.tx_registered_bytes(),
                         rx_registered_bytes = fabric.rx_registered_bytes(),

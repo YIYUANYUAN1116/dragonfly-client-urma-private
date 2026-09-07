@@ -4,7 +4,7 @@
 //! RM Jetty. The sender may not post a SEND until a validated
 //! `RecvPosted` window has granted matching remote receive credits.
 
-use super::lane::TransportMode;
+use super::lane::{TpType, TransportMode};
 use crate::rendezvous::{
     put_bytes, read_envelope, write_envelope, PayloadReader, MAX_PAYLOAD_LENGTH, MAX_STRING_LENGTH,
 };
@@ -21,7 +21,8 @@ pub(crate) const MAGIC: u32 = 0x4446_5552;
 // the wire prerequisite for multiplexing several Pieces over one peer lane;
 // version 1 implicitly allowed only one active Piece per lane.
 // Version 3 explicitly identifies RM and rejects RC peers on this branch.
-pub(crate) const VERSION: u8 = 3;
+// Version 4 negotiates RTP versus CTP before provider import.
+pub(crate) const VERSION: u8 = 4;
 const MAX_DESCRIPTOR_LENGTH: usize = 64 * 1024;
 
 pub(crate) type TransferId = u32;
@@ -31,6 +32,7 @@ pub(crate) const SESSION_TRANSFER_ID: TransferId = 0;
 pub struct UrmaCapability {
     pub transport_type: u32,
     pub transport_mode: TransportMode,
+    pub tp_type: TpType,
     pub fabric_tag: String,
     pub max_message_size: u64,
 }
@@ -47,6 +49,12 @@ impl UrmaCapability {
             return Err(format!(
                 "URMA mode mismatch: local {:?}, remote {:?}",
                 self.transport_mode, remote.transport_mode
+            ));
+        }
+        if self.tp_type != remote.tp_type {
+            return Err(format!(
+                "URMA TP type mismatch: local {:?}, remote {:?}",
+                self.tp_type, remote.tp_type
             ));
         }
         if self.fabric_tag.is_empty() || remote.fabric_tag.is_empty() {
@@ -67,6 +75,7 @@ impl UrmaCapability {
     fn encode(&self, payload: &mut Vec<u8>) {
         payload.extend_from_slice(&self.transport_type.to_be_bytes());
         payload.push(self.transport_mode.wire_value());
+        payload.push(self.tp_type.wire_value());
         put_bytes(payload, self.fabric_tag.as_bytes());
         payload.extend_from_slice(&self.max_message_size.to_be_bytes());
     }
@@ -75,6 +84,7 @@ impl UrmaCapability {
         Ok(Self {
             transport_type: reader.u32()?,
             transport_mode: TransportMode::from_wire(reader.u8()?).map_err(Error::Unknown)?,
+            tp_type: TpType::from_wire(reader.u8()?).map_err(Error::Unknown)?,
             fabric_tag: reader.string(MAX_STRING_LENGTH)?,
             max_message_size: reader.u64()?,
         })
@@ -294,6 +304,7 @@ mod tests {
         UrmaCapability {
             transport_type: 3,
             transport_mode: TransportMode::Rm,
+            tp_type: TpType::Rtp,
             fabric_tag: "rack-a".into(),
             max_message_size: 64 * 1024,
         }
@@ -434,6 +445,9 @@ mod tests {
         let mut remote = local.clone();
         remote.fabric_tag = "rack-b".into();
         assert!(local.compatible(&remote).is_err());
+        let mut remote = local.clone();
+        remote.tp_type = TpType::Ctp;
+        assert!(local.compatible(&remote).is_err());
     }
 
     #[test]
@@ -441,5 +455,8 @@ mod tests {
         assert_eq!(TransportMode::from_wire(1).unwrap(), TransportMode::Rm);
         assert!(TransportMode::from_wire(2).is_err());
         assert!(TransportMode::from_wire(0).is_err());
+        assert_eq!(TpType::from_wire(0).unwrap(), TpType::Rtp);
+        assert_eq!(TpType::from_wire(1).unwrap(), TpType::Ctp);
+        assert!(TpType::from_wire(2).is_err());
     }
 }

@@ -130,8 +130,13 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
         return Ok(());
     }
     Err(Error::InvalidConfiguration(format!(
-        "URMA Fabric is already running for device {} EID {}, requested device {} EID {}",
-        active.device_name, active.eid_index, requested.device_name, requested.eid_index
+        "URMA Fabric is already running for device {} EID {} TP {:?}, requested device {} EID {} TP {:?}",
+        active.device_name,
+        active.eid_index,
+        active.tp_type,
+        requested.device_name,
+        requested.eid_index,
+        requested.tp_type
     )))
 }
 
@@ -214,6 +219,21 @@ impl UrmaFabric {
     ) -> Result<UrmaFabricHandle> {
         let config = RuntimeConfig::new(device_name, eid_index)
             .with_registered_budget(max_registered_bytes, tx_registered_bytes)?;
+        Self::get_or_start_config(config)
+    }
+
+    /// Returns the process Fabric for the requested RM transport-path type.
+    /// RTP remains the default of the older constructors.
+    pub fn get_or_start_with_budget_and_tp_type(
+        device_name: impl Into<String>,
+        eid_index: u32,
+        max_registered_bytes: u64,
+        tx_registered_bytes: u64,
+        tp_type: crate::urma::TpType,
+    ) -> Result<UrmaFabricHandle> {
+        let config = RuntimeConfig::new(device_name, eid_index)
+            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?
+            .with_tp_type(tp_type);
         Self::get_or_start_config(config)
     }
 
@@ -378,6 +398,10 @@ impl UrmaFabricHandle {
     /// device at startup, used as one side of peer capability negotiation.
     pub fn transport_type(&self) -> u32 {
         self.inner.transport_type
+    }
+
+    pub fn tp_type(&self) -> crate::urma::TpType {
+        self.inner.runtime_config.tp_type
     }
 
     /// Reports whether the provider advertised the selected transport mode.
