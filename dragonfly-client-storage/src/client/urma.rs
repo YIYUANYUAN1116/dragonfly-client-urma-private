@@ -124,24 +124,18 @@ fn fail_after_recv_windows() -> Option<u64> {
 /// Reports whether the validation binary should measure only the URMA
 /// transport/lease path. The caller must still validate window identities,
 /// lengths, Done, and recycle every registered lease.
+#[cfg(feature = "urma-test-failpoints")]
 pub(crate) fn transport_only_profile_enabled() -> bool {
-    #[cfg(feature = "urma-test-failpoints")]
-    {
-        match std::env::var(PERFORMANCE_PROFILE_ENV) {
-            Ok(value) if value == TRANSPORT_ONLY_PROFILE => true,
-            Ok(value) => {
-                warn!(
-                    env = PERFORMANCE_PROFILE_ENV,
-                    value, "ignoring unknown URMA performance profile"
-                );
-                false
-            }
-            Err(_) => false,
+    match std::env::var(PERFORMANCE_PROFILE_ENV) {
+        Ok(value) if value == TRANSPORT_ONLY_PROFILE => true,
+        Ok(value) => {
+            warn!(
+                env = PERFORMANCE_PROFILE_ENV,
+                value, "ignoring unknown URMA performance profile"
+            );
+            false
         }
-    }
-    #[cfg(not(feature = "urma-test-failpoints"))]
-    {
-        false
+        Err(_) => false,
     }
 }
 
@@ -446,10 +440,11 @@ impl UrmaClient {
             config.storage.server.urma.pipeline_depth,
             fabric.max_native_receive_depth(),
         );
-        let mut peer_config = PeerTargetConfig::default();
-        peer_config.post_list_size = config.storage.server.urma.post_list_size;
-        peer_config.pipeline_depth = config.storage.server.urma.pipeline_depth;
-        peer_config.guaranteed_rx_credits = config.storage.server.urma.peer_guaranteed_rx_credits;
+        let peer_config = PeerTargetConfig {
+            post_list_size: config.storage.server.urma.post_list_size,
+            pipeline_depth: config.storage.server.urma.pipeline_depth,
+            guaranteed_rx_credits: config.storage.server.urma.peer_guaranteed_rx_credits,
+        };
         debug!(
             native_recv_depth = fabric.max_native_receive_depth(),
             piece_window_chunks = depths.window_chunks,
@@ -730,7 +725,9 @@ impl UrmaClient {
                             let published = window_tx.send(Ok(window)).await;
                             window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
                             if published.is_err() {
-                                return Ok(());
+                                return Err(UrmaError::Protocol(
+                                    "URMA Piece consumer closed before transfer completion".into(),
+                                ));
                             }
                         }
                         warn!(
@@ -776,9 +773,15 @@ impl UrmaClient {
                     let published = window_tx.send(Ok(window)).await;
                     window_publish_wait_ns += publish_start.elapsed().as_nanos() as u64;
                     if published.is_err() {
-                        // This is local cancellation, not evidence that the
-                        // parent or shared lane is unhealthy.
-                        return Ok(());
+                        // DFUR has no transfer-scoped Cancel frame yet. Leaving
+                        // the Piece half-open would make the server wait for a
+                        // RecvPosted that can never arrive and eventually abort
+                        // the lane behind our back. Fail closed now so the
+                        // cached lane and every native waiter are retired
+                        // deterministically.
+                        return Err(UrmaError::Protocol(
+                            "URMA Piece consumer closed before transfer completion".into(),
+                        ));
                     }
                 }
             });

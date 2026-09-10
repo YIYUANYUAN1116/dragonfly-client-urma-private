@@ -8,7 +8,12 @@ use std::{
 };
 
 mod sys {
-    #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+    #![allow(
+        dead_code,
+        non_camel_case_types,
+        non_snake_case,
+        non_upper_case_globals
+    )]
     #![allow(clippy::all)]
 
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
@@ -615,6 +620,7 @@ impl JettyHandle {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn post(
         &mut self,
         target: Option<&TargetHandle>,

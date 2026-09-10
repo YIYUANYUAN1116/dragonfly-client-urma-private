@@ -30,10 +30,12 @@ impl PeerCreditGrant {
         self.peer_id
     }
 
+    #[cfg(test)]
     pub(crate) fn guaranteed(&self) -> usize {
         self.guaranteed
     }
 
+    #[cfg(test)]
     pub(crate) fn borrowed(&self) -> usize {
         self.borrowed
     }
@@ -256,6 +258,7 @@ impl PeerCreditRegistry {
         self.peers.get(&peer_id).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding
     }
@@ -473,6 +476,7 @@ impl PeerCreditAdmission {
 }
 
 impl PeerCreditPermit {
+    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.grant
             .as_ref()

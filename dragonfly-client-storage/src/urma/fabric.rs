@@ -21,7 +21,8 @@ use std::thread::{self, JoinHandle};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak,
+        mpsc::{self as std_mpsc, RecvTimeoutError},
+        Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
 };
@@ -36,6 +37,14 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 /// Pure polling is required because Phase A deliberately has no JFCE. Keep the
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
+
+/// Native device discovery should normally finish immediately. Bound the
+/// synchronous hand-off so a wedged provider cannot pin an async caller and
+/// the process-wide Fabric registry forever.
+const FABRIC_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+type StartupProbe = (u32, u32, u64, u32, u32);
+type StartupResult = Result<StartupProbe>;
 
 #[derive(Clone, Default)]
 struct RequiredRxWaiters(Arc<AtomicUsize>);
@@ -294,7 +303,7 @@ impl UrmaFabric {
                 Error::InvalidConfiguration(format!("failed to spawn URMA owner thread: {error}"))
             })?;
 
-        match startup_rx.recv() {
+        match startup_rx.recv_timeout(FABRIC_STARTUP_TIMEOUT) {
             Ok(Ok((
                 transport_type,
                 transport_modes,
@@ -328,11 +337,20 @@ impl UrmaFabric {
                 let _ = join.join();
                 Err(error)
             }
-            Err(error) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = join.join();
-                Err(Error::InvalidConfiguration(format!(
-                    "URMA owner thread exited during startup: {error}"
-                )))
+                Err(Error::InvalidConfiguration(
+                    "URMA owner thread exited during startup".to_string(),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Detach the still-running owner. If native startup eventually
+                // returns, its failed startup reply makes it shut itself down
+                // and release the process-global liburma guard.
+                drop(join);
+                Err(Error::StartupTimeout {
+                    timeout: FABRIC_STARTUP_TIMEOUT,
+                })
             }
         }
     }
@@ -933,7 +951,7 @@ fn run_owner(
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
-    startup_tx: std_mpsc::SyncSender<Result<(u32, u32, u64, u32, u32)>>,
+    startup_tx: std_mpsc::SyncSender<StartupResult>,
 ) {
     let recycle_notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
         let _ = recycle_command_tx.send(CommandEnvelope::urgent(FabricCommand::RecycleLease {

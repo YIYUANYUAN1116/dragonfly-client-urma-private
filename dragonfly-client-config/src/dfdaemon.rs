@@ -1117,7 +1117,7 @@ fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), Validation
 
     let registered = urma.max_registered_bytes.as_u64();
     let tx_registered = urma.tx_registered_bytes.as_u64();
-    if registered < 2 * URMA_REGISTERED_SLOT_SIZE || registered > URMA_MAX_REGISTERED_BYTES {
+    if !(2 * URMA_REGISTERED_SLOT_SIZE..=URMA_MAX_REGISTERED_BYTES).contains(&registered) {
         return Err(ValidationError::new(
             "maxRegisteredBytes must be between 128KiB and 4GiB",
         ));

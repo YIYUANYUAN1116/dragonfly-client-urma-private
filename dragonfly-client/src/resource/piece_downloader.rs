@@ -249,13 +249,31 @@ pub mod urma {
                 dragonfly_client_config::dfdaemon::UrmaTpType::Rtp => TpType::Rtp,
                 dragonfly_client_config::dfdaemon::UrmaTpType::Ctp => TpType::Ctp,
             };
-            match UrmaFabric::get_or_start_with_budget_and_tp_type(
-                device,
-                urma_config.eid_index,
-                urma_config.max_registered_bytes.as_u64(),
-                urma_config.tx_registered_bytes.as_u64(),
-                tp_type,
-            ) {
+            let device = device.to_string();
+            let eid_index = urma_config.eid_index;
+            let max_registered_bytes = urma_config.max_registered_bytes.as_u64();
+            let tx_registered_bytes = urma_config.tx_registered_bytes.as_u64();
+            let startup = tokio::task::spawn_blocking(move || {
+                UrmaFabric::get_or_start_with_budget_and_tp_type(
+                    device,
+                    eid_index,
+                    max_registered_bytes,
+                    tx_registered_bytes,
+                    tp_type,
+                )
+            })
+            .await;
+            let startup = match startup {
+                Ok(startup) => startup,
+                Err(error) => {
+                    warn!(%error, "urma Fabric startup worker failed");
+                    *state = FabricState::Failed(Instant::now());
+                    return Err(Error::Unknown(format!(
+                        "urma Fabric startup worker failed: {error}"
+                    )));
+                }
+            };
+            match startup {
                 Ok(fabric) => {
                     let transport_mode = TransportMode::Rm;
                     if !fabric.supports_rm() {

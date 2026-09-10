@@ -523,10 +523,6 @@ impl PeerTarget {
         })
     }
 
-    pub(crate) fn id(&self) -> u16 {
-        self.id
-    }
-
     pub(crate) fn generation(&self) -> u8 {
         self.generation
     }
@@ -634,9 +630,32 @@ impl PeerTarget {
                 )?;
                 return Err(error);
             }
+            for (index, entry) in entries.iter().enumerate() {
+                if let Err(error) =
+                    completions.reserve_anonymous_rx(entry.user_ctx, Some(batch[index].1))
+                {
+                    for reserved_entry in entries.iter().take(index) {
+                        completions.cancel_reservation(reserved_entry.user_ctx)?;
+                    }
+                    for (slot, _) in &batch {
+                        pool.rollback_post(*slot, SlotKind::Rx)?;
+                    }
+                    pool.release_unposted_rx_window(
+                        batch
+                            .into_iter()
+                            .map(|(slot, _)| slot)
+                            .chain(pending.into_iter().map(|(slot, _)| slot))
+                            .collect(),
+                    )?;
+                    return Err(error);
+                }
+            }
             let posted = match jetty.post_recv_batch(pool.segment_handle()?, &entries) {
                 Ok(posted) => posted,
                 Err(error) => {
+                    for entry in &entries {
+                        completions.cancel_reservation(entry.user_ctx)?;
+                    }
                     for (slot, _) in &batch {
                         pool.rollback_post(*slot, SlotKind::Rx)?;
                     }
@@ -652,18 +671,15 @@ impl PeerTarget {
             };
             let posted_len = posted.handles.len();
             let mut handles = posted.handles.into_iter();
-            let mut first_error = posted
+            let first_error = posted
                 .error
                 .map(|error| native_error("post_jetty_recv_wr_list", error));
-            for (index, (slot, sequence)) in batch.into_iter().enumerate() {
+            for (index, (slot, _sequence)) in batch.into_iter().enumerate() {
                 if index < posted_len {
                     let wr = handles.next().expect("posted prefix handle count matches");
-                    if let Err(error) =
-                        completions.track_anonymous_rx(entries[index].user_ctx, wr, Some(sequence))
-                    {
-                        first_error.get_or_insert(error);
-                    }
+                    completions.commit_posted(entries[index].user_ctx, wr);
                 } else {
+                    completions.cancel_reservation(entries[index].user_ctx)?;
                     pool.rollback_post(slot, SlotKind::Rx)?;
                     pool.release(slot)?;
                 }
@@ -726,6 +742,20 @@ impl PeerTarget {
                 state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
+            for (index, entry) in entries.iter().enumerate() {
+                if let Err(error) =
+                    completions.reserve_registered_tx(entry.user_ctx, batch[index].1, state.clone())
+                {
+                    for reserved_entry in entries.iter().take(index) {
+                        completions.cancel_reservation(reserved_entry.user_ctx)?;
+                    }
+                    for ((slot, _, _), _) in &batch {
+                        pool.rollback_tx_lease_post(*slot)?;
+                    }
+                    state.finish_posting(Some(error.clone()));
+                    return Err(error);
+                }
+            }
             let posted = match jetty.post_send_batch(
                 self.target
                     .as_ref()
@@ -735,6 +765,9 @@ impl PeerTarget {
             ) {
                 Ok(posted) => posted,
                 Err(error) => {
+                    for entry in &entries {
+                        completions.cancel_reservation(entry.user_ctx)?;
+                    }
                     for ((slot, _, _), _) in &batch {
                         pool.rollback_tx_lease_post(*slot)?;
                     }
@@ -745,21 +778,15 @@ impl PeerTarget {
             let posted_len = posted.handles.len();
             self.credits.consume_remote_receives(posted_len);
             let mut handles = posted.handles.into_iter();
-            let mut first_error = posted
+            let first_error = posted
                 .error
                 .map(|error| native_error("post_jetty_send_wr_list", error));
-            for (index, ((slot, _, _), sequence)) in batch.into_iter().enumerate() {
+            for (index, ((slot, _, _), _sequence)) in batch.into_iter().enumerate() {
                 if index < posted_len {
                     let wr = handles.next().expect("posted prefix handle count matches");
-                    if let Err(error) = completions.track_registered_tx(
-                        entries[index].user_ctx,
-                        wr,
-                        sequence,
-                        state.clone(),
-                    ) {
-                        first_error.get_or_insert(error);
-                    }
+                    completions.commit_posted(entries[index].user_ctx, wr);
                 } else {
+                    completions.cancel_reservation(entries[index].user_ctx)?;
                     pool.rollback_tx_lease_post(slot)?;
                 }
             }

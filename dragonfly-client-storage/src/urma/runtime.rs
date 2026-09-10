@@ -122,6 +122,7 @@ mod native {
         marker::PhantomData,
         rc::Rc,
         sync::atomic::{AtomicBool, Ordering},
+        thread,
         time::Duration,
     };
 
@@ -136,6 +137,50 @@ mod native {
     struct UrmaJfc {
         kind: JfcKind,
         handle: ffi::JfcHandle,
+    }
+
+    pub(super) struct PeerIdAllocator {
+        next_fresh: u32,
+        free: Vec<u16>,
+        generations: HashMap<u16, u8>,
+    }
+
+    impl PeerIdAllocator {
+        pub(super) fn new() -> Self {
+            Self {
+                next_fresh: 1,
+                free: Vec::new(),
+                generations: HashMap::new(),
+            }
+        }
+
+        pub(super) fn allocate(&mut self) -> Result<(u16, u8)> {
+            let id = match self.free.pop() {
+                Some(id) => id,
+                None if self.next_fresh <= u32::from(u16::MAX) => {
+                    let id = self.next_fresh as u16;
+                    self.next_fresh += 1;
+                    id
+                }
+                None => {
+                    return Err(Error::InvalidConfiguration(
+                        "PeerTarget id space exhausted".into(),
+                    ));
+                }
+            };
+            let generation = self.generations.entry(id).or_insert(0);
+            *generation = generation.wrapping_add(1);
+            if *generation == 0 {
+                *generation = 1;
+            }
+            Ok((id, *generation))
+        }
+
+        pub(super) fn release(&mut self, id: u16) {
+            debug_assert_ne!(id, 0);
+            debug_assert!(!self.free.contains(&id), "PeerTarget id released twice");
+            self.free.push(id);
+        }
     }
 
     impl UrmaJfc {
@@ -245,7 +290,7 @@ mod native {
         endpoint: Option<SharedRmEndpoint>,
         accepting: bool,
         poisoned: bool,
-        next_peer_id: u16,
+        peer_ids: PeerIdAllocator,
         peers: HashMap<u16, PeerTarget>,
         completions: CompletionRouter,
         _not_send_sync: PhantomData<Rc<()>>,
@@ -355,7 +400,7 @@ mod native {
                 endpoint: None,
                 accepting: true,
                 poisoned: false,
-                next_peer_id: 1,
+                peer_ids: PeerIdAllocator::new(),
                 peers: HashMap::new(),
                 completions: CompletionRouter::new(16)?,
                 _not_send_sync: PhantomData,
@@ -377,16 +422,6 @@ mod native {
                     ffi::MAX_POST_LIST
                 )));
             }
-            let capability = self.capability.clone();
-            let peer_id = self.next_peer_id;
-            self.next_peer_id = self
-                .next_peer_id
-                .checked_add(1)
-                .filter(|id| *id != 0)
-                .ok_or_else(|| {
-                    Error::InvalidConfiguration("PeerTarget id space exhausted".into())
-                })?;
-
             if self.endpoint.is_none() {
                 // First peer: create the one process-shared RM endpoint.
                 let native = self
@@ -411,19 +446,27 @@ mod native {
                 self.completions.register_endpoint(jetty_id, jfr_id)?;
                 self.endpoint = Some(endpoint);
             }
+            let capability = self.capability.clone();
+            let (peer_id, generation) = self.peer_ids.allocate()?;
             let endpoint = self
                 .endpoint
                 .as_ref()
                 .expect("shared endpoint exists after create_peer_target");
-            let peer = PeerTarget::new(
+            let peer = match PeerTarget::new(
                 peer_id,
-                1,
+                generation,
                 capability,
                 post_list_size
                     .min(self.endpoint_config.send_depth)
                     .min(self.endpoint_config.recv_depth)
                     .min(self.max_post_list_size),
-            )?;
+            ) {
+                Ok(peer) => peer,
+                Err(error) => {
+                    self.peer_ids.release(peer_id);
+                    return Err(error);
+                }
+            };
             self.peers.insert(peer_id, peer);
             Ok((peer_id, endpoint.descriptor.clone()))
         }
@@ -677,6 +720,7 @@ mod native {
                 self.peer_mut(peer_id)?.close(outstanding)?;
                 self.completions.unregister_peer(peer_id)?;
                 self.peers.remove(&peer_id);
+                self.peer_ids.release(peer_id);
             }
             Ok(())
         }
@@ -710,9 +754,10 @@ mod native {
             while !self.peers.is_empty() && !deadline_expired(drain_deadline) {
                 if let Err(error) = self.poll_once() {
                     if !matches!(error, Error::Completion { .. }) {
-                        failures.push(error.to_string());
+                        push_unique_failure(&mut failures, error.to_string());
                     }
                 }
+                thread::sleep(Duration::from_micros(100));
             }
             if !self.peers.is_empty() || self.completions.outstanding() != 0 {
                 // Fatal escalation: the process is going away, so force every
@@ -732,9 +777,10 @@ mod native {
                 {
                     if let Err(error) = self.poll_once() {
                         if !matches!(error, Error::Completion { .. }) {
-                            failures.push(error.to_string());
+                            push_unique_failure(&mut failures, error.to_string());
                         }
                     }
+                    thread::sleep(Duration::from_micros(100));
                 }
                 if !self.peers.is_empty() || !self.completions.endpoint_ready_to_close() {
                     failures.push(format!(
@@ -820,6 +866,12 @@ mod native {
             )));
         }
         Ok(())
+    }
+
+    fn push_unique_failure(failures: &mut Vec<String>, failure: String) {
+        if !failures.contains(&failure) {
+            failures.push(failure);
+        }
     }
 
     fn validate_jetty_config(
@@ -998,5 +1050,29 @@ mod tests {
         let runtime = RuntimeConfig::new("urma0", 0).with_tp_type(crate::urma::TpType::Ctp);
         let endpoint = shared_endpoint_config(&runtime, &capability_for_depths(8, 8));
         assert_eq!(endpoint.tp_type, crate::urma::TpType::Ctp);
+    }
+
+    #[test]
+    fn peer_ids_reuse_only_after_release_and_advance_generation() {
+        let mut ids = native::PeerIdAllocator::new();
+        let first = ids.allocate().unwrap();
+        let second = ids.allocate().unwrap();
+        assert_eq!(first, (1, 1));
+        assert_eq!(second, (2, 1));
+
+        ids.release(first.0);
+        assert_eq!(ids.allocate().unwrap(), (1, 2));
+        assert_eq!(ids.allocate().unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn peer_id_allocator_includes_u16_max_before_exhaustion() {
+        let mut ids = native::PeerIdAllocator::new();
+        let mut last = (0, 0);
+        for _ in 0..u32::from(u16::MAX) {
+            last = ids.allocate().unwrap();
+        }
+        assert_eq!(last, (u16::MAX, 1));
+        assert!(ids.allocate().is_err());
     }
 }

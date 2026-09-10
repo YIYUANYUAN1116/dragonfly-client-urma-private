@@ -224,7 +224,10 @@ impl CompletionTarget {
 
 struct OutstandingWr {
     user_ctx: u64,
-    handle: ffi::WrHandle,
+    // Reserved before the native post and filled only for the prefix accepted
+    // by the provider. The owner thread cannot poll CQEs while a command is
+    // being handled, so a committed entry is always visible before its CQE.
+    handle: Option<ffi::WrHandle>,
     sequence: Option<u64>,
     completion: Option<CompletionTarget>,
 }
@@ -481,10 +484,9 @@ impl CompletionRouter {
     /// Records one provider-accepted anonymous receive WR. Logical ownership is
     /// registered separately because an existing endpoint RQE may be reused by
     /// a later PeerTarget after its original waiter is retired.
-    pub(crate) fn track_anonymous_rx(
+    pub(crate) fn reserve_anonymous_rx(
         &mut self,
         user_ctx: u64,
-        handle: ffi::WrHandle,
         posted_sequence: Option<u64>,
     ) -> Result<()> {
         let token = WrToken::decode(user_ctx)?;
@@ -493,26 +495,23 @@ impl CompletionRouter {
                 "anonymous RX ownership requires a peerless RECV WR".into(),
             ));
         }
-        let slot = token.slot.index();
-        if self.outstanding.len() <= slot {
-            self.outstanding.resize_with(slot + 1, || None);
-        }
-        if self.outstanding[slot].is_some() {
-            return Err(Error::Protocol("duplicate outstanding slot".into()));
-        }
-        self.outstanding[slot] = Some(OutstandingWr {
+        self.reserve_outstanding(OutstandingWr {
             user_ctx,
-            handle,
+            handle: None,
             sequence: posted_sequence,
             completion: None,
-        });
-        self.outstanding_total += 1;
-        self.outstanding_recv += 1;
-        self.stats.recv_post += 1;
-        self.stats.max_outstanding = self
-            .stats
-            .max_outstanding
-            .max(self.outstanding_total as u64);
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_anonymous_rx(
+        &mut self,
+        user_ctx: u64,
+        handle: ffi::WrHandle,
+        posted_sequence: Option<u64>,
+    ) -> Result<()> {
+        self.reserve_anonymous_rx(user_ctx, posted_sequence)?;
+        self.commit_posted(user_ctx, handle);
         Ok(())
     }
 
@@ -572,10 +571,9 @@ impl CompletionRouter {
         self.targets.validate_active_generation(peer_id, generation)
     }
 
-    pub(crate) fn track_registered_tx(
+    pub(crate) fn reserve_registered_tx(
         &mut self,
         user_ctx: u64,
-        handle: ffi::WrHandle,
         sequence: u64,
         completion: RegisteredTxWindowState,
     ) -> Result<()> {
@@ -586,6 +584,29 @@ impl CompletionRouter {
             ));
         }
         self.validate_send_owner(token.peer_id, token.generation)?;
+        self.reserve_outstanding(OutstandingWr {
+            user_ctx,
+            handle: None,
+            sequence: Some(sequence),
+            completion: Some(CompletionTarget::RegisteredTx(completion)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_registered_tx(
+        &mut self,
+        user_ctx: u64,
+        handle: ffi::WrHandle,
+        sequence: u64,
+        completion: RegisteredTxWindowState,
+    ) -> Result<()> {
+        self.reserve_registered_tx(user_ctx, sequence, completion)?;
+        self.commit_posted(user_ctx, handle);
+        Ok(())
+    }
+
+    fn reserve_outstanding(&mut self, outstanding: OutstandingWr) -> Result<()> {
+        let token = WrToken::decode(outstanding.user_ctx)?;
         let slot = token.slot.index();
         if self.outstanding.len() <= slot {
             self.outstanding.resize_with(slot + 1, || None);
@@ -593,21 +614,65 @@ impl CompletionRouter {
         if self.outstanding[slot].is_some() {
             return Err(Error::Protocol("duplicate outstanding slot".into()));
         }
-        completion.posted();
-        self.outstanding[slot] = Some(OutstandingWr {
-            user_ctx,
-            handle,
-            sequence: Some(sequence),
-            completion: Some(CompletionTarget::RegisteredTx(completion)),
-        });
+        self.outstanding[slot] = Some(outstanding);
+        Ok(())
+    }
+
+    /// Commits ownership for a WR already accepted by the provider. Every
+    /// fallible identity/slot check ran during reservation, before native state
+    /// changed; a failure here therefore denotes an internal invariant break.
+    pub(crate) fn commit_posted(&mut self, user_ctx: u64, handle: ffi::WrHandle) {
+        let token = WrToken::decode(user_ctx)
+            .expect("a committed WR identity was validated during reservation");
+        let entry = self
+            .outstanding
+            .get_mut(token.slot.index())
+            .and_then(Option::as_mut)
+            .expect("a posted WR has an outstanding reservation");
+        assert_eq!(
+            entry.user_ctx, user_ctx,
+            "posted WR reservation identity changed"
+        );
+        assert!(
+            entry.handle.is_none(),
+            "posted WR reservation was committed twice"
+        );
+        if let Some(CompletionTarget::RegisteredTx(completion)) = &entry.completion {
+            completion.posted();
+        }
+        entry.handle = Some(handle);
         self.outstanding_total += 1;
-        self.outstanding_send += 1;
-        *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
-        self.stats.send_post += 1;
+        match token.operation {
+            OperationType::Send => {
+                self.outstanding_send += 1;
+                *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
+                self.stats.send_post += 1;
+            }
+            OperationType::Recv => {
+                self.outstanding_recv += 1;
+                self.stats.recv_post += 1;
+            }
+        }
         self.stats.max_outstanding = self
             .stats
             .max_outstanding
             .max(self.outstanding_total as u64);
+    }
+
+    pub(crate) fn cancel_reservation(&mut self, user_ctx: u64) -> Result<()> {
+        let token = WrToken::decode(user_ctx)?;
+        let entry = self
+            .outstanding
+            .get_mut(token.slot.index())
+            .ok_or_else(|| Error::Protocol("WR reservation slot is outside table".into()))?;
+        if !entry.as_ref().is_some_and(|outstanding| {
+            outstanding.user_ctx == user_ctx && outstanding.handle.is_none()
+        }) {
+            return Err(Error::Protocol(
+                "cannot cancel a missing or committed WR reservation".into(),
+            ));
+        }
+        entry.take();
         Ok(())
     }
 
@@ -772,7 +837,11 @@ impl CompletionRouter {
             .as_ref()
             .is_some_and(|endpoint| endpoint.waiting_for_flush);
         let mut outstanding = self.take_outstanding(record.user_ctx)?;
-        outstanding.handle.complete();
+        outstanding
+            .handle
+            .take()
+            .expect("committed outstanding WR has a native handle")
+            .complete();
         let registered_tx = matches!(
             outstanding.completion,
             Some(CompletionTarget::RegisteredTx(_))
@@ -906,7 +975,11 @@ impl CompletionRouter {
             ));
         }
         let mut outstanding = self.take_outstanding(user_ctx)?;
-        outstanding.handle.complete();
+        outstanding
+            .handle
+            .take()
+            .expect("committed outstanding WR has a native handle")
+            .complete();
         self.outstanding_recv -= 1;
         self.stats.recv_cqe += 1;
         pool.complete_error(token.slot, OperationType::Recv)?;
@@ -954,10 +1027,9 @@ impl CompletionRouter {
             .outstanding
             .get_mut(token.slot.index())
             .ok_or_else(|| Error::Protocol("CQE slot is outside outstanding table".into()))?;
-        if !entry
-            .as_ref()
-            .is_some_and(|outstanding| outstanding.user_ctx == user_ctx)
-        {
+        if !entry.as_ref().is_some_and(|outstanding| {
+            outstanding.user_ctx == user_ctx && outstanding.handle.is_some()
+        }) {
             return Err(Error::Protocol("CQE has no outstanding WR".into()));
         }
         self.outstanding_total -= 1;
@@ -1081,6 +1153,24 @@ mod tests {
     fn completion_router_rejects_invalid_batch() {
         assert!(CompletionRouter::new(0).is_err());
         assert!(CompletionRouter::new(MAX_POLL_BATCH + 1).is_err());
+    }
+
+    #[test]
+    fn unposted_wr_reservation_can_be_cancelled_without_counting_ownership() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        let user_ctx = WrToken::anonymous_recv(SlotId::new(3, 1).unwrap())
+            .encode()
+            .unwrap();
+
+        router.reserve_anonymous_rx(user_ctx, Some(7)).unwrap();
+        assert_eq!(router.outstanding(), 0);
+        assert!(router.reserve_anonymous_rx(user_ctx, Some(7)).is_err());
+
+        router.cancel_reservation(user_ctx).unwrap();
+        router.reserve_anonymous_rx(user_ctx, Some(7)).unwrap();
+        router.commit_posted(user_ctx, ffi::WrHandle::without_native());
+        assert_eq!(router.outstanding(), 1);
+        assert_eq!(router.outstanding_recv(), 1);
     }
 
     #[test]

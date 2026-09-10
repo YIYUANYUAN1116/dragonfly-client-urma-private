@@ -462,6 +462,7 @@ pub(crate) struct UrmaClientTransfer {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> UrmaClientSession<S> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect(
         mut stream: S,
         fabric: UrmaFabricHandle,

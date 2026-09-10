@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use super::ffi::FfiError;
 
@@ -15,6 +16,9 @@ pub enum Error {
     },
     ControlTimeout {
         operation: &'static str,
+    },
+    StartupTimeout {
+        timeout: Duration,
     },
     OperationTimeout {
         sequence: Option<u64>,
@@ -76,6 +80,9 @@ impl fmt::Display for Error {
             }
             Self::ControlTimeout { operation } => {
                 write!(f, "URMA control operation timed out: {operation}")
+            }
+            Self::StartupTimeout { timeout } => {
+                write!(f, "URMA Fabric startup timed out after {timeout:?}")
             }
             Self::OperationTimeout { sequence } => {
                 write!(f, "URMA operation timed out: sequence={sequence:?}")
