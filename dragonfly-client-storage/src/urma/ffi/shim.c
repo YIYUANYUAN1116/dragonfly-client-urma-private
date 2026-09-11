@@ -210,6 +210,8 @@ int dfurma_runtime_query_device(dfurma_runtime_t *runtime,
     out->max_jfs_rsge = attr.dev_cap.max_jfs_rsge;
     out->max_jfr_sge = attr.dev_cap.max_jfr_sge;
     out->max_msg_size = attr.dev_cap.max_msg_size;
+    out->max_read_size = attr.dev_cap.max_read_size;
+    out->max_write_size = attr.dev_cap.max_write_size;
     return 0;
 }
 

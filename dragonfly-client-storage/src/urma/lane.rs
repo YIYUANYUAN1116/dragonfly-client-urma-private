@@ -902,6 +902,8 @@ mod tests {
             max_jfs_rsge: 1,
             max_jfr_sge: 1,
             max_msg_size: 64 * 1024,
+            max_read_size: 0,
+            max_write_size: 0,
         }
     }
 

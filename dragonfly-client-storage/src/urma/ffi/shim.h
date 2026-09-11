@@ -45,6 +45,8 @@ typedef struct dfurma_device_capability {
     uint32_t max_jfs_rsge;
     uint32_t max_jfr_sge;
     uint64_t max_msg_size;
+    uint32_t max_read_size;
+    uint32_t max_write_size;
 } dfurma_device_capability_t;
 
 typedef struct dfurma_jetty_config {

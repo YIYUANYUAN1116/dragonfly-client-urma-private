@@ -102,6 +102,8 @@ pub(crate) struct UrmaDeviceCapability {
     pub(crate) max_jfs_rsge: u32,
     pub(crate) max_jfr_sge: u32,
     pub(crate) max_msg_size: u64,
+    pub(crate) max_read_size: u32,
+    pub(crate) max_write_size: u32,
 }
 
 mod native {
@@ -961,6 +963,8 @@ mod native {
             max_jfs_rsge: raw.max_jfs_rsge,
             max_jfr_sge: raw.max_jfr_sge,
             max_msg_size: raw.max_msg_size,
+            max_read_size: raw.max_read_size,
+            max_write_size: raw.max_write_size,
         }
     }
 }
@@ -986,6 +990,8 @@ mod tests {
             max_jfs_rsge: 1,
             max_jfr_sge: 1,
             max_msg_size: u64::MAX,
+            max_read_size: 0,
+            max_write_size: 0,
         }
     }
 
