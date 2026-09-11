@@ -33,6 +33,8 @@ _Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
                "URMA EID size changed");
 _Static_assert(URMA_RTP == DFURMA_TP_RTP, "URMA RTP value changed");
 _Static_assert(URMA_CTP == DFURMA_TP_CTP, "URMA CTP value changed");
+_Static_assert(URMA_ACCESS_READ == DFURMA_READ_ACCESS, "URMA READ access changed");
+_Static_assert(URMA_TOKEN_PLAIN_TEXT == DFURMA_READ_TOKEN_PLAIN, "URMA token policy changed");
 
 struct dfurma_runtime {
     urma_device_t *device;
@@ -76,6 +78,26 @@ struct dfurma_target {
     dfurma_jetty_t *jetty;
     urma_target_jetty_t *target;
     uint32_t outstanding_wr_count;
+    uint32_t read_segment_count;
+};
+
+struct dfurma_read_segment {
+    dfurma_target_t *target;
+    urma_target_seg_t *segment;
+    uint64_t va;
+    uint64_t length;
+    uint32_t max_read_size;
+    uint32_t outstanding_wr_count;
+};
+
+struct dfurma_read_source {
+    dfurma_runtime_t *runtime;
+    urma_target_seg_t *segment;
+    urma_token_id_t *token_id;
+    uint64_t va;
+    uint64_t length;
+    int closing;
+    int registration_uncertain;
 };
 
 struct dfurma_wr {
@@ -83,6 +105,8 @@ struct dfurma_wr {
     dfurma_segment_t *segment;
     dfurma_jetty_t *jetty;
     dfurma_target_t *target;
+    dfurma_read_segment_t *read_segment;
+    urma_sge_t remote_sge;
     urma_sge_t sge;
     urma_jfs_wr_t send_wr;
     urma_jfr_wr_t recv_wr;
@@ -635,7 +659,7 @@ int dfurma_target_unimport(dfurma_target_t *target)
     if (target == NULL || target->jetty == NULL || target->target == NULL) {
         return -EINVAL;
     }
-    if (target->outstanding_wr_count != 0) {
+    if (target->outstanding_wr_count != 0 || target->read_segment_count != 0) {
         return -EBUSY;
     }
     status = urma_unimport_jetty(target->target);
@@ -749,6 +773,306 @@ static void dfurma_wr_posted(dfurma_wr_t *wr)
     if (wr->target != NULL) {
         wr->target->outstanding_wr_count++;
     }
+    if (wr->read_segment != NULL) {
+        wr->read_segment->outstanding_wr_count++;
+    }
+}
+
+int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
+                                uint64_t length, uint32_t token,
+                                dfurma_read_source_t **out)
+{
+    dfurma_read_source_t *source;
+    urma_seg_cfg_t cfg = {0};
+    uint64_t va = (uint64_t)(uintptr_t)data;
+    int error;
+
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    if (runtime == NULL || runtime->context == NULL || data == NULL ||
+        length == 0 || length > PTRDIFF_MAX || length > UINT64_MAX - va) {
+        return -EINVAL;
+    }
+    if (runtime->segment_count == UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    source = calloc(1, sizeof(*source));
+    if (source == NULL) {
+        return -ENOMEM;
+    }
+    /* Own the token ID explicitly. The current core unregister path may attempt
+     * to free automatically allocated IDs even on unregister failure. */
+    errno = 0;
+    source->token_id = urma_alloc_token_id(runtime->context);
+    if (source->token_id == NULL) {
+        error = dfurma_pointer_error(-EIO);
+        free(source);
+        return error;
+    }
+    source->runtime = runtime;
+    source->va = va;
+    source->length = length;
+    runtime->segment_count++;
+    cfg.va = va;
+    cfg.len = length;
+    cfg.token_id = source->token_id;
+    cfg.token_value.token = token;
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    cfg.flag.bs.access = URMA_ACCESS_READ;
+    cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
+    cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
+    /* non_pin remains zero: external pages must be pinned. */
+    errno = 0;
+    source->segment = urma_register_seg(runtime->context, &cfg);
+    error = source->segment == NULL ? dfurma_pointer_error(-EIO) : 0;
+    cfg.token_value.token = 0;
+    *out = source;
+    if (error != 0) {
+        /* Provider rollback may have failed after creating a grant. No native
+         * registration handle exists to retry unregister; retain backing/token. */
+        source->registration_uncertain = 1;
+        source->closing = 1;
+    }
+    return error;
+}
+
+int dfurma_read_source_descriptor(dfurma_read_source_t *source,
+                                  dfurma_read_descriptor_t *out)
+{
+    urma_seg_t *seg = NULL;
+    urma_seg_attr_t supported = {0};
+    uint32_t size = 0;
+    urma_status_t status;
+    int result = 0;
+
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    memset(out, 0, sizeof(*out));
+    if (source == NULL || source->segment == NULL || source->closing) {
+        return -ESHUTDOWN;
+    }
+    status = urma_get_seg_ctx(source->segment, &seg, &size);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    supported.bs.access = URMA_ACCESS_READ;
+    supported.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    supported.bs.cacheable = URMA_NON_CACHEABLE;
+    supported.bs.user_token_id = URMA_TOKEN_ID_VALID;
+    /* Reject extensions and any attribute not represented by descriptor v1. */
+    if (seg == NULL || size != sizeof(*seg) || seg->attr.value != supported.value) {
+        result = -EOPNOTSUPP;
+    } else if (seg->ubva.va != source->va || seg->len != source->length ||
+               seg->ubva.uasid > 0xffffffU) {
+        result = -ERANGE;
+    } else {
+        out->version = DFURMA_READ_DESCRIPTOR_VERSION;
+        memcpy(out->eid, seg->ubva.eid.raw, DFURMA_EID_SIZE);
+        out->uasid = seg->ubva.uasid;
+        out->va = seg->ubva.va;
+        out->length = seg->len;
+        out->token_id = seg->token_id;
+        out->access = DFURMA_READ_ACCESS;
+        out->token_policy = DFURMA_READ_TOKEN_PLAIN;
+    }
+    if (seg != NULL) {
+        urma_put_seg_ctx(seg);
+    }
+    return result;
+}
+
+int dfurma_read_source_unregister(dfurma_read_source_t *source)
+{
+    urma_status_t status;
+
+    if (source == NULL) {
+        return -EINVAL;
+    }
+    source->closing = 1;
+    if (source->registration_uncertain) {
+        return -EUCLEAN;
+    }
+    if (source->segment == NULL) {
+        return 0;
+    }
+    status = urma_unregister_seg(source->segment);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    source->segment = NULL;
+    /* Native unregister success does not prove ummu_ungrant succeeded. */
+    return 0;
+}
+
+int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source)
+{
+    urma_status_t status;
+
+    if (source == NULL || source->runtime == NULL || source->token_id == NULL) {
+        return -EINVAL;
+    }
+    if (source->segment != NULL) {
+        return -EBUSY;
+    }
+    /* This is a caller-supplied proof boundary, NOT a probe of remote access. */
+    status = urma_free_token_id(source->token_id);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    source->runtime->segment_count--;
+    source->token_id = NULL;
+    free(source);
+    return 0;
+}
+
+int dfurma_read_segment_import(dfurma_target_t *target,
+                               const dfurma_read_descriptor_t *descriptor,
+                               uint32_t token, uint32_t max_read_size,
+                               dfurma_read_segment_t **out)
+{
+    urma_seg_t seg = {0};
+    urma_import_seg_flag_t flag = {0};
+    urma_token_t token_value = {.token = token};
+    dfurma_device_capability_t capability;
+    dfurma_read_segment_t *remote;
+    dfurma_runtime_t *runtime;
+    int status;
+
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    if (target == NULL || target->target == NULL || target->jetty == NULL ||
+        target->jetty->runtime == NULL || descriptor == NULL ||
+        descriptor->version != DFURMA_READ_DESCRIPTOR_VERSION ||
+        descriptor->access != DFURMA_READ_ACCESS ||
+        descriptor->token_policy != DFURMA_READ_TOKEN_PLAIN ||
+        descriptor->uasid > 0xffffffU || descriptor->va == 0 ||
+        descriptor->length == 0 || descriptor->length > UINT64_MAX - descriptor->va ||
+        max_read_size == 0) {
+        return -EINVAL;
+    }
+    /* This prototype deliberately rejects cross-context source Segments. */
+    if (memcmp(descriptor->eid, target->target->id.eid.raw, DFURMA_EID_SIZE) != 0 ||
+        descriptor->uasid != target->target->id.uasid) {
+        return -EACCES;
+    }
+    runtime = target->jetty->runtime;
+    status = dfurma_runtime_query_device(runtime, &capability);
+    if (status != 0) {
+        return status;
+    }
+    if ((capability.transport_modes & URMA_TM_RM) == 0 || capability.max_read_size == 0 ||
+        capability.max_jfs_sge == 0 || capability.max_jfs_rsge == 0) {
+        return -EOPNOTSUPP;
+    }
+    remote = calloc(1, sizeof(*remote));
+    if (remote == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(seg.ubva.eid.raw, descriptor->eid, DFURMA_EID_SIZE);
+    seg.ubva.uasid = descriptor->uasid;
+    seg.ubva.va = descriptor->va;
+    seg.len = descriptor->length;
+    seg.token_id = descriptor->token_id;
+    seg.attr.bs.access = URMA_ACCESS_READ;
+    seg.attr.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
+    flag.bs.access = URMA_ACCESS_READ;
+    flag.bs.mapping = URMA_SEG_NOMAP;
+    errno = 0;
+    remote->segment = urma_import_seg(runtime->context, &seg, &token_value, 0, flag);
+    token_value.token = 0;
+    if (remote->segment == NULL) {
+        status = dfurma_pointer_error(-EIO);
+        free(remote);
+        return status;
+    }
+    remote->target = target;
+    remote->va = descriptor->va;
+    remote->length = descriptor->length;
+    remote->max_read_size = max_read_size < capability.max_read_size ?
+        max_read_size : capability.max_read_size;
+    target->read_segment_count++;
+    runtime->segment_count++;
+    *out = remote;
+    return 0;
+}
+
+int dfurma_read_segment_unimport(dfurma_read_segment_t *remote)
+{
+    urma_status_t status;
+
+    if (remote == NULL || remote->segment == NULL || remote->target == NULL) {
+        return -EINVAL;
+    }
+    if (remote->outstanding_wr_count != 0) {
+        return -EBUSY;
+    }
+    status = urma_unimport_seg(remote->segment);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    remote->target->read_segment_count--;
+    remote->target->jetty->runtime->segment_count--;
+    remote->segment = NULL;
+    free(remote);
+    return 0;
+}
+
+int dfurma_post_read(dfurma_jetty_t *jetty, dfurma_target_t *target,
+                     dfurma_segment_t *local, dfurma_read_segment_t *remote,
+                     uint64_t local_offset, uint64_t remote_offset,
+                     uint32_t length, uint64_t user_ctx, dfurma_wr_t **out)
+{
+    dfurma_wr_t *wr;
+    urma_jfs_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int result;
+
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    if (jetty == NULL || target == NULL || target->target == NULL || target->jetty != jetty ||
+        remote == NULL || remote->segment == NULL || remote->target != target ||
+        length == 0 || length > remote->max_read_size || remote_offset > remote->length ||
+        (uint64_t)length > remote->length - remote_offset) {
+        return -EINVAL;
+    }
+    if (jetty->jetty_error || jetty->jfr_error) {
+        return -ESHUTDOWN;
+    }
+    result = dfurma_wr_acquire(jetty, local, local_offset, length, &wr);
+    if (result != 0) {
+        return result;
+    }
+    wr->target = target;
+    wr->read_segment = remote;
+    wr->remote_sge.addr = remote->va + remote_offset;
+    wr->remote_sge.len = length;
+    wr->remote_sge.tseg = remote->segment;
+    wr->send_wr.opcode = URMA_OPC_READ;
+    wr->send_wr.flag.bs.complete_enable = 1;
+    wr->send_wr.tjetty = target->target;
+    wr->send_wr.user_ctx = user_ctx;
+    wr->send_wr.rw.src.sge = &wr->remote_sge;
+    wr->send_wr.rw.src.num_sge = 1;
+    wr->send_wr.rw.dst.sge = &wr->sge;
+    wr->send_wr.rw.dst.num_sge = 1;
+    status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
+    if (status != URMA_SUCCESS && bad_wr == &wr->send_wr) {
+        dfurma_wr_return(wr);
+        return (int)status;
+    }
+    /* Success, or an ambiguous error without a known rejected WR: retain all
+     * references. The caller must quarantine an ambiguous post, not recycle it. */
+    dfurma_wr_posted(wr);
+    *out = wr;
+    return (int)status;
 }
 
 static int dfurma_post_send_common(dfurma_jetty_t *jetty,
@@ -1026,6 +1350,9 @@ void dfurma_wr_complete(dfurma_wr_t *wr)
     }
     if (wr->target != NULL && wr->target->outstanding_wr_count > 0) {
         wr->target->outstanding_wr_count--;
+    }
+    if (wr->read_segment != NULL && wr->read_segment->outstanding_wr_count > 0) {
+        wr->read_segment->outstanding_wr_count--;
     }
     dfurma_wr_return(wr);
 }

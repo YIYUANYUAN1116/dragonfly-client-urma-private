@@ -29,6 +29,8 @@ typedef struct dfurma_segment dfurma_segment_t;
 typedef struct dfurma_jetty dfurma_jetty_t;
 typedef struct dfurma_target dfurma_target_t;
 typedef struct dfurma_wr dfurma_wr_t;
+typedef struct dfurma_read_segment dfurma_read_segment_t;
+typedef struct dfurma_read_source dfurma_read_source_t;
 
 /* Rust-owned capability DTO. No pointer in this object belongs to liburma. */
 typedef struct dfurma_device_capability {
@@ -70,6 +72,58 @@ typedef struct dfurma_jetty_descriptor_meta {
 #define DFURMA_TP_CTP 1U
 
 #define DFURMA_EID_SIZE 16U
+
+/* Explicit DTO fields, not a memcpy of a provider ABI structure. Version 1 only
+ * represents pinned, non-cacheable READ/plain-token Segments without extensions.
+ * Segment/peer generations are checked by the outer transfer registry. */
+#define DFURMA_READ_DESCRIPTOR_VERSION 1U
+#define DFURMA_READ_ACCESS 2U
+#define DFURMA_READ_TOKEN_PLAIN 1U
+typedef struct dfurma_read_descriptor {
+    uint32_t version;
+    uint8_t eid[DFURMA_EID_SIZE];
+    uint32_t uasid;
+    uint64_t va;
+    uint64_t length;
+    uint32_t token_id;
+    uint32_t access;
+    uint32_t token_policy;
+} dfurma_read_descriptor_t;
+
+/* External immutable backing is caller-owned throughout registration, retirement
+ * and revocation confirmation. No function below frees the backing allocation.
+ * On a registration error with non-NULL *out, native grant cleanup is uncertain:
+ * retain the wrapper AND backing. NULL *out means registration was never called. */
+int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
+                                uint64_t length, uint32_t token,
+                                dfurma_read_source_t **out);
+int dfurma_read_source_descriptor(dfurma_read_source_t *source,
+                                  dfurma_read_descriptor_t *out);
+/* Stops descriptor export; success means native unregister only, not revocation.
+ * Wrapper, explicitly owned token ID, backing and runtime count remain retained.
+ * Registration-uncertain sources cannot be unregistered using a missing handle. */
+int dfurma_read_source_unregister(dfurma_read_source_t *source);
+/* CALLER MUST independently prove remote access has ceased and cannot resume.
+ * Only accepts sources without a live native registration; releases token ID and
+ * wrapper on success. Caller may release backing only after this also succeeds. */
+int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source);
+
+/* Validates the supported descriptor subset and peer identity before import.
+ * max_read_size is the negotiated limit; zero never means unlimited. */
+int dfurma_read_segment_import(dfurma_target_t *target,
+                               const dfurma_read_descriptor_t *descriptor,
+                               uint32_t token, uint32_t max_read_size,
+                               dfurma_read_segment_t **out);
+/* Refuses unimport while any READ owner is outstanding. Success only closes the
+ * local import; it is not evidence of remote revocation. */
+int dfurma_read_segment_unimport(dfurma_read_segment_t *segment);
+/* On an indeterminate provider post error, returns an error AND a non-NULL WR.
+ * That WR holds all dependencies until CQE/verified retirement; never discard it
+ * as an unposted request. A known unaccepted WR returns an error and NULL. */
+int dfurma_post_read(dfurma_jetty_t *jetty, dfurma_target_t *target,
+                     dfurma_segment_t *local, dfurma_read_segment_t *remote,
+                     uint64_t local_offset, uint64_t remote_offset,
+                     uint32_t length, uint64_t user_ctx, dfurma_wr_t **out);
 
 /* Pointer-free completion DTO copied from urma_cr_t by the C shim. */
 typedef struct dfurma_completion {

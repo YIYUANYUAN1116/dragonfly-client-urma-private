@@ -7,6 +7,10 @@ use std::{
     rc::Rc,
 };
 
+// Native READ building blocks remain disconnected from production dispatch.
+#[allow(dead_code)]
+pub(crate) mod read;
+
 mod sys {
     #![allow(
         dead_code,
