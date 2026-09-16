@@ -184,6 +184,9 @@ int dfurma_jfc_create(dfurma_runtime_t *runtime, uint32_t depth,
 int dfurma_jfc_delete(dfurma_jfc_t *jfc);
 
 /* Allocates aligned zeroed memory, then registers it as local-only memory. */
+/* Error with non-NULL out retains uncertain registration and backing. */
+int dfurma_read_buffer_create(dfurma_runtime_t *runtime, uint64_t length,
+                             uint64_t alignment, dfurma_segment_t **out);
 int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
                           uint64_t alignment, dfurma_segment_t **out);
 

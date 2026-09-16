@@ -27,6 +27,10 @@ pub(crate) struct ReadBacking<K> {
 }
 
 impl<K> ReadBacking<K> {
+    pub(crate) fn len(&self) -> u64 {
+        self.memory.bytes().len() as u64
+    }
+
     pub(crate) fn new(memory: ReadSourceMemory, keepalive: K) -> Self {
         Self { memory, keepalive }
     }
@@ -245,6 +249,107 @@ mod tests {
         let (memory, guard) = backing.into_parts();
         assert_eq!(memory.bytes(), &[7]);
         drop(guard);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn source_registry_rejections_return_backing_and_release_only_unused_budget() {
+        use crate::urma::{
+            read_owner::{ReadBudget, ReadCapacity, ReadOwnerRegistry, ReadPeer},
+            read_source_owner::{SourceAdmission, SourceAdmissionError, SourceOwner},
+        };
+        let cap = |bytes, entries| ReadCapacity { bytes, entries };
+        let mut registry: ReadOwnerRegistry<SourceOwner<Guard>> =
+            ReadOwnerRegistry::new(ReadBudget {
+                total: cap(16, 4),
+                destination: cap(8, 2),
+                source: cap(8, 2),
+                per_peer_destination: cap(8, 2),
+                per_peer_source: cap(8, 2),
+                quarantine: cap(8, 2),
+            })
+            .unwrap();
+        let peer = ReadPeer {
+            id: 1,
+            generation: 1,
+        };
+        registry.activate_peer(peer).unwrap();
+        let mut runtime = NativeRuntime {
+            raw: None,
+            _not_send_sync: PhantomData,
+        };
+        let drops = Rc::new(Cell::new(0));
+        for (index, length) in [9, 4].into_iter().enumerate() {
+            let backing = ReadBacking::new(
+                ReadSourceMemory::Bytes(vec![7; length].into_boxed_slice()),
+                Guard(drops.clone()),
+            );
+            // SAFETY: Closed runtime cannot start native registration or DMA.
+            let result = unsafe {
+                registry.register_source(peer, &mut runtime, backing, &ReadToken::new(1))
+            };
+            let SourceAdmission::Rejected { error, backing } = result else {
+                panic!("expected rejection")
+            };
+            match (index, error) {
+                (
+                    0,
+                    SourceAdmissionError::Budget(crate::urma::read_owner::OwnerError::Capacity),
+                ) => {}
+                (1, SourceAdmissionError::Native(FfiError::Contract("runtime is closed"))) => {}
+                (_, error) => panic!("unexpected rejection: {error:?}"),
+            }
+            assert!(registry.drained());
+            assert_eq!(registry.usage().bytes, 0);
+            assert_eq!(backing.len(), length as u64);
+            assert_eq!(drops.get(), index);
+            drop(backing);
+            assert_eq!(drops.get(), index + 1);
+        }
+    }
+
+    #[test]
+    fn mixed_registry_source_preflight_returns_backing_and_clears_charge() {
+        use crate::urma::{
+            read_child_owner::NativeChild,
+            read_owner::{ReadBudget, ReadCapacity, ReadPeer},
+            read_owners::ReadOwners,
+            read_source_owner::SourceAdmission,
+        };
+        let cap = |bytes, entries| ReadCapacity { bytes, entries };
+        let mut owners: ReadOwners<Guard, NativeChild<()>> = ReadOwners::new(ReadBudget {
+            total: cap(16, 4),
+            source: cap(8, 2),
+            destination: cap(8, 2),
+            per_peer_source: cap(8, 2),
+            per_peer_destination: cap(8, 2),
+            quarantine: cap(8, 2),
+        })
+        .unwrap();
+        let peer = ReadPeer {
+            id: 1,
+            generation: 1,
+        };
+        owners.activate_peer(peer).unwrap();
+        let drops = Rc::new(Cell::new(0));
+        let backing = ReadBacking::new(
+            ReadSourceMemory::Bytes(vec![0; 4].into_boxed_slice()),
+            Guard(drops.clone()),
+        );
+        let mut runtime = NativeRuntime {
+            raw: None,
+            _not_send_sync: PhantomData,
+        };
+        // SAFETY: Closed runtime cannot register memory or start native DMA.
+        let result =
+            unsafe { owners.register_source(peer, &mut runtime, backing, &ReadToken::new(1)) };
+        let SourceAdmission::Rejected { backing, .. } = result else {
+            panic!("expected preflight rejection")
+        };
+        assert!(owners.drained());
+        assert_eq!(owners.usage().bytes, 0);
+        assert_eq!(drops.get(), 0);
+        drop(backing);
         assert_eq!(drops.get(), 1);
     }
 }

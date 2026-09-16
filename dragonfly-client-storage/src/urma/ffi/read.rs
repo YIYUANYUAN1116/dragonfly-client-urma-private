@@ -54,7 +54,7 @@ impl TargetHandle {
     /// transfer/Segment generation and exact Piece bounds. The shim additionally
     /// binds the Segment EID/UASID and lifetime to this native PeerTarget.
     pub(crate) fn import_read_segment(
-        &mut self,
+        &self,
         descriptor: &ReadDescriptor,
         token: &ReadToken,
         max_read_size: u32,
@@ -112,6 +112,54 @@ impl Drop for ImportedReadSegment {
         // As with existing FFI owners, a failed close deliberately retains native
         // dependencies. Runtime-level quarantine/reap is still required at integration.
         let _ = self.close();
+    }
+}
+
+pub(crate) enum ReadBufferCreation {
+    Ready(SegmentHandle),
+    Rejected(FfiError),
+    Uncertain {
+        buffer: SegmentHandle,
+        error: FfiError,
+    },
+}
+impl SegmentHandle {
+    /// READ-only allocation entry: failed registration retains the native wrapper
+    /// and backing. Such a wrapper cannot be reclaimed by ordinary close.
+    pub(crate) fn create_read_buffer(
+        runtime: &mut super::NativeRuntime,
+        length: u64,
+        alignment: u64,
+    ) -> ReadBufferCreation {
+        let Some(runtime) = runtime.raw else {
+            return ReadBufferCreation::Rejected(FfiError::Contract("runtime is closed"));
+        };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: Runtime is live; shim validates size/alignment and owns memory.
+        let status = unsafe {
+            sys::dfurma_read_buffer_create(runtime.as_ptr(), length, alignment, &mut raw)
+        };
+        match NonNull::new(raw) {
+            Some(raw) => {
+                let buffer = SegmentHandle {
+                    raw: Some(raw),
+                    _not_send_sync: PhantomData,
+                };
+                if status == 0 {
+                    ReadBufferCreation::Ready(buffer)
+                } else {
+                    ReadBufferCreation::Uncertain {
+                        buffer,
+                        error: FfiError::Status(status),
+                    }
+                }
+            }
+            None => ReadBufferCreation::Rejected(if status == 0 {
+                FfiError::NullHandle
+            } else {
+                FfiError::Status(status)
+            }),
+        }
     }
 }
 

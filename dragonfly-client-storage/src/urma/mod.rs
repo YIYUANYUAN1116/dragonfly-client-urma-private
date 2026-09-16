@@ -17,6 +17,16 @@ mod lane;
 // Offline READ foundation; not advertised or dispatched until provider gates pass.
 #[allow(dead_code)]
 mod read;
+#[allow(dead_code)]
+mod read_child_owner;
+#[allow(dead_code)]
+mod read_owner;
+#[allow(dead_code)]
+mod read_owners;
+#[allow(dead_code)]
+mod read_source_owner;
+#[allow(dead_code)]
+mod read_wr_credit;
 pub mod rendezvous;
 pub(crate) mod runtime;
 pub(crate) mod session;

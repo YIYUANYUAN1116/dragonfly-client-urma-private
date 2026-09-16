@@ -61,6 +61,14 @@ urma_status_t test_free_token(urma_token_id_t *token)
 urma_target_seg_t *test_register_source(urma_context_t *ctx, urma_seg_cfg_t *cfg)
 {
     urma_target_seg_t *seg;
+    if (cfg->flag.bs.access == URMA_ACCESS_LOCAL_ONLY) {
+        assert(cfg->flag.bs.token_policy == URMA_TOKEN_NONE);
+        if (fail_register) { errno = EIO; return NULL; }
+        seg = calloc(1, sizeof(*seg));
+        assert(seg != NULL);
+        seg->urma_ctx = ctx;
+        return seg;
+    }
     assert(cfg->flag.bs.access == URMA_ACCESS_READ);
     assert(cfg->flag.bs.token_policy == URMA_TOKEN_PLAIN_TEXT);
     assert(cfg->flag.bs.token_id_valid == URMA_TOKEN_ID_VALID && cfg->token_id != NULL);
@@ -458,6 +466,55 @@ static void test_registration_failure_retains_uncertain_grants(void)
     assert(token_frees == 1 && f.runtime.segment_count == 1);
 }
 
+static void test_read_buffer_failure_retains_memory_and_runtime(void)
+{
+    struct fixture f;
+    dfurma_segment_t *buffer = NULL;
+    setup(&f);
+    assert(dfurma_read_buffer_create(&f.runtime, 32, 3, &buffer) == -EINVAL);
+    assert(buffer == NULL && f.runtime.segment_count == 1);
+    assert(dfurma_read_buffer_create(&f.runtime, 32, 64, &buffer) == 0);
+    assert(buffer != NULL && f.runtime.segment_count == 2);
+    fail_unregister = 1;
+    assert(dfurma_segment_delete(buffer) != 0);
+    assert(buffer->memory != NULL && f.runtime.segment_count == 2);
+    fail_unregister = 0;
+    assert(dfurma_segment_delete(buffer) == 0 && f.runtime.segment_count == 1);
+    buffer = NULL;
+    fail_register = 1;
+    assert(dfurma_read_buffer_create(&f.runtime, 32, 64, &buffer) == -EIO);
+    assert(buffer != NULL && buffer->memory != NULL && buffer->segment == NULL);
+    assert(f.runtime.segment_count == 2);
+    assert(dfurma_segment_delete(buffer) != 0 && f.runtime.segment_count == 2);
+    /* Only the test knows no provider resource was created. Production has no
+     * unchecked recovery API for this uncertain allocation. */
+    free(buffer->memory);
+    free(buffer);
+    f.runtime.segment_count--;
+}
+
+static void test_allocated_read_buffer_full_lifecycle(void)
+{
+    struct fixture f;
+    dfurma_segment_t *buffer = NULL;
+    dfurma_read_segment_t *remote = NULL;
+    dfurma_wr_t *wr = NULL;
+    setup(&f);
+    assert(dfurma_read_buffer_create(&f.runtime, 32, 64, &buffer) == 0);
+    assert(dfurma_read_segment_import(&f.target, &f.descriptor, 0x12345678, 16, &remote) == 0);
+    assert(f.runtime.segment_count == 3);
+    assert(dfurma_post_read(&f.jetty, &f.target, buffer, remote, 0, 0, 16, 0xabcdef, &wr) == 0);
+    assert(buffer->outstanding_wr_count == 1);
+    assert(dfurma_segment_delete(buffer) == -EBUSY);
+    assert(dfurma_read_segment_unimport(remote) == -EBUSY);
+    assert(memcmp(source, buffer->memory, 16) == 0);
+    dfurma_wr_complete(wr);
+    assert(buffer->outstanding_wr_count == 0);
+    assert(dfurma_read_segment_unimport(remote) == 0);
+    assert(dfurma_segment_delete(buffer) == 0);
+    assert(f.runtime.segment_count == 1 && f.target.read_segment_count == 0);
+}
+
 int main(void)
 {
     test_descriptor_validation();
@@ -468,6 +525,8 @@ int main(void)
     test_source_export_rejects_unrepresented_context();
     test_source_unregister_failure_keeps_token_and_blocks_export();
     test_registration_failure_retains_uncertain_grants();
-    puts("PASS: 8 groups covering source/import/READ, context validation, retirement and uncertain grants");
+    test_read_buffer_failure_retains_memory_and_runtime();
+    test_allocated_read_buffer_full_lifecycle();
+    puts("PASS: 10 groups covering source/import/READ, context validation, retirement and uncertain grants");
     return 0;
 }

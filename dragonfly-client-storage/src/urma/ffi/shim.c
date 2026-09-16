@@ -294,8 +294,8 @@ int dfurma_jfc_delete(dfurma_jfc_t *jfc)
     return 0;
 }
 
-int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
-                            uint64_t alignment, dfurma_segment_t **out)
+static int dfurma_segment_create_impl(dfurma_runtime_t *runtime, uint64_t length,
+                            uint64_t alignment, dfurma_segment_t **out, int retain_failure)
 {
     urma_seg_cfg_t cfg = {0};
     dfurma_segment_t *segment;
@@ -334,6 +334,14 @@ int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
     segment->segment = urma_register_seg(runtime->context, &cfg);
     if (segment->segment == NULL) {
         int error = dfurma_pointer_error(-EIO);
+        if (retain_failure) {
+            /* No proof that failed registration rolled back all pinning. */
+            segment->runtime = runtime;
+            segment->length = length;
+            runtime->segment_count++;
+            *out = segment;
+            return error;
+        }
         free(segment->memory);
         free(segment);
         return error;
@@ -344,6 +352,18 @@ int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
     runtime->segment_count++;
     *out = segment;
     return 0;
+}
+
+int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
+                            uint64_t alignment, dfurma_segment_t **out)
+{
+    return dfurma_segment_create_impl(runtime, length, alignment, out, 0);
+}
+
+int dfurma_read_buffer_create(dfurma_runtime_t *runtime, uint64_t length,
+                            uint64_t alignment, dfurma_segment_t **out)
+{
+    return dfurma_segment_create_impl(runtime, length, alignment, out, 1);
 }
 
 int dfurma_segment_delete(dfurma_segment_t *segment)
