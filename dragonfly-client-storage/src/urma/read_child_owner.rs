@@ -1,5 +1,5 @@
-//! Offline Child ownership foundation. No production CQE decoder or Storage
-//! publication yet. The owner thread must retain this bundle in the byte registry.
+//! Child ownership foundation with context-routed CQE retirement. Production
+//! READ commands and Storage publication remain gated.
 use super::{
     ffi::{
         read::{
@@ -13,10 +13,19 @@ use super::{
 use std::{
     collections::BTreeMap,
     mem::ManuallyDrop,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
-static NEXT_READ_CONTEXT: AtomicU64 = AtomicU64::new(1);
+// Existing SEND/RECV WrToken values always carry operation 1 or 2 in bits
+// 32..40. Reserve an invalid operation byte for READ so a stale or unknown
+// READ CQE can never be decoded as an ordinary SEND/RECV completion.
+const READ_CONTEXT_PREFIX: u64 = 0xffff_ff52_0000_0000;
+const READ_CONTEXT_MASK: u64 = 0xffff_ffff_0000_0000;
+static NEXT_READ_CONTEXT: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn is_read_context(context: u64) -> bool {
+    context & READ_CONTEXT_MASK == READ_CONTEXT_PREFIX
+}
 
 /// A decoded completion whose provider retirement semantics have been validated.
 /// Identity is checked again against the owning bundle before any WR is released.
@@ -48,12 +57,27 @@ impl ReadRetired {
             success,
         }
     }
+
+    pub(crate) fn context(&self) -> u64 {
+        self.context
+    }
 }
 
 pub(crate) enum ChildPost<W> {
     Posted(W),
     Rejected(FfiError),
     Uncertain(W, FfiError),
+}
+
+pub(crate) enum ChildPostOutcome {
+    Posted(u64),
+    /// The provider may have accepted the WR. The context must be routed even
+    /// though the operation is quarantined and no further READ may be posted.
+    Uncertain {
+        context: u64,
+        error: FfiError,
+    },
+    Rejected(FfiError),
 }
 
 /// Implementations must retain destination/import/native dependencies until close.
@@ -286,6 +310,9 @@ impl<R: ChildResources> ChildOwner<R> {
     pub(crate) fn outstanding(&self) -> usize {
         self.pending.len()
     }
+    pub(crate) fn jetty(&self) -> u32 {
+        self.jetty
+    }
     pub(crate) fn read_succeeded(&self) -> bool {
         !self.failed
             && !self.lost_handle
@@ -293,6 +320,14 @@ impl<R: ChildResources> ChildOwner<R> {
             && self.pending.is_empty()
     }
     pub(crate) fn post(&mut self, length: u32) -> Result<u64, FfiError> {
+        match self.post_routed(length) {
+            ChildPostOutcome::Posted(context) => Ok(context),
+            ChildPostOutcome::Uncertain { error, .. } | ChildPostOutcome::Rejected(error) => {
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn post_routed(&mut self, length: u32) -> ChildPostOutcome {
         if self.stopped
             || self.closed
             || !self.imported
@@ -300,11 +335,18 @@ impl<R: ChildResources> ChildOwner<R> {
             || u64::from(length) > self.piece_length - self.posted_bytes
             || self.pending.len() >= self.max_outstanding
         {
-            return Err(FfiError::Contract("READ post admission rejected"));
+            return ChildPostOutcome::Rejected(FfiError::Contract("READ post admission rejected"));
         }
-        let context = NEXT_READ_CONTEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| FfiError::Contract("READ context exhausted"))?;
+        let sequence =
+            match NEXT_READ_CONTEXT
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            {
+                Ok(sequence) => sequence,
+                Err(_) => {
+                    return ChildPostOutcome::Rejected(FfiError::Contract("READ context exhausted"))
+                }
+            };
+        let context = READ_CONTEXT_PREFIX | u64::from(sequence);
         let request = ReadRequest {
             local_offset: self.posted_bytes,
             remote_offset: self.posted_bytes,
@@ -317,7 +359,7 @@ impl<R: ChildResources> ChildOwner<R> {
             Ok(ChildPost::Rejected(error)) => {
                 self.failed = true;
                 self.stop();
-                return Err(error);
+                return ChildPostOutcome::Rejected(error);
             }
             Err(error) => {
                 self.failed = true;
@@ -325,7 +367,7 @@ impl<R: ChildResources> ChildOwner<R> {
                 // Includes malformed success without a handle. Conservatively
                 // retain the entire bundle; no implicit reset on timeout.
                 self.lost_handle = true;
-                return Err(error);
+                return ChildPostOutcome::Rejected(error);
             }
         };
         self.pending.insert(context, Pending { length, wr });
@@ -333,9 +375,9 @@ impl<R: ChildResources> ChildOwner<R> {
         if let Some(error) = error {
             self.failed = true;
             self.stop();
-            return Err(error);
+            return ChildPostOutcome::Uncertain { context, error };
         }
-        Ok(context)
+        ChildPostOutcome::Posted(context)
     }
     pub(crate) fn complete(&mut self, record: ReadRetired) -> Result<(), FfiError> {
         if record.owner != self.id

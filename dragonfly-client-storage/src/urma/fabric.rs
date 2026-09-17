@@ -14,7 +14,10 @@ use super::{
     },
     credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
-    runtime::{RuntimeConfig, UrmaRuntime},
+    runtime::{
+        ReadChildAdmission, ReadChildId, ReadChildRequest, ReadSourceAdmission, ReadSourceId,
+        ReadSourceRequest, RuntimeConfig, UrmaRuntime,
+    },
     Error, Result,
 };
 use std::thread::{self, JoinHandle};
@@ -511,6 +514,68 @@ impl UrmaFabricHandle {
         .await
     }
 
+    /// # Safety
+    /// The caller must authenticate and generation-bind the READ descriptor and
+    /// token, and guarantee exclusive ownership of the destination Piece.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async unsafe fn create_read_child(
+        &self,
+        request: ReadChildRequest,
+    ) -> Result<ReadChildAdmission> {
+        self.submit(|reply| FabricCommand::CreateReadChild { request, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn post_read_child(&self, id: ReadChildId, length: u32) -> Result<u64> {
+        self.submit(|reply| FabricCommand::PostReadChild { id, length, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn retire_read_child_for_cleanup(&self, id: ReadChildId) -> Result<bool> {
+        self.submit_urgent(|reply| FabricCommand::RetireReadChild { id, reply })
+            .await
+    }
+
+    /// # Safety
+    /// The caller must hold immutable exact-Piece backing and authenticate and
+    /// generation-bind this source to the requesting peer and transfer.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async unsafe fn register_read_source(
+        &self,
+        request: ReadSourceRequest,
+    ) -> Result<ReadSourceAdmission> {
+        self.submit(|reply| FabricCommand::RegisterReadSource { request, reply })
+            .await
+    }
+
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn retire_read_source(&self, id: ReadSourceId) -> Result<()> {
+        self.submit_urgent(|reply| FabricCommand::RetireReadSource { id, reply })
+            .await
+    }
+
+    /// # Safety
+    /// The caller must hold the provider drain proof for this exact source.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async unsafe fn unregister_read_source(&self, id: ReadSourceId) -> Result<bool> {
+        self.submit_urgent(|reply| FabricCommand::UnregisterReadSource { id, reply })
+            .await
+    }
+
+    /// # Safety
+    /// The caller must independently prove that remote access to this source has
+    /// ceased and cannot resume, including access through stale tokens.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async unsafe fn release_read_source_after_revoke(
+        &self,
+        id: ReadSourceId,
+    ) -> Result<bool> {
+        self.submit_urgent(|reply| FabricCommand::ReleaseReadSourceAfterRevoke { id, reply })
+            .await
+    }
+
     pub(crate) async fn post_receive_window_registered(
         &self,
         lane_id: u16,
@@ -872,6 +937,42 @@ enum FabricCommand {
         descriptor: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    CreateReadChild {
+        request: ReadChildRequest,
+        reply: oneshot::Sender<Result<ReadChildAdmission>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    PostReadChild {
+        id: ReadChildId,
+        length: u32,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    RetireReadChild {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    RegisterReadSource {
+        request: ReadSourceRequest,
+        reply: oneshot::Sender<Result<ReadSourceAdmission>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    RetireReadSource {
+        id: ReadSourceId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    UnregisterReadSource {
+        id: ReadSourceId,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    ReleaseReadSourceAfterRevoke {
+        id: ReadSourceId,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     PostReceiveWindowRegistered {
         lane_id: u16,
         sequences: Vec<u64>,
@@ -1070,6 +1171,50 @@ fn handle_command(
                 let descriptor = JettyDescriptor::deserialize(&descriptor)?;
                 runtime.connect_peer_target(lane_id, &descriptor)
             });
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::CreateReadChild { request, reply } => {
+            let result = reject_if_poisoned(poisoned).and_then(|()| {
+                // SAFETY: This command can only be constructed by the unsafe
+                // facade whose caller supplies descriptor/generation proofs.
+                unsafe { runtime.create_read_child(request) }
+            });
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::PostReadChild { id, length, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.post_read_child(id, length));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::RetireReadChild { id, reply } => {
+            let _ = reply.send(runtime.retire_read_child_for_cleanup(id));
+            OwnerControl::Continue
+        }
+        FabricCommand::RegisterReadSource { request, reply } => {
+            let result = reject_if_poisoned(poisoned).and_then(|()| {
+                // SAFETY: This command can only be constructed by the unsafe
+                // facade whose caller supplies backing and identity guarantees.
+                unsafe { runtime.register_read_source(request) }
+            });
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::RetireReadSource { id, reply } => {
+            let _ = reply.send(runtime.retire_read_source(id));
+            OwnerControl::Continue
+        }
+        FabricCommand::UnregisterReadSource { id, reply } => {
+            // SAFETY: Construction is restricted to the unsafe facade.
+            let result = unsafe { runtime.unregister_read_source(id) };
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ReleaseReadSourceAfterRevoke { id, reply } => {
+            // SAFETY: Construction is restricted to the unsafe facade.
+            let result = unsafe { runtime.release_read_source_after_revoke(id) };
             let _ = reply.send(result);
             OwnerControl::Continue
         }

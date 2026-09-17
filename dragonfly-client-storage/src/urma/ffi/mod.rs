@@ -357,6 +357,15 @@ pub(crate) struct JettyHandle {
 }
 
 impl JettyHandle {
+    /// Test-only closed handle for ownership/lifecycle tests without a provider.
+    #[cfg(test)]
+    pub(crate) fn without_native() -> Self {
+        Self {
+            raw: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
     pub(crate) fn create(
         runtime: &mut NativeRuntime,
         send_jfc: &JfcHandle,
@@ -747,6 +756,15 @@ pub(crate) struct TargetHandle {
 }
 
 impl TargetHandle {
+    /// Test-only closed handle for ownership/lifecycle tests without a provider.
+    #[cfg(test)]
+    pub(crate) fn without_native() -> Self {
+        Self {
+            raw: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
     pub(crate) fn remote_id(&self) -> Result<RemoteJettyId, FfiError> {
         let target = self.raw.ok_or(FfiError::Contract("target is closed"))?;
         let mut eid = [0u8; EID_SIZE];

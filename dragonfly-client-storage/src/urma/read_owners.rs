@@ -1,11 +1,13 @@
-//! One budget and peer lifecycle for both READ directions. Production wiring is
-//! still gated: factories and completion decoding must supply native evidence.
+//! One budget, peer lifecycle, and CQE route table for both READ directions.
+//! Production command and Storage wiring remain gated.
 use super::{
     ffi::{
         read::{source::ReadBacking, ReadDescriptor, ReadToken},
         FfiError, NativeRuntime,
     },
-    read_child_owner::{ChildOwner, ChildResources, ReadRetired},
+    read_child_owner::{
+        is_read_context, ChildOwner, ChildPostOutcome, ChildResources, ReadRetired,
+    },
     read_owner::{
         OwnerError, QuarantineReason, ReadBudget, ReadDirection, ReadOwnerId, ReadOwnerRegistry,
         ReadPeer, ReadUsage, ReapError,
@@ -15,6 +17,14 @@ use super::{
         UnregisterPermit,
     },
 };
+use std::collections::{btree_map::Entry, BTreeMap};
+
+#[derive(Clone, Copy)]
+struct ReadRoute {
+    owner: ReadOwnerId,
+    jetty: u32,
+    length: u32,
+}
 
 enum ReadBundle<K, R: ChildResources> {
     Source(SourceOwner<K>),
@@ -85,11 +95,13 @@ pub(crate) enum ChildAdmission {
 
 pub(crate) struct ReadOwners<K, R: ChildResources> {
     registry: ReadOwnerRegistry<ReadBundle<K, R>>,
+    routes: BTreeMap<u64, ReadRoute>,
 }
 impl<K, R: ChildResources> ReadOwners<K, R> {
     pub(crate) fn new(budget: ReadBudget) -> Result<Self, OwnerError> {
         Ok(Self {
             registry: ReadOwnerRegistry::new(budget)?,
+            routes: BTreeMap::new(),
         })
     }
     pub(crate) fn activate_peer(&mut self, peer: ReadPeer) -> Result<(), OwnerError> {
@@ -98,8 +110,11 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     pub(crate) fn usage(&self) -> ReadUsage {
         self.registry.usage()
     }
+    pub(crate) fn peer_drained(&self, peer: ReadPeer) -> bool {
+        self.registry.peer_usage(peer).entries == 0
+    }
     pub(crate) fn drained(&self) -> bool {
-        self.registry.drained()
+        self.routes.is_empty() && self.registry.drained()
     }
     pub(crate) fn begin_shutdown(&mut self) {
         self.registry.begin_shutdown();
@@ -207,20 +222,98 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         }
     }
     pub(crate) fn post(&mut self, id: ReadOwnerId, length: u32) -> Result<u64, ReadDispatchError> {
-        let result = self.registry.active_owner(id)?.child_mut()?.post(length);
-        // Conservative policy: even local admission rejection closes this attempt.
-        // Native uncertain post must never remain dispatchable after an error.
-        if result.is_err() {
+        let outcome = self
+            .registry
+            .active_owner(id)?
+            .child_mut()?
+            .post_routed(length);
+        let (context, error) = match outcome {
+            ChildPostOutcome::Posted(context) => (Some(context), None),
+            ChildPostOutcome::Uncertain { context, error } => (Some(context), Some(error)),
+            ChildPostOutcome::Rejected(error) => (None, Some(error)),
+        };
+        if let Some(context) = context {
+            let jetty = self.registry.retained_owner(id)?.child_mut()?.jetty();
+            match self.routes.entry(context) {
+                Entry::Vacant(entry) => {
+                    entry.insert(ReadRoute {
+                        owner: id,
+                        jetty,
+                        length,
+                    });
+                }
+                Entry::Occupied(_) => {
+                    self.registry.quarantine(id, QuarantineReason::WrongProof)?;
+                    return Err(FfiError::Contract("duplicate READ completion context").into());
+                }
+            }
+        }
+        if let Some(error) = error {
+            // Conservative policy: even local admission rejection closes this
+            // attempt. An uncertain accepted WR remains routed while quarantined.
             self.registry
                 .quarantine(id, QuarantineReason::PostUncertain)?;
+            return Err(error.into());
         }
-        result.map_err(Into::into)
+        Ok(context.expect("successful READ post has a context"))
+    }
+
+    pub(crate) fn outstanding_completions(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Decode a send-JFC CQE using the context route installed at post time.
+    /// The real provider reports READ with opcode=0 and completion_len=0, so
+    /// neither field participates in identity or length validation.
+    pub(crate) fn route_completion(
+        &mut self,
+        record: super::ffi::CompletionRecord,
+        recv_queue: bool,
+    ) -> Option<Result<(), ReadDispatchError>> {
+        if !record.user_ctx_valid || !is_read_context(record.user_ctx) {
+            return None;
+        }
+        let Some(route) = self.routes.get(&record.user_ctx).copied() else {
+            return Some(Err(
+                FfiError::Contract("unknown or duplicate READ CQE").into()
+            ));
+        };
+        if recv_queue
+            || record.event_kind != super::ffi::CompletionEventKind::WorkRequest
+            || record.is_recv
+            || !record.is_jetty
+            || record.local_id != route.jetty
+        {
+            let error = self
+                .registry
+                .quarantine(route.owner, QuarantineReason::WrongProof)
+                .map_or_else(ReadDispatchError::Registry, |_| {
+                    ReadDispatchError::Native(FfiError::Contract(
+                        "READ CQE queue or native identity mismatch",
+                    ))
+                });
+            return Some(Err(error));
+        }
+        // SAFETY: A route exists only after the matching native post retained
+        // its WR. Provider probe established that a work-request event on the
+        // send JFC with valid user_ctx retires that READ; status selects success.
+        let retired = unsafe {
+            ReadRetired::new(
+                route.owner,
+                route.jetty,
+                record.user_ctx,
+                route.length,
+                record.status == 0,
+            )
+        };
+        Some(self.complete(route.owner, retired))
     }
     pub(crate) fn complete(
         &mut self,
         id: ReadOwnerId,
         completion: ReadRetired,
     ) -> Result<(), ReadDispatchError> {
+        let context = completion.context();
         let result = self
             .registry
             .retained_owner(id)?
@@ -228,12 +321,32 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .complete(completion);
         if result.is_err() {
             self.registry.quarantine(id, QuarantineReason::WrongProof)?;
+        } else {
+            self.routes.remove(&context);
         }
         result.map_err(Into::into)
     }
     pub(crate) fn reap_child(&mut self, id: ReadOwnerId) -> Result<bool, ReapError<FfiError>> {
         self.registry
             .reap_with(id, |bundle| bundle.child_mut()?.reap())
+    }
+}
+
+impl<K, R: ChildResources> super::completion::ReadCompletionSink for ReadOwners<K, R> {
+    fn outstanding_read_completions(&self) -> usize {
+        self.outstanding_completions()
+    }
+
+    fn try_route_read_completion(
+        &mut self,
+        record: super::ffi::CompletionRecord,
+        recv_queue: bool,
+    ) -> Option<super::Result<()>> {
+        self.route_completion(record, recv_queue).map(|result| {
+            result.map_err(|error| {
+                super::Error::Protocol(format!("READ completion routing failed: {error:?}"))
+            })
+        })
     }
 }
 
@@ -392,6 +505,117 @@ mod tests {
         assert_eq!(owners.reap_child(id), Ok(true));
         assert!(owners.drained());
         assert_eq!(closes.get(), 2);
+    }
+    #[test]
+    fn real_provider_read_cqe_routes_by_context_and_send_shape() {
+        let mut owners = setup();
+        let closes = Rc::new(Cell::new(0));
+        let id = create(&mut owners, closes.clone());
+        let context = owners.post(id, 4).unwrap();
+        assert!(is_read_context(context));
+        assert_eq!(owners.outstanding_completions(), 1);
+
+        // Real udma reports READ opcode=0 and completion_len=0; neither field
+        // is a READ identity source.
+        let record = super::super::ffi::CompletionRecord {
+            status: 0,
+            opcode: 0,
+            user_ctx: context,
+            completion_len: 0,
+            local_id: 7,
+            is_recv: false,
+            is_jetty: true,
+            user_ctx_valid: true,
+            event_kind: super::super::ffi::CompletionEventKind::WorkRequest,
+            ..Default::default()
+        };
+        assert_eq!(owners.route_completion(record, false), Some(Ok(())));
+        assert_eq!(owners.outstanding_completions(), 0);
+        assert!(owners.route_completion(record, false).unwrap().is_err());
+        owners.retire(id).unwrap();
+        assert_eq!(owners.reap_child(id), Ok(true));
+        assert_eq!(closes.get(), 2);
+    }
+    #[test]
+    fn read_cqe_wrong_queue_or_jetty_keeps_wr_routed_and_quarantines_owner() {
+        let mut owners = setup();
+        let id = create(&mut owners, Rc::new(Cell::new(0)));
+        let context = owners.post(id, 4).unwrap();
+        let record = super::super::ffi::CompletionRecord {
+            status: 0,
+            user_ctx: context,
+            local_id: 7,
+            is_recv: true,
+            is_jetty: true,
+            user_ctx_valid: true,
+            event_kind: super::super::ffi::CompletionEventKind::WorkRequest,
+            ..Default::default()
+        };
+        assert!(owners.route_completion(record, true).unwrap().is_err());
+        assert_eq!(owners.outstanding_completions(), 1);
+        assert_eq!(owners.usage().quarantined_entries, 1);
+        assert_eq!(owners.reap_child(id), Ok(false));
+    }
+    #[test]
+    fn uncertain_post_is_routed_until_its_error_cqe_retires_the_wr() {
+        struct UncertainMock {
+            context: Rc<Cell<u64>>,
+        }
+        impl ChildResources for UncertainMock {
+            type Wr = ();
+            fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<()>, FfiError> {
+                self.context.set(request.user_ctx);
+                Ok(ChildPost::Uncertain((), FfiError::Status(-5)))
+            }
+            unsafe fn complete(&mut self, _: ()) {}
+            fn unimport(&mut self) -> Result<(), FfiError> {
+                Ok(())
+            }
+            fn close_buffer(&mut self) -> Result<(), FfiError> {
+                Ok(())
+            }
+        }
+        let cap = |bytes, entries| ReadCapacity { bytes, entries };
+        let mut owners: ReadOwners<(), UncertainMock> = ReadOwners::new(ReadBudget {
+            total: cap(16, 4),
+            source: cap(8, 2),
+            destination: cap(8, 2),
+            per_peer_source: cap(8, 2),
+            per_peer_destination: cap(8, 2),
+            quarantine: cap(8, 2),
+        })
+        .unwrap();
+        owners.activate_peer(PEER).unwrap();
+        let context = Rc::new(Cell::new(0));
+        let id = match unsafe {
+            owners.create_child(PEER, SPEC, || {
+                ChildCreation::Ready(UncertainMock {
+                    context: context.clone(),
+                })
+            })
+        } {
+            ChildAdmission::Ready(id) => id,
+            _ => panic!("expected admission"),
+        };
+        assert!(owners.post(id, 4).is_err());
+        let user_ctx = context.get();
+        assert!(is_read_context(user_ctx));
+        assert_eq!(owners.outstanding_completions(), 1);
+        let record = super::super::ffi::CompletionRecord {
+            status: -5,
+            opcode: 0,
+            user_ctx,
+            completion_len: 0,
+            local_id: 7,
+            is_recv: false,
+            is_jetty: true,
+            user_ctx_valid: true,
+            event_kind: super::super::ffi::CompletionEventKind::WorkRequest,
+            ..Default::default()
+        };
+        assert_eq!(owners.route_completion(record, false), Some(Ok(())));
+        assert_eq!(owners.outstanding_completions(), 0);
+        assert_eq!(owners.reap_child(id), Ok(true));
     }
     #[test]
     fn lost_creation_keeps_reservation_and_blocks_further_admission() {

@@ -32,7 +32,7 @@ pub(crate) enum ReadDirection {
     Source,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadCapacity {
     pub(crate) bytes: u64,
     pub(crate) entries: usize,
@@ -47,7 +47,7 @@ impl ReadCapacity {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadBudget {
     pub(crate) total: ReadCapacity,
     pub(crate) destination: ReadCapacity,

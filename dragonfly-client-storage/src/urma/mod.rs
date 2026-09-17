@@ -24,6 +24,8 @@ mod read_owner;
 #[allow(dead_code)]
 mod read_owners;
 #[allow(dead_code)]
+mod read_protocol;
+#[allow(dead_code)]
 mod read_source_owner;
 #[allow(dead_code)]
 mod read_wr_credit;

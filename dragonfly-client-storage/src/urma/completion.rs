@@ -7,6 +7,7 @@ use super::{
     transfer::RoutingToken,
     Error, Result,
 };
+
 use dragonfly_client_metric::collect_urma_rx_anomaly_metrics;
 use std::{
     collections::HashMap,
@@ -14,6 +15,18 @@ use std::{
     time::Instant,
 };
 use tokio::sync::oneshot;
+
+/// Owner-loop hook for READ CQEs sharing the send JFC. Implementations route
+/// by a separately reserved user_ctx namespace and retain native WR ownership.
+#[allow(dead_code)] // Activated with the READ command path; production dispatch remains gated.
+pub(crate) trait ReadCompletionSink {
+    fn outstanding_read_completions(&self) -> usize;
+    fn try_route_read_completion(
+        &mut self,
+        record: ffi::CompletionRecord,
+        recv_queue: bool,
+    ) -> Option<Result<()>>;
+}
 
 const MAX_POLL_BATCH: usize = 16;
 
@@ -691,23 +704,31 @@ impl CompletionRouter {
             })
     }
 
-    pub(crate) fn poll_once(
+    /// Poll the shared JFCs while READ owners are active. READ is checked
+    /// before ordinary WrToken decoding because its context namespace is
+    /// deliberately invalid as a SEND/RECV operation byte.
+    #[allow(dead_code)] // Activated with the READ command path; production dispatch remains gated.
+    pub(crate) fn poll_once_with_read<R: ReadCompletionSink>(
         &mut self,
         send_jfc: &ffi::JfcHandle,
         recv_jfc: &ffi::JfcHandle,
         pool: &mut UrmaBufferPool,
+        read: &mut R,
     ) -> Result<usize> {
         self.stats.poll_calls += 1;
         let mut completed = 0;
         let mut first_error = None;
-        if self.outstanding_send != 0 || self.has_pending_flush() {
-            match self.poll_jfc(send_jfc, false, pool) {
+        if self.outstanding_send != 0
+            || read.outstanding_read_completions() != 0
+            || self.has_pending_flush()
+        {
+            match self.poll_jfc_with_read(send_jfc, false, pool, read) {
                 Ok(count) => completed += count,
                 Err(error) => first_error = Some(error),
             }
         }
         if self.outstanding_recv != 0 {
-            match self.poll_jfc(recv_jfc, true, pool) {
+            match self.poll_jfc_with_read(recv_jfc, true, pool, read) {
                 Ok(count) => completed += count,
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -723,18 +744,78 @@ impl CompletionRouter {
         Ok(completed)
     }
 
-    fn poll_jfc(
+    #[allow(dead_code)] // Activated with the READ command path; production dispatch remains gated.
+    pub(crate) fn outstanding_with_read<R: ReadCompletionSink>(&self, read: &R) -> usize {
+        self.outstanding_total
+            .saturating_add(read.outstanding_read_completions())
+    }
+
+    /// READ-only progress path. No registered SEND/RECV buffer pool exists in
+    /// this mode, so every ordinary WR CQE must be consumed by the READ sink.
+    pub(crate) fn poll_read_only<R: ReadCompletionSink>(
+        &mut self,
+        send_jfc: &ffi::JfcHandle,
+        read: &mut R,
+    ) -> Result<usize> {
+        if self.outstanding_total != 0 {
+            return Err(Error::Protocol(
+                "legacy SEND/RECV WR is tracked in READ-only mode".into(),
+            ));
+        }
+        self.stats.poll_calls += 1;
+        let completed = if read.outstanding_read_completions() != 0 || self.has_pending_flush() {
+            let mut records = [ffi::CompletionRecord::default(); MAX_POLL_BATCH];
+            let count = send_jfc
+                .poll_into(&mut records[..self.batch])
+                .map_err(|error| native_error("poll_read_jfc", error))?;
+            drain_batch(records.into_iter().take(count), |record| {
+                if let Some(result) = read.try_route_read_completion(record, false) {
+                    return result;
+                }
+                match record.event_kind {
+                    ffi::CompletionEventKind::FlushErrorDone => {
+                        self.route_flush_done(record, false)
+                    }
+                    ffi::CompletionEventKind::SuspendDone => Err(Error::Protocol(format!(
+                        "unexpected WR_SUSPEND_DONE lifecycle CQE on native object {}",
+                        record.local_id
+                    ))),
+                    ffi::CompletionEventKind::Unknown(kind) => Err(Error::Protocol(format!(
+                        "unknown URMA completion event kind {kind}"
+                    ))),
+                    ffi::CompletionEventKind::WorkRequest => Err(Error::Protocol(format!(
+                        "non-READ work-request CQE in READ-only mode: user_ctx={}",
+                        record.user_ctx
+                    ))),
+                }
+            })?
+        } else {
+            0
+        };
+        if completed == 0 {
+            self.stats.empty_polls += 1;
+            std::hint::spin_loop();
+        }
+        Ok(completed)
+    }
+
+    fn poll_jfc_with_read<R: ReadCompletionSink>(
         &mut self,
         jfc: &ffi::JfcHandle,
         recv_queue: bool,
         pool: &mut UrmaBufferPool,
+        read: &mut R,
     ) -> Result<usize> {
         let mut records = [ffi::CompletionRecord::default(); MAX_POLL_BATCH];
         let count = jfc
             .poll_into(&mut records[..self.batch])
             .map_err(|error| native_error("poll_jfc", error))?;
         drain_batch(records.into_iter().take(count), |record| {
-            self.route(record, recv_queue, pool)
+            if let Some(result) = read.try_route_read_completion(record, recv_queue) {
+                result
+            } else {
+                self.route(record, recv_queue, pool)
+            }
         })
     }
 

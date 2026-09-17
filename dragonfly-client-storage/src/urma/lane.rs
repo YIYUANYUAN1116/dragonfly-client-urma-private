@@ -8,6 +8,7 @@ use super::{
     runtime::UrmaDeviceCapability,
     Error, Result,
 };
+use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u32)]
@@ -300,7 +301,7 @@ impl Default for JettyConfig {
 /// and SEND posts must name that target explicitly. This is the single
 /// native data-plane endpoint shared by every PeerTarget.
 pub(crate) struct UrmaJetty {
-    handle: ffi::JettyHandle,
+    handle: Rc<RefCell<ffi::JettyHandle>>,
     local_jetty_id: u32,
     local_jfr_id: u32,
     token: u32,
@@ -328,7 +329,7 @@ impl UrmaJetty {
             .local_ids()
             .map_err(|error| native_error("query_jetty_local_ids", error))?;
         Ok(Self {
-            handle,
+            handle: Rc::new(RefCell::new(handle)),
             local_jetty_id,
             local_jfr_id,
             token: config.token,
@@ -337,8 +338,11 @@ impl UrmaJetty {
     }
 
     pub(crate) fn export_descriptor(&self) -> Result<JettyDescriptor> {
-        let raw = self
+        let handle = self
             .handle
+            .try_borrow()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?;
+        let raw = handle
             .export_descriptor()
             .map_err(|error| native_error("get_rjetty", error))?;
         JettyDescriptor::from_ffi(raw)
@@ -349,7 +353,7 @@ impl UrmaJetty {
     pub(crate) fn import_target(
         &mut self,
         descriptor: &JettyDescriptor,
-    ) -> Result<ffi::TargetHandle> {
+    ) -> Result<Rc<ffi::TargetHandle>> {
         if descriptor.tp_type != self.tp_type {
             return Err(Error::Protocol(format!(
                 "remote Jetty TP type {:?} does not match local {:?}",
@@ -357,6 +361,8 @@ impl UrmaJetty {
             )));
         }
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .import_target(&descriptor.to_ffi()?, self.token)
             .map_err(|error| {
                 Error::Protocol(format!(
@@ -370,16 +376,26 @@ impl UrmaJetty {
                     native_error("import_jetty", error)
                 ))
             })
+            .map(Rc::new)
     }
 
     pub(crate) fn mark_error(&mut self) -> Result<()> {
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .mark_error()
             .map_err(|error| native_error("modify_jetty_error", error))
     }
 
     pub(crate) fn local_ids(&self) -> (u32, u32) {
         (self.local_jetty_id, self.local_jfr_id)
+    }
+
+    /// Shared native identity retained by READ owners. Runtime shutdown must
+    /// drain every clone before closing the JFCs and native context.
+    #[allow(dead_code)] // Used by the gated production READ command factory.
+    pub(crate) fn read_handle(&self) -> Rc<RefCell<ffi::JettyHandle>> {
+        self.handle.clone()
     }
 
     pub(crate) fn post_send_imm(
@@ -392,6 +408,8 @@ impl UrmaJetty {
         imm_data: u64,
     ) -> Result<ffi::WrHandle> {
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .post_send_imm(target, segment, offset, length, user_ctx, imm_data)
             .map_err(|error| native_error("post_jetty_send_imm_wr", error))
     }
@@ -404,6 +422,8 @@ impl UrmaJetty {
         user_ctx: u64,
     ) -> Result<ffi::WrHandle> {
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .post_recv(segment, offset, length, user_ctx)
             .map_err(|error| native_error("post_jetty_recv_wr", error))
     }
@@ -431,6 +451,8 @@ impl UrmaJetty {
             });
         }
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .post_send_imm_list(target, segment, entries)
             .map_err(|error| native_error("post_jetty_send_imm_wr_list", error))
     }
@@ -452,14 +474,25 @@ impl UrmaJetty {
             });
         }
         self.handle
+            .try_borrow_mut()
+            .map_err(|_| Error::Protocol("shared RM Jetty is busy".into()))?
             .post_recv_list(segment, entries)
             .map_err(|error| native_error("post_jetty_recv_wr_list", error))
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
         let mut failures = Vec::new();
-        if let Err(error) = self.handle.close() {
-            failures.push(native_error("delete_jetty", error).to_string());
+        if Rc::strong_count(&self.handle) != 1 {
+            failures.push("shared RM Jetty is still retained by READ owners".into());
+        } else {
+            match self.handle.try_borrow_mut() {
+                Ok(mut handle) => {
+                    if let Err(error) = handle.close() {
+                        failures.push(native_error("delete_jetty", error).to_string());
+                    }
+                }
+                Err(_) => failures.push("shared RM Jetty is busy during close".into()),
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -493,7 +526,7 @@ pub(crate) struct PeerTarget {
     generation: u8,
     state: PeerTargetLifecycle,
     capability: UrmaDeviceCapability,
-    target: Option<ffi::TargetHandle>,
+    target: Option<Rc<ffi::TargetHandle>>,
     credits: PeerSendCredits,
     post_list_size: usize,
     retirement_armed: bool,
@@ -556,6 +589,17 @@ impl PeerTarget {
             .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?
             .remote_id()
             .map_err(|error| native_error("query_remote_jetty_id", error))
+    }
+
+    /// Retains the imported target while a READ import/WR can still refer to
+    /// it. Peer retirement refuses to unimport until every clone is gone.
+    #[allow(dead_code)] // Used by the gated production READ command factory.
+    pub(crate) fn read_target(&self) -> Result<Rc<ffi::TargetHandle>> {
+        self.require(PeerTargetLifecycle::Ready)?;
+        self.target
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::Protocol("RM target is not imported".into()))
     }
 
     pub(crate) fn grant_send_credit(&mut self, count: u32) -> Result<()> {
@@ -833,12 +877,18 @@ impl PeerTarget {
             )));
         }
         let result = match self.target.as_mut() {
-            Some(target) => match target.close() {
-                Ok(()) => {
-                    self.target = None;
-                    Ok(())
-                }
-                Err(error) => Err(native_error("unimport_jetty", error)),
+            Some(target) => match Rc::get_mut(target) {
+                None => Err(Error::Protocol(format!(
+                    "cannot close PeerTarget {} while READ owners retain it",
+                    self.id
+                ))),
+                Some(target) => match target.close() {
+                    Ok(()) => {
+                        self.target = None;
+                        Ok(())
+                    }
+                    Err(error) => Err(native_error("unimport_jetty", error)),
+                },
             },
             None => Ok(()),
         };
@@ -995,5 +1045,33 @@ mod tests {
         peer.close(0).unwrap();
         assert_eq!(peer.state, PeerTargetLifecycle::Closed);
         assert!(peer.grant_send_credit(1).is_err());
+    }
+
+    #[test]
+    fn read_owners_hold_jetty_and_target_close_gates() {
+        let handle = Rc::new(RefCell::new(ffi::JettyHandle::without_native()));
+        let mut jetty = UrmaJetty {
+            handle: handle.clone(),
+            local_jetty_id: 7,
+            local_jfr_id: 8,
+            token: 0,
+            tp_type: TpType::Rtp,
+        };
+        drop(handle);
+        let read_jetty = jetty.read_handle();
+        assert!(jetty.close().is_err());
+        drop(read_jetty);
+        jetty.close().unwrap();
+
+        let mut peer = PeerTarget::new(7, 2, capability(), 1).unwrap();
+        peer.target = Some(Rc::new(ffi::TargetHandle::without_native()));
+        peer.state = PeerTargetLifecycle::Ready;
+        let read_target = peer.read_target().unwrap();
+        peer.begin_draining().unwrap();
+        assert!(peer.close(0).is_err());
+        assert_eq!(peer.state, PeerTargetLifecycle::Failed);
+        drop(read_target);
+        peer.close(0).unwrap();
+        assert_eq!(peer.state, PeerTargetLifecycle::Closed);
     }
 }

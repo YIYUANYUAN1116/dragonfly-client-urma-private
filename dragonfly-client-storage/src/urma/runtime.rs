@@ -3,9 +3,61 @@ use super::{
         BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
         RxBufferStateCounts, TxWindowLease,
     },
+    ffi::read::{source::ReadBacking, ReadDescriptor, ReadToken},
+    read_owner::{ReadBudget, ReadOwnerId},
     Error, Result,
 };
 use dragonfly_client_metric::collect_urma_rx_state_metrics;
+
+pub(crate) struct ReadChildRequest {
+    pub(crate) peer_id: u16,
+    pub(crate) allocation_bytes: u64,
+    pub(crate) piece_length: u64,
+    pub(crate) max_outstanding: usize,
+    pub(crate) descriptor: ReadDescriptor,
+    pub(crate) token: ReadToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadChildId(ReadOwnerId);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the gated READ session state machine.
+pub(crate) enum ReadChildAdmission {
+    Ready(ReadChildId),
+    Quarantined { id: ReadChildId, error: Error },
+}
+
+pub(crate) struct ReadSourceRequest {
+    pub(crate) peer_id: u16,
+    pub(crate) backing: ReadBacking<()>,
+    pub(crate) token: ReadToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadSourceId(ReadOwnerId);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the gated READ session state machine.
+pub(crate) struct ReadSourceOffer {
+    pub(crate) id: ReadSourceId,
+    pub(crate) descriptor: ReadDescriptor,
+    pub(crate) token: ReadToken,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the gated READ session state machine.
+pub(crate) enum ReadSourceAdmission {
+    Ready(ReadSourceOffer),
+    Quarantined { id: ReadSourceId, error: Error },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReadRuntimeConfig {
+    pub(crate) budget: ReadBudget,
+    pub(crate) max_outstanding_per_peer: usize,
+    pub(crate) buffer_alignment: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeConfig {
@@ -15,6 +67,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) recv_jfc_depth: u32,
     pub(crate) buffer_pool: BufferPoolConfig,
     pub(crate) tp_type: crate::urma::TpType,
+    pub(crate) read: Option<ReadRuntimeConfig>,
 }
 
 impl RuntimeConfig {
@@ -26,6 +79,7 @@ impl RuntimeConfig {
             recv_jfc_depth: 4096,
             buffer_pool: BufferPoolConfig::default(),
             tp_type: crate::urma::TpType::default(),
+            read: None,
         }
     }
 
@@ -58,6 +112,13 @@ impl RuntimeConfig {
         self.tp_type = tp_type;
         self
     }
+
+    /// Enables the READ-only data plane. Once enabled, the full effective JFS
+    /// depth is reserved for READ and legacy SEND/RECV posts are rejected.
+    pub(crate) fn with_read_only(mut self, read: ReadRuntimeConfig) -> Self {
+        self.read = Some(read);
+        self
+    }
 }
 
 fn effective_max_message_size(device_max: u64, slot_size: usize) -> Result<u64> {
@@ -70,15 +131,21 @@ fn shared_endpoint_config(
     runtime: &RuntimeConfig,
     capability: &UrmaDeviceCapability,
 ) -> crate::urma::lane::JettyConfig {
+    let send_depth = runtime.send_jfc_depth.min(capability.max_jfs_depth);
+    let send_depth = if runtime.read.is_some() {
+        send_depth
+    } else {
+        send_depth.min(u32::try_from(runtime.buffer_pool.tx_slot_count).unwrap_or(u32::MAX))
+    };
+    let recv_depth = runtime.recv_jfc_depth.min(capability.max_jfr_depth);
+    let recv_depth = if runtime.read.is_some() {
+        recv_depth
+    } else {
+        recv_depth.min(u32::try_from(runtime.buffer_pool.rx_slot_count).unwrap_or(u32::MAX))
+    };
     crate::urma::lane::JettyConfig {
-        send_depth: runtime
-            .send_jfc_depth
-            .min(capability.max_jfs_depth)
-            .min(u32::try_from(runtime.buffer_pool.tx_slot_count).unwrap_or(u32::MAX)),
-        recv_depth: runtime
-            .recv_jfc_depth
-            .min(capability.max_jfr_depth)
-            .min(u32::try_from(runtime.buffer_pool.rx_slot_count).unwrap_or(u32::MAX)),
+        send_depth,
+        recv_depth,
         max_send_sge: 1,
         max_recv_sge: 1,
         token: 0,
@@ -111,12 +178,20 @@ mod native {
     use crate::urma::{
         buffer::UrmaBufferPool,
         completion::{
-            deadline_after, deadline_expired, CompletionRouter, RegisteredRxCompletionTx,
-            RegisteredTxCompletionTx,
+            deadline_after, deadline_expired, CompletionRouter, ReadCompletionSink,
+            RegisteredRxCompletionTx, RegisteredTxCompletionTx,
         },
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, PeerTarget, TransportMode, UrmaJetty},
         native_error,
+        read_child_owner::NativeChild,
+        read_owner::ReadPeer,
+        read_owners::ReadOwners,
+        read_owners::{ChildAdmission, ChildSpec, ReadDispatchError},
+        read_source_owner::{
+            SourceAdmission, SourceAdmissionError, SourceRevoked, UnregisterPermit,
+        },
+        read_wr_credit::{CreditedChild, ReadWrCredits},
     };
     use std::{
         collections::HashMap,
@@ -226,6 +301,99 @@ mod native {
         descriptor: JettyDescriptor,
     }
 
+    type RuntimeReadOwners = ReadOwners<(), CreditedChild<NativeChild<()>>>;
+
+    /// The concrete READ owner container lives on the single fabric owner
+    /// thread. RuntimeConfig selects Disabled or the READ-only Active state at
+    /// startup; it never switches modes while native objects are live.
+    enum RuntimeReadState {
+        Disabled,
+        Active {
+            owners: RuntimeReadOwners,
+            credits: Rc<std::cell::RefCell<ReadWrCredits>>,
+            max_outstanding_per_peer: usize,
+            buffer_alignment: u64,
+        },
+    }
+
+    impl RuntimeReadState {
+        fn activate_peer(&mut self, peer: ReadPeer) -> Result<()> {
+            match self {
+                Self::Disabled => Ok(()),
+                Self::Active { owners, .. } => owners.activate_peer(peer).map_err(read_owner_error),
+            }
+        }
+
+        fn drain_peer(&mut self, peer: ReadPeer) -> Result<()> {
+            match self {
+                Self::Disabled => Ok(()),
+                Self::Active { owners, .. } => owners.drain_peer(peer).map_err(read_owner_error),
+            }
+        }
+
+        fn peer_drained(&self, peer: ReadPeer) -> bool {
+            match self {
+                Self::Disabled => true,
+                Self::Active { owners, .. } => owners.peer_drained(peer),
+            }
+        }
+
+        fn begin_shutdown(&mut self) {
+            if let Self::Active { owners, .. } = self {
+                owners.begin_shutdown();
+            }
+        }
+
+        fn drained(&self) -> bool {
+            match self {
+                Self::Disabled => true,
+                Self::Active { owners, .. } => owners.drained(),
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            matches!(self, Self::Active { .. })
+        }
+    }
+
+    impl ReadCompletionSink for RuntimeReadState {
+        fn outstanding_read_completions(&self) -> usize {
+            match self {
+                Self::Disabled => 0,
+                Self::Active { owners, .. } => owners.outstanding_read_completions(),
+            }
+        }
+
+        fn try_route_read_completion(
+            &mut self,
+            record: ffi::CompletionRecord,
+            recv_queue: bool,
+        ) -> Option<Result<()>> {
+            match self {
+                Self::Disabled => None,
+                Self::Active { owners, .. } => owners.try_route_read_completion(record, recv_queue),
+            }
+        }
+    }
+
+    fn read_owner_error(error: super::super::read_owner::OwnerError) -> Error {
+        Error::Protocol(error.to_string())
+    }
+
+    fn read_dispatch_error(error: ReadDispatchError) -> Error {
+        match error {
+            ReadDispatchError::Registry(error) => read_owner_error(error),
+            ReadDispatchError::Native(error) => native_error("read_owner", error),
+        }
+    }
+
+    fn read_source_error(operation: &'static str, error: SourceAdmissionError) -> Error {
+        match error {
+            SourceAdmissionError::Budget(error) => read_owner_error(error),
+            SourceAdmissionError::Native(error) => native_error(operation, error),
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct SharedRxStateSnapshot {
         physical: RxBufferStateCounts,
@@ -295,10 +463,20 @@ mod native {
         peer_ids: PeerIdAllocator,
         peers: HashMap<u16, PeerTarget>,
         completions: CompletionRouter,
+        read: RuntimeReadState,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
     impl UrmaRuntime {
+        fn reject_legacy_data_plane_when_read_only(&self) -> Result<()> {
+            if self.read.is_active() {
+                return Err(Error::Protocol(
+                    "legacy URMA SEND/RECV data plane is disabled in READ-only mode".into(),
+                ));
+            }
+            Ok(())
+        }
+
         pub(crate) fn start(
             config: RuntimeConfig,
             recycle_notifier: LeaseRecycleNotifier,
@@ -343,11 +521,15 @@ mod native {
             }
             let max_payload_size =
                 effective_max_message_size(capability.max_msg_size, config.buffer_pool.slot_size)?;
-            let max_post_list_size = config
-                .send_jfc_depth
-                .min(config.recv_jfc_depth)
-                .min(u32::try_from(config.buffer_pool.tx_slot_count).unwrap_or(u32::MAX))
-                .min(u32::try_from(config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX));
+            let max_post_list_size = if config.read.is_some() {
+                config.send_jfc_depth.min(config.recv_jfc_depth)
+            } else {
+                config
+                    .send_jfc_depth
+                    .min(config.recv_jfc_depth)
+                    .min(u32::try_from(config.buffer_pool.tx_slot_count).unwrap_or(u32::MAX))
+                    .min(u32::try_from(config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX))
+            };
             let endpoint_config = shared_endpoint_config(&config, &capability);
             validate_jetty_config(&endpoint_config, &capability)?;
 
@@ -371,31 +553,73 @@ mod native {
                         ));
                     }
                 };
-            let buffer_pool = match UrmaBufferPool::create(
-                &mut native,
-                config.buffer_pool.clone(),
-                recycle_notifier,
-            ) {
-                Ok(pool) => pool,
-                Err(primary) => {
-                    return Err(rollback_startup(
-                        primary,
-                        None,
-                        Some(recv_jfc),
-                        Some(send_jfc),
-                        Some(native),
-                    ));
+            let buffer_pool = if config.read.is_some() {
+                None
+            } else {
+                match UrmaBufferPool::create(
+                    &mut native,
+                    config.buffer_pool.clone(),
+                    recycle_notifier,
+                ) {
+                    Ok(pool) => Some(pool),
+                    Err(primary) => {
+                        return Err(rollback_startup(
+                            primary,
+                            None,
+                            Some(recv_jfc),
+                            Some(send_jfc),
+                            Some(native),
+                        ));
+                    }
                 }
             };
 
             debug_assert_eq!(send_jfc.kind(), JfcKind::Send);
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
+            let read = match config.read {
+                Some(read) => {
+                    let credits = match ReadWrCredits::new(
+                        endpoint_config.send_depth as usize,
+                        read.max_outstanding_per_peer,
+                    ) {
+                        Ok(credits) => credits,
+                        Err(error) => {
+                            return Err(rollback_startup(
+                                native_error("create_read_wr_credits", error),
+                                buffer_pool,
+                                Some(recv_jfc),
+                                Some(send_jfc),
+                                Some(native),
+                            ))
+                        }
+                    };
+                    let owners = match ReadOwners::new(read.budget) {
+                        Ok(owners) => owners,
+                        Err(error) => {
+                            return Err(rollback_startup(
+                                read_owner_error(error),
+                                buffer_pool,
+                                Some(recv_jfc),
+                                Some(send_jfc),
+                                Some(native),
+                            ))
+                        }
+                    };
+                    RuntimeReadState::Active {
+                        owners,
+                        credits,
+                        max_outstanding_per_peer: read.max_outstanding_per_peer,
+                        buffer_alignment: read.buffer_alignment,
+                    }
+                }
+                None => RuntimeReadState::Disabled,
+            };
             Ok(Self {
                 capability,
                 max_payload_size,
                 max_post_list_size,
                 endpoint_config,
-                buffer_pool: Some(buffer_pool),
+                buffer_pool,
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
                 native: Some(native),
@@ -405,6 +629,7 @@ mod native {
                 peer_ids: PeerIdAllocator::new(),
                 peers: HashMap::new(),
                 completions: CompletionRouter::new(16)?,
+                read,
                 _not_send_sync: PhantomData,
             })
         }
@@ -469,6 +694,14 @@ mod native {
                     return Err(error);
                 }
             };
+            let read_peer = ReadPeer {
+                id: peer_id,
+                generation,
+            };
+            if let Err(error) = self.read.activate_peer(read_peer) {
+                self.peer_ids.release(peer_id);
+                return Err(error);
+            }
             self.peers.insert(peer_id, peer);
             Ok((peer_id, endpoint.descriptor.clone()))
         }
@@ -495,12 +728,254 @@ mod native {
                 .authorize_remote(peer_id, generation, remote_id)
         }
 
+        /// # Safety
+        /// The caller must have authenticated descriptor/token ownership and
+        /// generation, validated exact Piece bounds, and reserved the business
+        /// transfer identity. This owner-thread call supplies native/byte/JFS
+        /// ownership but cannot establish those wire-level facts itself.
+        pub(crate) unsafe fn create_read_child(
+            &mut self,
+            request: ReadChildRequest,
+        ) -> Result<ReadChildAdmission> {
+            if request.max_outstanding == 0 || request.piece_length == 0 {
+                return Err(Error::InvalidConfiguration(
+                    "invalid READ Child request".into(),
+                ));
+            }
+            let peer = self.peers.get(&request.peer_id).ok_or_else(|| {
+                Error::Protocol(format!("unknown URMA PeerTarget {}", request.peer_id))
+            })?;
+            let read_peer = ReadPeer {
+                id: request.peer_id,
+                generation: peer.generation(),
+            };
+            let target = peer.read_target()?;
+            let endpoint = self
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| Error::Protocol("shared RM endpoint is not created".into()))?;
+            let (jetty_id, _) = endpoint.jetty.local_ids();
+            let jetty = endpoint.jetty.read_handle();
+            let native = self
+                .native
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
+            let (owners, credits, configured_max, alignment) = match &mut self.read {
+                RuntimeReadState::Disabled => {
+                    return Err(Error::InvalidConfiguration(
+                        "READ-only runtime is not enabled".into(),
+                    ))
+                }
+                RuntimeReadState::Active {
+                    owners,
+                    credits,
+                    max_outstanding_per_peer,
+                    buffer_alignment,
+                } => (
+                    owners,
+                    credits.clone(),
+                    *max_outstanding_per_peer,
+                    *buffer_alignment,
+                ),
+            };
+            if request.max_outstanding > configured_max {
+                return Err(Error::InvalidConfiguration(format!(
+                    "READ Child max_outstanding={} exceeds per-peer limit {configured_max}",
+                    request.max_outstanding
+                )));
+            }
+            let spec = ChildSpec {
+                allocation_bytes: request.allocation_bytes,
+                piece_length: request.piece_length,
+                jetty_id,
+                max_outstanding: request.max_outstanding,
+            };
+            // SAFETY: The caller provides authenticated descriptor/generation
+            // and exact Piece ownership; runtime supplies the retained handles,
+            // byte registry and READ-only JFS credits.
+            match unsafe {
+                owners.create_native_child(
+                    read_peer,
+                    spec,
+                    native,
+                    jetty,
+                    target,
+                    alignment,
+                    &request.descriptor,
+                    &request.token,
+                    self.capability.max_read_size,
+                    (),
+                    credits,
+                )
+            } {
+                ChildAdmission::Ready(id) => Ok(ReadChildAdmission::Ready(ReadChildId(id))),
+                ChildAdmission::Rejected(error) => Err(read_dispatch_error(error)),
+                ChildAdmission::Quarantined { id, error } => Ok(ReadChildAdmission::Quarantined {
+                    id: ReadChildId(id),
+                    error: native_error("create_read_child", error),
+                }),
+            }
+        }
+
+        pub(crate) fn post_read_child(&mut self, id: ReadChildId, length: u32) -> Result<u64> {
+            match &mut self.read {
+                RuntimeReadState::Disabled => Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                )),
+                RuntimeReadState::Active { owners, .. } => {
+                    owners.post(id.0, length).map_err(read_dispatch_error)
+                }
+            }
+        }
+
+        /// Registers one immutable Parent Piece and exports the descriptor on the
+        /// native owner thread. The token is returned only with a usable offer.
+        ///
+        /// # Safety
+        /// The caller must hold an immutable, exact-range Storage backing lease,
+        /// enforce source admission, and bind this request to the authenticated
+        /// peer/transfer generation. The backing must satisfy provider alignment.
+        pub(crate) unsafe fn register_read_source(
+            &mut self,
+            request: ReadSourceRequest,
+        ) -> Result<ReadSourceAdmission> {
+            let peer = self.peers.get(&request.peer_id).ok_or_else(|| {
+                Error::Protocol(format!("unknown URMA PeerTarget {}", request.peer_id))
+            })?;
+            let read_peer = ReadPeer {
+                id: request.peer_id,
+                generation: peer.generation(),
+            };
+            let native = self
+                .native
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            let ReadSourceRequest { backing, token, .. } = request;
+            // SAFETY: The caller supplies immutable exact-range backing and
+            // authenticated generation; the owner registry supplies admission.
+            match unsafe { owners.register_source(read_peer, native, backing, &token) } {
+                SourceAdmission::Registered(id) => match owners.source_descriptor(id) {
+                    Ok(descriptor) => Ok(ReadSourceAdmission::Ready(ReadSourceOffer {
+                        id: ReadSourceId(id),
+                        descriptor,
+                        token,
+                    })),
+                    Err(error) => {
+                        // No descriptor is returned. Retain the source and charge
+                        // until the normal unregister/revocation path reaps it.
+                        owners.retire(id).map_err(read_owner_error)?;
+                        Ok(ReadSourceAdmission::Quarantined {
+                            id: ReadSourceId(id),
+                            error: read_source_error("read_source_descriptor", error),
+                        })
+                    }
+                },
+                SourceAdmission::Rejected { error, backing } => {
+                    // Rejected proves registration never began, so this backing is
+                    // safe to release on the owner thread.
+                    drop(backing);
+                    Err(read_source_error("register_read_source", error))
+                }
+                SourceAdmission::Uncertain { id, error } => Ok(ReadSourceAdmission::Quarantined {
+                    id: ReadSourceId(id),
+                    error: native_error("register_read_source", error),
+                }),
+            }
+        }
+
+        /// Stops descriptor dispatch. This is only the local first step of
+        /// revocation and does not release native state, backing, or budget.
+        pub(crate) fn retire_read_source(&mut self, id: ReadSourceId) -> Result<()> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners.retire(id.0).map_err(read_owner_error)
+        }
+
+        /// Runs native unregister while retaining backing and budget.
+        ///
+        /// # Safety
+        /// The caller must prove the provider's unregister preconditions for this
+        /// exact source. ReadDone, EOF, and timeout alone are insufficient.
+        pub(crate) unsafe fn unregister_read_source(&mut self, id: ReadSourceId) -> Result<bool> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            // SAFETY: The caller supplied the provider-specific drain proof.
+            let permit = unsafe { UnregisterPermit::new(id.0) };
+            owners
+                .reap_source(id.0, &permit, None)
+                .map_err(|error| match error {
+                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
+                    super::super::read_owner::ReapError::Cleanup(error) => {
+                        native_error("unregister_read_source", error)
+                    }
+                })
+        }
+
+        /// Releases the source only after independent remote revocation proof.
+        /// This retries unregister first if a previous attempt was uncertain.
+        ///
+        /// # Safety
+        /// The caller must prove both unregister preconditions and that access to
+        /// this exact generation has ceased and cannot resume, including stale
+        /// tokens and failed-registration rollback.
+        pub(crate) unsafe fn release_read_source_after_revoke(
+            &mut self,
+            id: ReadSourceId,
+        ) -> Result<bool> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            // SAFETY: Both identity-bound proofs are supplied by the caller.
+            let permit = unsafe { UnregisterPermit::new(id.0) };
+            // SAFETY: See method contract.
+            let revoked = unsafe { SourceRevoked::new(id.0) };
+            owners
+                .reap_source(id.0, &permit, Some(&revoked))
+                .map_err(|error| match error {
+                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
+                    super::super::read_owner::ReapError::Cleanup(error) => {
+                        native_error("release_read_source_after_revoke", error)
+                    }
+                })
+        }
+
+        /// Cleanup-only retirement. A later Storage handoff must extract an
+        /// independently owned destination lease before invoking this path.
+        pub(crate) fn retire_read_child_for_cleanup(&mut self, id: ReadChildId) -> Result<bool> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners.retire(id.0).map_err(read_owner_error)?;
+            owners.reap_child(id.0).map_err(|error| match error {
+                super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
+                super::super::read_owner::ReapError::Cleanup(error) => {
+                    native_error("reap_read_child", error)
+                }
+            })
+        }
+
         pub(crate) fn post_receive_window_registered(
             &mut self,
             peer_id: u16,
             sequences: Vec<u64>,
             completion_txs: Vec<RegisteredRxCompletionTx>,
         ) -> Result<()> {
+            self.reject_legacy_data_plane_when_read_only()?;
             let pool = self
                 .buffer_pool
                 .as_mut()
@@ -525,6 +1000,7 @@ mod native {
         }
 
         pub(crate) fn grant_send_credit(&mut self, peer_id: u16, count: u32) -> Result<()> {
+            self.reject_legacy_data_plane_when_read_only()?;
             self.peer_mut(peer_id)?.grant_send_credit(count)
         }
 
@@ -535,6 +1011,7 @@ mod native {
             sequences: Vec<u64>,
             completion: RegisteredTxCompletionTx,
         ) -> Result<()> {
+            self.reject_legacy_data_plane_when_read_only()?;
             let pool = self
                 .buffer_pool
                 .as_mut()
@@ -562,17 +1039,24 @@ mod native {
                 .send_jfc
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("send JFC is closed".into()))?;
-            let recv_jfc = self
-                .recv_jfc
-                .as_ref()
-                .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
-            let pool = self
-                .buffer_pool
-                .as_mut()
-                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?;
-            let progress = self
-                .completions
-                .poll_once(send_jfc.handle(), recv_jfc.handle(), pool);
+            let progress =
+                if self.read.is_active() {
+                    self.completions
+                        .poll_read_only(send_jfc.handle(), &mut self.read)
+                } else {
+                    let recv_jfc = self.recv_jfc.as_ref().ok_or_else(|| {
+                        Error::InvalidConfiguration("receive JFC is closed".into())
+                    })?;
+                    let pool = self.buffer_pool.as_mut().ok_or_else(|| {
+                        Error::InvalidConfiguration("buffer pool is closed".into())
+                    })?;
+                    self.completions.poll_once_with_read(
+                        send_jfc.handle(),
+                        recv_jfc.handle(),
+                        pool,
+                        &mut self.read,
+                    )
+                };
             if let Err(error) = &progress {
                 self.completions.fail_pending(error);
             }
@@ -587,12 +1071,14 @@ mod native {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(count), Ok(())) => Ok(count),
             }?;
-            self.verify_shared_rx_state()?;
+            if !self.read.is_active() {
+                self.verify_shared_rx_state()?;
+            }
             Ok(count)
         }
 
         pub(crate) fn outstanding(&self) -> usize {
-            self.completions.outstanding()
+            self.completions.outstanding_with_read(&self.read)
         }
 
         pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
@@ -696,6 +1182,15 @@ mod native {
         }
 
         pub(crate) fn abort_peer_target(&mut self, peer_id: u16) -> Result<()> {
+            let generation = self
+                .peers
+                .get(&peer_id)
+                .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))?
+                .generation();
+            self.read.drain_peer(ReadPeer {
+                id: peer_id,
+                generation,
+            })?;
             self.completions.begin_peer_retirement(peer_id)?;
             self.peer_mut(peer_id)?.begin_draining()?;
             self.reap_drained_peers()
@@ -713,6 +1208,10 @@ mod native {
                 .filter_map(|(&peer_id, peer)| {
                     (peer.is_draining()
                         && peer.is_retirement_armed()
+                        && self.read.peer_drained(ReadPeer {
+                            id: peer_id,
+                            generation: peer.generation(),
+                        })
                         && self.completions.outstanding_for_peer(peer_id) == 0)
                         .then_some(peer_id)
                 })
@@ -744,6 +1243,7 @@ mod native {
                 });
             }
             self.accepting = false;
+            self.read.begin_shutdown();
             let mut failures = Vec::new();
 
             let peer_ids = self.peers.keys().copied().collect::<Vec<_>>();
@@ -761,7 +1261,7 @@ mod native {
                 }
                 thread::sleep(Duration::from_micros(100));
             }
-            if !self.peers.is_empty() || self.completions.outstanding() != 0 {
+            if !self.peers.is_empty() || self.outstanding() != 0 || !self.read.drained() {
                 // Fatal escalation: the process is going away, so force every
                 // stranded WR on the shared endpoint to complete with an
                 // error (Jetty mark_error + WR_FLUSH_ERR_DONE) and keep
@@ -774,7 +1274,9 @@ mod native {
                     }
                 }
                 let flush_deadline = deadline_after(Duration::from_secs(5));
-                while (!self.peers.is_empty() || !self.completions.endpoint_ready_to_close())
+                while (!self.peers.is_empty()
+                    || !self.completions.endpoint_ready_to_close()
+                    || !self.read.drained())
                     && !deadline_expired(flush_deadline)
                 {
                     if let Err(error) = self.poll_once() {
@@ -784,16 +1286,23 @@ mod native {
                     }
                     thread::sleep(Duration::from_micros(100));
                 }
-                if !self.peers.is_empty() || !self.completions.endpoint_ready_to_close() {
+                if !self.peers.is_empty()
+                    || !self.completions.endpoint_ready_to_close()
+                    || !self.read.drained()
+                {
                     failures.push(format!(
-                        "timed out retiring {} URMA PeerTargets with {} endpoint WRs even after endpoint flush",
+                        "timed out retiring {} URMA PeerTargets with {} endpoint WRs and read_drained={} even after endpoint flush",
                         self.peers.len(),
-                        self.completions.outstanding(),
+                        self.outstanding(),
+                        self.read.drained(),
                     ));
                 }
             }
 
-            if self.peers.is_empty() && self.completions.endpoint_ready_to_close() {
+            if self.peers.is_empty()
+                && self.completions.endpoint_ready_to_close()
+                && self.read.drained()
+            {
                 if let Some(mut endpoint) = self.endpoint.take() {
                     if let Err(error) = endpoint.jetty.close() {
                         failures.push(error.to_string());
@@ -866,6 +1375,26 @@ mod native {
                 "slot_size={slot_size} exceeds max_msg_size={}",
                 capability.max_msg_size
             )));
+        }
+        if let Some(read) = &config.read {
+            if capability.max_read_size == 0 {
+                return Err(Error::InvalidConfiguration(
+                    "device does not advertise URMA READ capability".into(),
+                ));
+            }
+            if read.max_outstanding_per_peer == 0
+                || read.max_outstanding_per_peer
+                    > config.send_jfc_depth.min(capability.max_jfs_depth) as usize
+            {
+                return Err(Error::InvalidConfiguration(
+                    "READ per-peer outstanding limit exceeds effective JFS depth".into(),
+                ));
+            }
+            if read.buffer_alignment < 4096 || !read.buffer_alignment.is_power_of_two() {
+                return Err(Error::InvalidConfiguration(
+                    "READ buffer alignment must be a power of two and at least 4096".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1056,6 +1585,35 @@ mod tests {
         let runtime = RuntimeConfig::new("urma0", 0).with_tp_type(crate::urma::TpType::Ctp);
         let endpoint = shared_endpoint_config(&runtime, &capability_for_depths(8, 8));
         assert_eq!(endpoint.tp_type, crate::urma::TpType::Ctp);
+    }
+
+    #[test]
+    fn read_only_mode_reserves_full_jfs_depth_and_changes_shared_identity() {
+        use crate::urma::read_owner::{ReadBudget, ReadCapacity};
+        let cap = |bytes, entries| ReadCapacity { bytes, entries };
+        let read = ReadRuntimeConfig {
+            budget: ReadBudget {
+                total: cap(64 * 1024 * 1024, 8),
+                source: cap(32 * 1024 * 1024, 4),
+                destination: cap(32 * 1024 * 1024, 4),
+                per_peer_source: cap(16 * 1024 * 1024, 2),
+                per_peer_destination: cap(16 * 1024 * 1024, 2),
+                quarantine: cap(16 * 1024 * 1024, 2),
+            },
+            max_outstanding_per_peer: 8,
+            buffer_alignment: 4096,
+        };
+        let mut legacy = RuntimeConfig::new("urma0", 0);
+        legacy.send_jfc_depth = 96;
+        legacy.buffer_pool.tx_slot_count = 4;
+        let read_only = legacy.clone().with_read_only(read);
+        let capability = capability_for_depths(80, 8);
+        assert_eq!(shared_endpoint_config(&legacy, &capability).send_depth, 4);
+        assert_eq!(
+            shared_endpoint_config(&read_only, &capability).send_depth,
+            80
+        );
+        assert_ne!(legacy, read_only);
     }
 
     #[test]
