@@ -94,6 +94,10 @@ struct dfurma_read_source {
     dfurma_runtime_t *runtime;
     urma_target_seg_t *segment;
     urma_token_id_t *token_id;
+    /* Page-aligned private copy of the caller bytes. The provider rejects
+     * register requests whose VA is not page aligned, so the shim never
+     * registers caller memory directly. */
+    void *memory;
     uint64_t va;
     uint64_t length;
     int closing;
@@ -804,7 +808,8 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
 {
     dfurma_read_source_t *source;
     urma_seg_cfg_t cfg = {0};
-    uint64_t va = (uint64_t)(uintptr_t)data;
+    int alloc_status;
+    uint64_t va;
     int error;
 
     if (out == NULL) {
@@ -812,7 +817,7 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     }
     *out = NULL;
     if (runtime == NULL || runtime->context == NULL || data == NULL ||
-        length == 0 || length > PTRDIFF_MAX || length > UINT64_MAX - va) {
+        length == 0 || length > PTRDIFF_MAX) {
         return -EINVAL;
     }
     if (runtime->segment_count == UINT32_MAX) {
@@ -822,12 +827,28 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     if (source == NULL) {
         return -ENOMEM;
     }
+    /* The provider rejects registration of non-page-aligned VAs. Register a
+     * private page-aligned copy of the caller bytes instead, exactly like the
+     * transport lab probe shim does. */
+    alloc_status = posix_memalign(&source->memory, 4096, (size_t)length);
+    if (alloc_status != 0) {
+        free(source);
+        return -alloc_status;
+    }
+    memcpy(source->memory, data, (size_t)length);
+    va = (uint64_t)(uintptr_t)source->memory;
+    if (length > UINT64_MAX - va) {
+        free(source->memory);
+        free(source);
+        return -EINVAL;
+    }
     /* Own the token ID explicitly. The current core unregister path may attempt
      * to free automatically allocated IDs even on unregister failure. */
     errno = 0;
     source->token_id = urma_alloc_token_id(runtime->context);
     if (source->token_id == NULL) {
         error = dfurma_pointer_error(-EIO);
+        free(source->memory);
         free(source);
         return error;
     }
@@ -944,6 +965,8 @@ int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source)
     }
     source->runtime->segment_count--;
     source->token_id = NULL;
+    free(source->memory);
+    source->memory = NULL;
     free(source);
     return 0;
 }

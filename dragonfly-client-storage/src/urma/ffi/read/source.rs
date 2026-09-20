@@ -65,8 +65,9 @@ impl<K> ReadSource<K> {
     /// # Safety
     /// The caller must enforce source byte/Segment admission and immutable Storage
     /// lifetime (including no truncate/overwrite of mmap backing). The provider's
-    /// registration/rollback contract must have passed the deployment gate. Memory
-    /// with insufficient alignment must not be silently registered with wider bounds.
+    /// registration/rollback contract must have passed the deployment gate. The
+    /// shim registers a private page-aligned copy of the caller bytes; caller
+    /// memory is only read synchronously during this call.
     pub(crate) unsafe fn register(
         runtime: &mut NativeRuntime,
         backing: ReadBacking<K>,
@@ -81,7 +82,8 @@ impl<K> ReadSource<K> {
         let bytes = backing.memory.bytes();
         let mut raw = std::ptr::null_mut();
         // SAFETY: The caller provides immutability/admission. Memory is owned and
-        // stable; the shim validates length and does not free external memory.
+        // stable for this synchronous copy; the shim validates length and copies
+        // the bytes into its own page-aligned registration before returning.
         let status = unsafe {
             sys::dfurma_read_source_register(
                 runtime.as_ptr(),
