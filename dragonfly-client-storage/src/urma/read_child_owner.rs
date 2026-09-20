@@ -80,6 +80,19 @@ pub(crate) enum ChildPostOutcome {
     Rejected(FfiError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChildProgress {
+    pub(crate) piece_length: u64,
+    pub(crate) accepted_bytes: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) accepted_wr_count: u64,
+    pub(crate) retired_wr_count: u64,
+    pub(crate) outstanding_wr_count: usize,
+    pub(crate) posting_stopped: bool,
+    pub(crate) failed: bool,
+    pub(crate) read_succeeded: bool,
+}
+
 /// Implementations must retain destination/import/native dependencies until close.
 /// Kept private to this transport module; no CPU buffer access is exposed.
 pub(crate) trait ChildResources {
@@ -265,6 +278,9 @@ pub(crate) struct ChildOwner<R: ChildResources> {
     jetty: u32,
     piece_length: u64,
     posted_bytes: u64,
+    retired_bytes: u64,
+    accepted_wr_count: u64,
+    retired_wr_count: u64,
     max_outstanding: usize,
     stopped: bool,
     failed: bool,
@@ -294,6 +310,9 @@ impl<R: ChildResources> ChildOwner<R> {
             jetty,
             piece_length,
             posted_bytes: 0,
+            retired_bytes: 0,
+            accepted_wr_count: 0,
+            retired_wr_count: 0,
             max_outstanding,
             stopped: invalid,
             failed: invalid,
@@ -318,6 +337,19 @@ impl<R: ChildResources> ChildOwner<R> {
             && !self.lost_handle
             && self.posted_bytes == self.piece_length
             && self.pending.is_empty()
+    }
+    pub(crate) fn progress(&self) -> ChildProgress {
+        ChildProgress {
+            piece_length: self.piece_length,
+            accepted_bytes: self.posted_bytes,
+            retired_bytes: self.retired_bytes,
+            accepted_wr_count: self.accepted_wr_count,
+            retired_wr_count: self.retired_wr_count,
+            outstanding_wr_count: self.pending.len(),
+            posting_stopped: self.stopped,
+            failed: self.failed || self.lost_handle,
+            read_succeeded: self.read_succeeded(),
+        }
     }
     pub(crate) fn post(&mut self, length: u32) -> Result<u64, FfiError> {
         match self.post_routed(length) {
@@ -372,6 +404,7 @@ impl<R: ChildResources> ChildOwner<R> {
         };
         self.pending.insert(context, Pending { length, wr });
         self.posted_bytes += u64::from(length);
+        self.accepted_wr_count += 1;
         if let Some(error) = error {
             self.failed = true;
             self.stop();
@@ -397,6 +430,8 @@ impl<R: ChildResources> ChildOwner<R> {
             .expect("matched pending WR");
         // SAFETY: ReadRetired requires provider evidence; all identity fields match.
         unsafe { self.resources.complete(pending.wr) };
+        self.retired_bytes += u64::from(pending.length);
+        self.retired_wr_count += 1;
         if !record.success {
             self.failed = true;
             self.stop();
@@ -526,6 +561,20 @@ mod tests {
         assert!(owner.post(1).is_err());
         owner.complete(completion(id, second, true)).unwrap();
         assert!(!owner.read_succeeded());
+        assert_eq!(
+            owner.progress(),
+            ChildProgress {
+                piece_length: 8,
+                accepted_bytes: 8,
+                retired_bytes: 4,
+                accepted_wr_count: 2,
+                retired_wr_count: 1,
+                outstanding_wr_count: 1,
+                posting_stopped: false,
+                failed: false,
+                read_succeeded: false,
+            }
+        );
         registry.retire(id).unwrap();
         assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(false));
         assert_eq!(registry.usage().bytes, 8);
@@ -533,6 +582,8 @@ mod tests {
             registry.reap_with(id, |o| {
                 o.complete(completion(id, first, true))?;
                 assert!(o.read_succeeded());
+                assert_eq!(o.progress().retired_wr_count, 2);
+                assert_eq!(o.progress().retired_bytes, 8);
                 o.reap()
             }),
             Ok(true)

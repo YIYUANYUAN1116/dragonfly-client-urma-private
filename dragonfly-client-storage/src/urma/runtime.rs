@@ -28,6 +28,19 @@ pub(crate) enum ReadChildAdmission {
     Quarantined { id: ReadChildId, error: Error },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadChildProgress {
+    pub(crate) piece_length: u64,
+    pub(crate) accepted_bytes: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) accepted_wr_count: u64,
+    pub(crate) retired_wr_count: u64,
+    pub(crate) outstanding_wr_count: usize,
+    pub(crate) posting_stopped: bool,
+    pub(crate) failed: bool,
+    pub(crate) read_succeeded: bool,
+}
+
 pub(crate) struct ReadSourceRequest {
     pub(crate) peer_id: u16,
     pub(crate) backing: ReadBacking<()>,
@@ -826,6 +839,26 @@ mod native {
                     owners.post(id.0, length).map_err(read_dispatch_error)
                 }
             }
+        }
+
+        pub(crate) fn read_child_progress(&mut self, id: ReadChildId) -> Result<ReadChildProgress> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            let progress = owners.child_progress(id.0).map_err(read_dispatch_error)?;
+            Ok(ReadChildProgress {
+                piece_length: progress.piece_length,
+                accepted_bytes: progress.accepted_bytes,
+                retired_bytes: progress.retired_bytes,
+                accepted_wr_count: progress.accepted_wr_count,
+                retired_wr_count: progress.retired_wr_count,
+                outstanding_wr_count: progress.outstanding_wr_count,
+                posting_stopped: progress.posting_stopped,
+                failed: progress.failed,
+                read_succeeded: progress.read_succeeded,
+            })
         }
 
         /// Registers one immutable Parent Piece and exports the descriptor on the

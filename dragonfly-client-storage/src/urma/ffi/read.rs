@@ -36,6 +36,12 @@ impl ReadToken {
     pub(crate) fn new(value: u32) -> Self {
         Self(value)
     }
+
+    /// Consumes the bearer token for authenticated DFUR wire publication.
+    /// Callers must keep the returned value out of logs, metrics and errors.
+    pub(crate) fn into_wire_value(self) -> u32 {
+        self.0
+    }
 }
 
 impl fmt::Debug for ReadToken {

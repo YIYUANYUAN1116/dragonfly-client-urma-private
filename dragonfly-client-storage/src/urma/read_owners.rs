@@ -6,7 +6,7 @@ use super::{
         FfiError, NativeRuntime,
     },
     read_child_owner::{
-        is_read_context, ChildOwner, ChildPostOutcome, ChildResources, ReadRetired,
+        is_read_context, ChildOwner, ChildPostOutcome, ChildProgress, ChildResources, ReadRetired,
     },
     read_owner::{
         OwnerError, QuarantineReason, ReadBudget, ReadDirection, ReadOwnerId, ReadOwnerRegistry,
@@ -260,6 +260,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
 
     pub(crate) fn outstanding_completions(&self) -> usize {
         self.routes.len()
+    }
+
+    pub(crate) fn child_progress(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<ChildProgress, ReadDispatchError> {
+        Ok(self.registry.retained_owner(id)?.child_mut()?.progress())
     }
 
     /// Decode a send-JFC CQE using the context route installed at post time.

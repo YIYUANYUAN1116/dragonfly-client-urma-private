@@ -60,14 +60,14 @@ impl<'a> WireReader<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ReadTransferIdentity {
-    pub(crate) peer_generation: u8,
+    pub(crate) session_generation: u64,
     pub(crate) transfer_id: u32,
     pub(crate) metadata_generation: u64,
 }
 
 impl ReadTransferIdentity {
     pub(crate) fn validate(self) -> Result<()> {
-        if self.peer_generation == 0 || self.transfer_id == 0 || self.metadata_generation == 0 {
+        if self.session_generation == 0 || self.transfer_id == 0 || self.metadata_generation == 0 {
             return Err(protocol(
                 "READ transfer identity contains a zero generation/id",
             ));
@@ -76,14 +76,14 @@ impl ReadTransferIdentity {
     }
 
     fn encode(self, payload: &mut Vec<u8>) {
-        payload.push(self.peer_generation);
+        payload.extend_from_slice(&self.session_generation.to_be_bytes());
         payload.extend_from_slice(&self.transfer_id.to_be_bytes());
         payload.extend_from_slice(&self.metadata_generation.to_be_bytes());
     }
 
     fn decode(reader: &mut WireReader<'_>) -> Result<Self> {
         let identity = Self {
-            peer_generation: reader.u8()?,
+            session_generation: reader.u64()?,
             transfer_id: reader.u32()?,
             metadata_generation: reader.u64()?,
         };
@@ -828,6 +828,10 @@ impl ReadTombstones {
     pub(crate) fn contains(&self, identity: ReadTransferIdentity, generation: Option<u64>) -> bool {
         self.entries.contains(&(identity, generation))
     }
+
+    pub(crate) fn contains_transfer(&self, identity: ReadTransferIdentity) -> bool {
+        self.entries.iter().any(|(retired, _)| *retired == identity)
+    }
 }
 
 #[cfg(test)]
@@ -835,7 +839,7 @@ mod tests {
     use super::*;
 
     const ID: ReadTransferIdentity = ReadTransferIdentity {
-        peer_generation: 3,
+        session_generation: 3,
         transfer_id: 17,
         metadata_generation: 9,
     };
@@ -991,7 +995,7 @@ mod tests {
         assert!(parent
             .on_frame(&ReadFrame::BufferReady {
                 identity: ReadTransferIdentity {
-                    peer_generation: 4,
+                    session_generation: 4,
                     ..ID
                 },
                 accepted_length: 64 * 1024,

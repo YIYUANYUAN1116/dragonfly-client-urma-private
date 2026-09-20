@@ -15,8 +15,8 @@ use super::{
     credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
     runtime::{
-        ReadChildAdmission, ReadChildId, ReadChildRequest, ReadSourceAdmission, ReadSourceId,
-        ReadSourceRequest, RuntimeConfig, UrmaRuntime,
+        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadSourceAdmission,
+        ReadSourceId, ReadSourceRequest, RuntimeConfig, UrmaRuntime,
     },
     Error, Result,
 };
@@ -532,6 +532,12 @@ impl UrmaFabricHandle {
             .await
     }
 
+    #[allow(dead_code)] // Used by the gated READ session adapter.
+    pub(crate) async fn read_child_progress(&self, id: ReadChildId) -> Result<ReadChildProgress> {
+        self.submit(|reply| FabricCommand::ReadChildProgress { id, reply })
+            .await
+    }
+
     #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn retire_read_child_for_cleanup(&self, id: ReadChildId) -> Result<bool> {
         self.submit_urgent(|reply| FabricCommand::RetireReadChild { id, reply })
@@ -948,6 +954,11 @@ enum FabricCommand {
         length: u32,
         reply: oneshot::Sender<Result<u64>>,
     },
+    #[allow(dead_code)] // Gated until the READ session adapter is connected.
+    ReadChildProgress {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<ReadChildProgress>>,
+    },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
     RetireReadChild {
         id: ReadChildId,
@@ -1186,6 +1197,12 @@ fn handle_command(
         FabricCommand::PostReadChild { id, length, reply } => {
             let result =
                 reject_if_poisoned(poisoned).and_then(|()| runtime.post_read_child(id, length));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ReadChildProgress { id, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.read_child_progress(id));
             let _ = reply.send(result);
             OwnerControl::Continue
         }
