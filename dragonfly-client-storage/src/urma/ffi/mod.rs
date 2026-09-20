@@ -58,6 +58,7 @@ pub(crate) struct PostEntry {
     pub(crate) length: u32,
     pub(crate) user_ctx: u64,
     pub(crate) imm_data: Option<u64>,
+    pub(crate) complete_enable: bool,
 }
 
 pub(crate) struct PostBatch {
@@ -560,6 +561,7 @@ impl JettyHandle {
                 length: entry.length,
                 user_ctx: entry.user_ctx,
                 imm_data: entry.imm_data.unwrap_or_default(),
+                complete_enable: u8::from(entry.complete_enable),
             })
             .collect();
         let mut raw_handles = vec![std::ptr::null_mut(); entries.len()];

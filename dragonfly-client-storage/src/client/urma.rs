@@ -442,6 +442,7 @@ impl UrmaClient {
         );
         let peer_config = PeerTargetConfig {
             post_list_size: config.storage.server.urma.post_list_size,
+            send_completion_interval: config.storage.server.urma.send_completion_interval,
             pipeline_depth: config.storage.server.urma.pipeline_depth,
             guaranteed_rx_credits: config.storage.server.urma.peer_guaranteed_rx_credits,
         };
@@ -450,6 +451,7 @@ impl UrmaClient {
             piece_window_chunks = depths.window_chunks,
             max_concurrent_transfers = config.storage.server.urma.max_concurrent_transfers,
             pipeline_depth = config.storage.server.urma.pipeline_depth,
+            send_completion_interval = config.storage.server.urma.send_completion_interval,
             peer_guaranteed_rx_credits = config.storage.server.urma.peer_guaranteed_rx_credits,
             "configured URMA client receive depths"
         );

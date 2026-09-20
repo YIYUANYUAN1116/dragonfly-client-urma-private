@@ -9,7 +9,7 @@ use super::{
 };
 use dragonfly_client_metric::collect_urma_rx_anomaly_metrics;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -229,6 +229,9 @@ struct OutstandingWr {
     // being handled, so a committed entry is always visible before its CQE.
     handle: Option<ffi::WrHandle>,
     sequence: Option<u64>,
+    /// Only signaled SENDs may produce a successful local CQE. RECV entries
+    /// are always effectively signaled and do not use the SEND frontier.
+    signaled: bool,
     completion: Option<CompletionTarget>,
 }
 
@@ -249,6 +252,10 @@ pub(crate) struct CompletionRouter {
     outstanding_total: usize,
     outstanding_send: usize,
     outstanding_recv: usize,
+    /// Provider post order for the one process-wide RM JFS. A signaled SEND
+    /// CQE retires this ordered prefix, including preceding unsignaled WRs
+    /// belonging to other logical PeerTargets.
+    send_order: VecDeque<u64>,
     outstanding_by_peer: HashMap<u16, usize>,
     /// The one process-shared RM endpoint; receive CQEs must resolve their
     /// source through the PeerTargetRegistry because posted RECV WRs are
@@ -272,6 +279,7 @@ impl CompletionRouter {
             outstanding_total: 0,
             outstanding_send: 0,
             outstanding_recv: 0,
+            send_order: VecDeque::new(),
             outstanding_by_peer: HashMap::new(),
             endpoint: None,
             targets: PeerTargetRegistry::default(),
@@ -323,6 +331,12 @@ impl CompletionRouter {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn endpoint_is_flushing(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.waiting_for_flush)
     }
 
     pub(crate) fn authorize_remote(
@@ -499,6 +513,7 @@ impl CompletionRouter {
             user_ctx,
             handle: None,
             sequence: posted_sequence,
+            signaled: true,
             completion: None,
         })
     }
@@ -575,6 +590,7 @@ impl CompletionRouter {
         &mut self,
         user_ctx: u64,
         sequence: u64,
+        signaled: bool,
         completion: RegisteredTxWindowState,
     ) -> Result<()> {
         let token = WrToken::decode(user_ctx)?;
@@ -588,6 +604,7 @@ impl CompletionRouter {
             user_ctx,
             handle: None,
             sequence: Some(sequence),
+            signaled,
             completion: Some(CompletionTarget::RegisteredTx(completion)),
         })
     }
@@ -600,7 +617,19 @@ impl CompletionRouter {
         sequence: u64,
         completion: RegisteredTxWindowState,
     ) -> Result<()> {
-        self.reserve_registered_tx(user_ctx, sequence, completion)?;
+        self.track_registered_tx_with_signal(user_ctx, handle, sequence, true, completion)
+    }
+
+    #[cfg(test)]
+    fn track_registered_tx_with_signal(
+        &mut self,
+        user_ctx: u64,
+        handle: ffi::WrHandle,
+        sequence: u64,
+        signaled: bool,
+        completion: RegisteredTxWindowState,
+    ) -> Result<()> {
+        self.reserve_registered_tx(user_ctx, sequence, signaled, completion)?;
         self.commit_posted(user_ctx, handle);
         Ok(())
     }
@@ -644,6 +673,7 @@ impl CompletionRouter {
         self.outstanding_total += 1;
         match token.operation {
             OperationType::Send => {
+                self.send_order.push_back(user_ctx);
                 self.outstanding_send += 1;
                 *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
                 self.stats.send_post += 1;
@@ -836,38 +866,32 @@ impl CompletionRouter {
             .endpoint
             .as_ref()
             .is_some_and(|endpoint| endpoint.waiting_for_flush);
+        if token.operation == OperationType::Send {
+            return self.route_send_frontier(record, recv_queue, pool, retiring, source);
+        }
         let mut outstanding = self.take_outstanding(record.user_ctx)?;
         outstanding
             .handle
             .take()
             .expect("committed outstanding WR has a native handle")
             .complete();
-        let registered_tx = matches!(
-            outstanding.completion,
-            Some(CompletionTarget::RegisteredTx(_))
-        );
-        let result =
-            if expected_recv != recv_queue || record.is_recv != recv_queue || !record.is_jetty {
-                self.stats.cqe_error += 1;
-                self.decrement_operation(token.operation);
-                (if registered_tx {
-                    pool.complete_tx_lease_send(token.slot)
-                } else {
-                    pool.complete_error(token.slot, token.operation)
-                        .and_then(|()| pool.release(token.slot))
-                })
+        debug_assert_eq!(token.operation, OperationType::Recv);
+        let result = if expected_recv != recv_queue
+            || record.is_recv != recv_queue
+            || !record.is_jetty
+        {
+            self.stats.cqe_error += 1;
+            self.decrement_operation(token.operation);
+            pool.complete_error(token.slot, token.operation)
+                .and_then(|()| pool.release(token.slot))
                 .and(Err(Error::Protocol(
                     "CQE queue/operation flags disagree".into(),
                 )))
-            } else if record.status != 0 {
-                self.stats.cqe_error += 1;
-                self.decrement_operation(token.operation);
-                (if registered_tx {
-                    pool.complete_tx_lease_send(token.slot)
-                } else {
-                    pool.complete_error(token.slot, token.operation)
-                        .and_then(|()| pool.release(token.slot))
-                })
+        } else if record.status != 0 {
+            self.stats.cqe_error += 1;
+            self.decrement_operation(token.operation);
+            pool.complete_error(token.slot, token.operation)
+                .and_then(|()| pool.release(token.slot))
                 .and(Err(Error::Completion {
                     status: record.status,
                     opcode: record.opcode,
@@ -875,70 +899,48 @@ impl CompletionRouter {
                     sequence: outstanding.sequence,
                     post_call: None,
                 }))
-            } else {
-                (|| match token.operation {
-                    OperationType::Send => {
-                        self.outstanding_send -= 1;
-                        self.stats.send_cqe += 1;
-                        if matches!(
-                            outstanding.completion,
-                            Some(CompletionTarget::RegisteredTx(_))
-                        ) {
-                            pool.complete_tx_lease_send(token.slot)?;
-                            Ok(RoutedCompletion::RegisteredTx)
-                        } else {
-                            pool.complete_error(token.slot, token.operation)?;
-                            pool.release(token.slot)?;
-                            Err(Error::Protocol(
-                                "SEND CQE has no registered TX owner".into(),
-                            ))
-                        }
+        } else {
+            (|| {
+                self.outstanding_recv -= 1;
+                self.stats.recv_cqe += 1;
+                let imm_data = record.imm_data;
+                let completion = match self.take_registered_rx(
+                    source.expect("successful receive resolved a source"),
+                    imm_data,
+                ) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        pool.complete_error(token.slot, token.operation)?;
+                        pool.release(token.slot)?;
+                        return Err(error);
                     }
-                    OperationType::Recv => {
-                        self.outstanding_recv -= 1;
-                        self.stats.recv_cqe += 1;
-                        let imm_data = record.imm_data;
-                        let completion = match self.take_registered_rx(
-                            source.expect("successful receive resolved a source"),
-                            imm_data,
-                        ) {
-                            Ok(completion) => completion,
-                            Err(error) => {
-                                pool.complete_error(token.slot, token.operation)?;
-                                pool.release(token.slot)?;
-                                return Err(error);
-                            }
-                        };
-                        outstanding.completion = Some(CompletionTarget::RegisteredRx(completion));
-                        if let Err(error) =
-                            pool.complete_recv_leased(token.slot, record.completion_len)
-                        {
-                            pool.complete_error(token.slot, token.operation)?;
+                };
+                outstanding.completion = Some(CompletionTarget::RegisteredRx(completion));
+                if let Err(error) = pool.complete_recv_leased(token.slot, record.completion_len) {
+                    pool.complete_error(token.slot, token.operation)?;
+                    pool.release(token.slot)?;
+                    return Err(error);
+                }
+                let lease =
+                    match pool.lease_completed_rx_window(&[(token.slot, record.completion_len)]) {
+                        Ok(lease) => lease,
+                        Err(error) => {
                             pool.release(token.slot)?;
                             return Err(error);
                         }
-                        let lease = match pool
-                            .lease_completed_rx_window(&[(token.slot, record.completion_len)])
-                        {
-                            Ok(lease) => lease,
-                            Err(error) => {
-                                pool.release(token.slot)?;
-                                return Err(error);
-                            }
-                        };
-                        Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
-                            // The source peer owns the transfer identity; the
-                            // lease remains attached to the anonymous physical
-                            // receive slot named by user_ctx.
-                            lane_id: source.expect("successful receive resolved a source"),
-                            posted_sequence: outstanding.sequence,
-                            imm_data,
-                            slot: token.slot,
-                            lease,
-                        }))
-                    }
-                })()
-            };
+                    };
+                Ok(RoutedCompletion::RegisteredRx(RegisteredRxCompletion {
+                    // The source peer owns the transfer identity; the
+                    // lease remains attached to the anonymous physical
+                    // receive slot named by user_ctx.
+                    lane_id: source.expect("successful receive resolved a source"),
+                    posted_sequence: outstanding.sequence,
+                    imm_data,
+                    slot: token.slot,
+                    lease,
+                }))
+            })()
+        };
 
         let owner_error = result.as_ref().err().cloned();
         if let Some(completion) = outstanding.completion.take() {
@@ -956,6 +958,131 @@ impl CompletionRouter {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Retires the globally ordered prefix of the one shared RM JFS. With
+    /// `outorder_comp=0`, a successful signaled completion proves that every
+    /// earlier SEND has stopped accessing its registered slot. The ordering
+    /// scope is the physical JFS, not a logical PeerTarget.
+    fn route_send_frontier(
+        &mut self,
+        record: ffi::CompletionRecord,
+        recv_queue: bool,
+        pool: &mut UrmaBufferPool,
+        retiring: bool,
+        source: Option<u16>,
+    ) -> Result<()> {
+        let frontier = self
+            .send_order
+            .iter()
+            .position(|user_ctx| *user_ctx == record.user_ctx)
+            .ok_or_else(|| Error::Protocol("SEND CQE has no ordered frontier".into()))?;
+        let frontier_entry = self.outstanding_for(record.user_ctx)?;
+        if record.status == 0 && !frontier_entry.signaled {
+            self.stats.cqe_error += 1;
+            return Err(Error::Protocol(
+                "successful SEND CQE corresponds to an unsignaled WR".into(),
+            ));
+        }
+        let completion_error = if recv_queue || record.is_recv || !record.is_jetty {
+            Some(Error::Protocol("CQE queue/operation flags disagree".into()))
+        } else if record.status != 0 {
+            Some(Error::Completion {
+                status: record.status,
+                opcode: record.opcode,
+                user_ctx: record.user_ctx,
+                sequence: frontier_entry.sequence,
+                post_call: None,
+            })
+        } else {
+            None
+        };
+
+        if completion_error.is_some() {
+            self.stats.cqe_error += 1;
+        } else {
+            self.stats.send_cqe += 1;
+        }
+
+        let mut first_routing_error = None;
+        for index in 0..=frontier {
+            let user_ctx = self
+                .send_order
+                .pop_front()
+                .expect("frontier position proves a queued SEND");
+            let token = WrToken::decode(user_ctx)?;
+            let mut outstanding = self.take_outstanding(user_ctx)?;
+            outstanding
+                .handle
+                .take()
+                .expect("committed outstanding WR has a native handle")
+                .complete();
+            self.outstanding_send -= 1;
+
+            let result = if index == frontier {
+                completion_error
+                    .as_ref()
+                    .map_or(Ok(RoutedCompletion::RegisteredTx), |error| {
+                        Err(error.clone())
+                    })
+            } else {
+                Ok(RoutedCompletion::RegisteredTx)
+            };
+            let result = if matches!(
+                outstanding.completion,
+                Some(CompletionTarget::RegisteredTx(_))
+            ) {
+                match pool.complete_tx_lease_send(token.slot) {
+                    Ok(()) => result,
+                    Err(error) => {
+                        if first_routing_error.is_none() {
+                            first_routing_error = Some(error.clone());
+                        }
+                        Err(error)
+                    }
+                }
+            } else {
+                let error =
+                    Error::Protocol("SEND frontier entry has no registered TX owner".into());
+                let cleanup_error = pool
+                    .complete_error(token.slot, token.operation)
+                    .and_then(|()| pool.release(token.slot))
+                    .err();
+                if first_routing_error.is_none() {
+                    first_routing_error = Some(cleanup_error.unwrap_or_else(|| error.clone()));
+                }
+                Err(error)
+            };
+            if let Some(completion) = outstanding.completion.take() {
+                completion.send(result);
+            }
+        }
+
+        if let Some(error) = first_routing_error {
+            return Err(error);
+        }
+
+        match completion_error {
+            Some(Error::Completion { .. }) if retiring => Ok(()),
+            Some(Error::Completion { .. }) if source.is_some() => {
+                let peer_id = source.expect("known source checked above");
+                if !self.failed_peers.contains(&peer_id) {
+                    self.failed_peers.push(peer_id);
+                }
+                Ok(())
+            }
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn outstanding_for(&self, user_ctx: u64) -> Result<&OutstandingWr> {
+        let token = WrToken::decode(user_ctx)?;
+        self.outstanding
+            .get(token.slot.index())
+            .and_then(Option::as_ref)
+            .filter(|outstanding| outstanding.user_ctx == user_ctx && outstanding.handle.is_some())
+            .ok_or_else(|| Error::Protocol("CQE has no outstanding WR".into()))
     }
 
     /// A receive CQE has already consumed its provider-side RQE even when its
@@ -1836,6 +1963,202 @@ mod tests {
             )
             .expect("matching native Jetty identity must route");
         assert_eq!(router.outstanding(), 0);
+    }
+
+    #[test]
+    fn signaled_send_cqe_retires_preceding_unsignaled_prefix() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        let contexts = (0..3)
+            .map(|index| {
+                WrToken {
+                    peer_id: 1,
+                    generation: 1,
+                    operation: OperationType::Send,
+                    slot: SlotId::new(index, 1).unwrap(),
+                }
+                .encode()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (completion, receiver) = oneshot::channel();
+        let state = RegisteredTxWindowState::new(
+            1,
+            vec![10, 11, 12],
+            TxWindowLease::from_test_lengths(vec![8, 8, 8]),
+            completion,
+        );
+        for (index, &user_ctx) in contexts.iter().enumerate() {
+            router
+                .track_registered_tx_with_signal(
+                    user_ctx,
+                    ffi::WrHandle::without_native(),
+                    10 + index as u64,
+                    index == 2,
+                    state.clone(),
+                )
+                .unwrap();
+        }
+        state.finish_posting(None);
+        let mut pool = UrmaBufferPool::from_test_slot_states(&[
+            (SlotKind::Tx, SlotState::SendPosted),
+            (SlotKind::Tx, SlotState::SendPosted),
+            (SlotKind::Tx, SlotState::SendPosted),
+        ]);
+
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx: contexts[2],
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .unwrap();
+
+        let completion = receiver.blocking_recv().unwrap().unwrap();
+        assert_eq!(completion.sequences, vec![10, 11, 12]);
+        assert_eq!(router.outstanding(), 0);
+        assert_eq!(router.outstanding_for_peer(1), 0);
+        assert_eq!(router.stats().send_post, 3);
+        assert_eq!(router.stats().send_cqe, 1);
+    }
+
+    #[test]
+    fn successful_cqe_for_unsignaled_send_fails_without_releasing_prefix() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        let user_ctx = WrToken {
+            peer_id: 1,
+            generation: 1,
+            operation: OperationType::Send,
+            slot: SlotId::new(0, 1).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        router
+            .track_registered_tx_with_signal(
+                user_ctx,
+                ffi::WrHandle::without_native(),
+                7,
+                false,
+                RegisteredTxWindowState::new(
+                    1,
+                    vec![7],
+                    TxWindowLease::from_test_lengths(vec![8]),
+                    oneshot::channel().0,
+                ),
+            )
+            .unwrap();
+        let mut pool =
+            UrmaBufferPool::from_test_slot_states(&[(SlotKind::Tx, SlotState::SendPosted)]);
+
+        assert!(router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx,
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .is_err());
+        assert_eq!(router.outstanding(), 1);
+        assert_eq!(router.outstanding_for_peer(1), 1);
+    }
+
+    #[test]
+    fn error_cqe_may_name_unsignaled_send_and_later_frontier_still_drains() {
+        let mut router = CompletionRouter::new(4).unwrap();
+        router.register_endpoint(101, 201).unwrap();
+        authorize_test_peer(&mut router, 1);
+        let contexts = (0..2)
+            .map(|index| {
+                WrToken {
+                    peer_id: 1,
+                    generation: 1,
+                    operation: OperationType::Send,
+                    slot: SlotId::new(index, 1).unwrap(),
+                }
+                .encode()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (completion, mut receiver) = oneshot::channel();
+        let state = RegisteredTxWindowState::new(
+            1,
+            vec![10, 11],
+            TxWindowLease::from_test_lengths(vec![8, 8]),
+            completion,
+        );
+        for (index, &user_ctx) in contexts.iter().enumerate() {
+            router
+                .track_registered_tx_with_signal(
+                    user_ctx,
+                    ffi::WrHandle::without_native(),
+                    10 + index as u64,
+                    index == 1,
+                    state.clone(),
+                )
+                .unwrap();
+        }
+        state.finish_posting(None);
+        let mut pool = UrmaBufferPool::from_test_slot_states(&[
+            (SlotKind::Tx, SlotState::SendPosted),
+            (SlotKind::Tx, SlotState::SendPosted),
+        ]);
+
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 9,
+                    user_ctx: contexts[0],
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(router.outstanding(), 1);
+
+        router
+            .route(
+                ffi::CompletionRecord {
+                    status: 0,
+                    user_ctx: contexts[1],
+                    user_ctx_valid: true,
+                    is_jetty: true,
+                    local_id: 101,
+                    ..Default::default()
+                },
+                false,
+                &mut pool,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.blocking_recv().unwrap(),
+            Err(Error::Completion { status: 9, .. })
+        ));
+        assert_eq!(router.outstanding(), 0);
+        assert_eq!(router.take_failed_peers(), vec![1]);
     }
 
     #[test]

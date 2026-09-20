@@ -153,11 +153,13 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
     )))
 }
 
-/// Dragonfly-facing PeerTarget batching and Piece pipeline policy. Native
-/// endpoint sizing, tokens, and handles remain private to the owner thread.
+/// Dragonfly-facing PeerTarget batching, completion, and Piece pipeline
+/// policy. Native endpoint sizing, tokens, and handles remain private to the
+/// owner thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PeerTargetConfig {
     pub post_list_size: u32,
+    pub send_completion_interval: u32,
     pub pipeline_depth: u32,
     pub guaranteed_rx_credits: u32,
 }
@@ -166,6 +168,7 @@ impl Default for PeerTargetConfig {
     fn default() -> Self {
         Self {
             post_list_size: 1,
+            send_completion_interval: 1,
             pipeline_depth: 2,
             guaranteed_rx_credits: 0,
         }
@@ -179,6 +182,12 @@ impl PeerTargetConfig {
                 "RM PeerTarget post_list_size={} is outside 1..={}",
                 self.post_list_size,
                 crate::urma::ffi::MAX_POST_LIST
+            )));
+        }
+        if !(1..=4096).contains(&self.send_completion_interval) {
+            return Err(Error::InvalidConfiguration(format!(
+                "RM PeerTarget send_completion_interval={} is outside 1..=4096",
+                self.send_completion_interval
             )));
         }
         if !(1..=2).contains(&self.pipeline_depth) {
@@ -1069,8 +1078,9 @@ fn run_owner(
                     if let OwnerControl::Shutdown(reply) = handle_command(
                         envelope.command,
                         &mut runtime,
-                        poisoned.as_deref(),
+                        &mut poisoned,
                         &tx_slot_admission,
+                        &readiness_tx,
                     ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
@@ -1090,8 +1100,9 @@ fn run_owner(
                     if let OwnerControl::Shutdown(reply) = handle_command(
                         envelope.command,
                         &mut runtime,
-                        poisoned.as_deref(),
+                        &mut poisoned,
                         &tx_slot_admission,
+                        &readiness_tx,
                     ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
@@ -1130,13 +1141,15 @@ enum OwnerControl {
 fn handle_command(
     command: FabricCommand,
     runtime: &mut UrmaRuntime,
-    poisoned: Option<&str>,
+    poisoned: &mut Option<String>,
     tx_slot_admission: &Semaphore,
+    readiness_tx: &watch::Sender<FabricReadiness>,
 ) -> OwnerControl {
     match command {
         FabricCommand::CreateLane { config, reply } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
-                let (lane_id, descriptor) = runtime.create_peer_target(config.post_list_size)?;
+            let result = reject_if_poisoned(poisoned.as_deref()).and_then(|()| {
+                let (lane_id, descriptor) = runtime
+                    .create_peer_target(config.post_list_size, config.send_completion_interval)?;
                 match descriptor.serialize() {
                     Ok(descriptor) => Ok((lane_id, descriptor)),
                     Err(error) => {
@@ -1153,7 +1166,7 @@ fn handle_command(
             descriptor,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
+            let result = reject_if_poisoned(poisoned.as_deref()).and_then(|()| {
                 let descriptor = JettyDescriptor::deserialize(&descriptor)?;
                 runtime.connect_peer_target(lane_id, &descriptor)
             });
@@ -1166,7 +1179,7 @@ fn handle_command(
             completion_txs,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
+            let result = reject_if_poisoned(poisoned.as_deref()).and_then(|()| {
                 runtime.post_receive_window_registered(lane_id, sequences, completion_txs)
             });
             let _ = reply.send(result);
@@ -1177,7 +1190,7 @@ fn handle_command(
             count,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned)
+            let result = reject_if_poisoned(poisoned.as_deref())
                 .and_then(|()| runtime.grant_send_credit(lane_id, count));
             let _ = reply.send(result);
             OwnerControl::Continue
@@ -1187,8 +1200,8 @@ fn handle_command(
             tx_slots,
             reply,
         } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.acquire_tx_window(length));
+            let result = reject_if_poisoned(poisoned.as_deref())
+                .and_then(|()| runtime.acquire_tx_window(length));
             if result.is_ok() {
                 commit_tx_slot_permit(tx_slots);
             }
@@ -1200,7 +1213,7 @@ fn handle_command(
             tx_slots,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned)
+            let result = reject_if_poisoned(poisoned.as_deref())
                 .and_then(|()| runtime.acquire_tx_window_chunks(&chunk_lengths));
             if result.is_ok() {
                 commit_tx_slot_permit(tx_slots);
@@ -1227,9 +1240,14 @@ fn handle_command(
             completion,
             reply,
         } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
+            let result = reject_if_poisoned(poisoned.as_deref()).and_then(|()| {
                 runtime.send_registered_window(lane_id, lease, sequences, completion)
             });
+            if let Err(error) = &result {
+                if runtime.endpoint_is_flushing() {
+                    poison_once(poisoned, error.to_string(), readiness_tx);
+                }
+            }
             let _ = reply.send(result);
             OwnerControl::Continue
         }
@@ -1466,18 +1484,32 @@ mod tests {
     }
 
     #[test]
-    fn peer_target_config_contains_only_peer_local_pipeline_policy() {
+    fn peer_target_config_validates_peer_local_transport_policy() {
         let config = PeerTargetConfig {
             post_list_size: 5,
+            send_completion_interval: 16,
             pipeline_depth: 2,
             guaranteed_rx_credits: 3,
         };
         assert_eq!(config.post_list_size, 5);
+        assert_eq!(config.send_completion_interval, 16);
         assert_eq!(config.pipeline_depth, 2);
         assert_eq!(config.guaranteed_rx_credits, 3);
         assert!(config.validate().is_ok());
         assert!(PeerTargetConfig {
             pipeline_depth: 0,
+            ..config
+        }
+        .validate()
+        .is_err());
+        assert!(PeerTargetConfig {
+            send_completion_interval: 0,
+            ..config
+        }
+        .validate()
+        .is_err());
+        assert!(PeerTargetConfig {
+            send_completion_interval: 4097,
             ..config
         }
         .validate()

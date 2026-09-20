@@ -496,6 +496,7 @@ pub(crate) struct PeerTarget {
     target: Option<ffi::TargetHandle>,
     credits: PeerSendCredits,
     post_list_size: usize,
+    send_completion_interval: usize,
     retirement_armed: bool,
 }
 
@@ -505,11 +506,17 @@ impl PeerTarget {
         generation: u8,
         capability: UrmaDeviceCapability,
         post_list_size: u32,
+        send_completion_interval: u32,
     ) -> Result<Self> {
         if id == 0 || generation == 0 {
             return Err(Error::InvalidConfiguration(
                 "PeerTarget id and generation must be non-zero".into(),
             ));
+        }
+        if !(1..=4096).contains(&send_completion_interval) {
+            return Err(Error::InvalidConfiguration(format!(
+                "SEND completion interval {send_completion_interval} is outside 1..=4096"
+            )));
         }
         Ok(Self {
             id,
@@ -519,6 +526,7 @@ impl PeerTarget {
             target: None,
             credits: PeerSendCredits::default(),
             post_list_size: post_list_size as usize,
+            send_completion_interval: send_completion_interval as usize,
             retirement_armed: false,
         })
     }
@@ -613,6 +621,7 @@ impl PeerTarget {
                         length,
                         user_ctx,
                         imm_data: None,
+                        complete_enable: true,
                     });
                 }
                 Ok(())
@@ -718,12 +727,20 @@ impl PeerTarget {
         let state = RegisteredTxWindowState::new(self.id, sequences.clone(), lease, completion);
 
         let mut pending: Vec<_> = layouts.into_iter().zip(sequences).collect();
+        let mut sends_since_completion = 0usize;
+        let mut posted_since_completion = 0usize;
         while !pending.is_empty() {
             let batch_len = self.post_list_size.min(pending.len());
             let batch: Vec<_> = pending.drain(..batch_len).collect();
             let mut entries = Vec::with_capacity(batch_len);
             let prepare: Result<()> = (|| {
-                for ((slot, offset, length), sequence) in &batch {
+                for (index, ((slot, offset, length), sequence)) in batch.iter().enumerate() {
+                    let window_tail = pending.is_empty() && index + 1 == batch.len();
+                    let complete_enable = select_send_completion(
+                        &mut sends_since_completion,
+                        self.send_completion_interval,
+                        window_tail,
+                    );
                     let user_ctx = self.token(OperationType::Send, *slot).encode()?;
                     pool.mark_tx_lease_posted(*slot)?;
                     entries.push(ffi::PostEntry {
@@ -731,6 +748,7 @@ impl PeerTarget {
                         length: *length,
                         user_ctx,
                         imm_data: Some(*sequence),
+                        complete_enable,
                     });
                 }
                 Ok(())
@@ -739,30 +757,44 @@ impl PeerTarget {
                 for ((slot, _, _), _) in batch.iter().take(entries.len()) {
                     pool.rollback_tx_lease_post(*slot)?;
                 }
-                state.finish_posting(Some(error.clone()));
-                return Err(error);
+                return fail_moderated_send_post(
+                    jetty,
+                    completions,
+                    &state,
+                    posted_since_completion,
+                    error,
+                );
             }
             for (index, entry) in entries.iter().enumerate() {
-                if let Err(error) =
-                    completions.reserve_registered_tx(entry.user_ctx, batch[index].1, state.clone())
-                {
+                if let Err(error) = completions.reserve_registered_tx(
+                    entry.user_ctx,
+                    batch[index].1,
+                    entry.complete_enable,
+                    state.clone(),
+                ) {
                     for reserved_entry in entries.iter().take(index) {
                         completions.cancel_reservation(reserved_entry.user_ctx)?;
                     }
                     for ((slot, _, _), _) in &batch {
                         pool.rollback_tx_lease_post(*slot)?;
                     }
-                    state.finish_posting(Some(error.clone()));
-                    return Err(error);
+                    return fail_moderated_send_post(
+                        jetty,
+                        completions,
+                        &state,
+                        posted_since_completion,
+                        error,
+                    );
                 }
             }
-            let posted = match jetty.post_send_batch(
-                self.target
-                    .as_ref()
-                    .ok_or_else(|| Error::Protocol("RM target is not imported".into()))?,
-                pool.segment_handle()?,
-                &entries,
-            ) {
+            let posted_result = match self.target.as_ref() {
+                Some(target) => match pool.segment_handle() {
+                    Ok(segment) => jetty.post_send_batch(target, segment, &entries),
+                    Err(error) => Err(error),
+                },
+                None => Err(Error::Protocol("RM target is not imported".into())),
+            };
+            let posted = match posted_result {
                 Ok(posted) => posted,
                 Err(error) => {
                     for entry in &entries {
@@ -771,8 +803,13 @@ impl PeerTarget {
                     for ((slot, _, _), _) in &batch {
                         pool.rollback_tx_lease_post(*slot)?;
                     }
-                    state.finish_posting(Some(error.clone()));
-                    return Err(error);
+                    return fail_moderated_send_post(
+                        jetty,
+                        completions,
+                        &state,
+                        posted_since_completion,
+                        error,
+                    );
                 }
             };
             let posted_len = posted.handles.len();
@@ -785,14 +822,24 @@ impl PeerTarget {
                 if index < posted_len {
                     let wr = handles.next().expect("posted prefix handle count matches");
                     completions.commit_posted(entries[index].user_ctx, wr);
+                    if entries[index].complete_enable {
+                        posted_since_completion = 0;
+                    } else {
+                        posted_since_completion += 1;
+                    }
                 } else {
                     completions.cancel_reservation(entries[index].user_ctx)?;
                     pool.rollback_tx_lease_post(slot)?;
                 }
             }
             if let Some(error) = first_error {
-                state.finish_posting(Some(error.clone()));
-                return Err(error);
+                return fail_moderated_send_post(
+                    jetty,
+                    completions,
+                    &state,
+                    posted_since_completion,
+                    error,
+                );
             }
         }
         state.finish_posting(None);
@@ -880,6 +927,47 @@ impl PeerTarget {
             "cannot {operation} while PeerTarget {} is {:?}",
             self.id, self.state
         ))
+    }
+}
+
+fn select_send_completion(
+    sends_since_completion: &mut usize,
+    interval: usize,
+    force: bool,
+) -> bool {
+    debug_assert_ne!(interval, 0);
+    let complete_enable = force || *sends_since_completion + 1 >= interval;
+    if complete_enable {
+        *sends_since_completion = 0;
+    } else {
+        *sends_since_completion += 1;
+    }
+    complete_enable
+}
+
+fn fail_moderated_send_post(
+    jetty: &mut UrmaJetty,
+    completions: &mut CompletionRouter,
+    state: &RegisteredTxWindowState,
+    posted_since_completion: usize,
+    error: Error,
+) -> Result<()> {
+    state.finish_posting(Some(error.clone()));
+    if posted_since_completion == 0 {
+        return Err(error);
+    }
+
+    // No later successful signaled WR can prove completion of this accepted
+    // unsignaled suffix. Retiring only one logical PeerTarget would leave its
+    // registered slots owned forever, so fail and flush the shared endpoint.
+    completions.begin_endpoint_flush();
+    match jetty.mark_error() {
+        Ok(()) => Err(Error::Protocol(format!(
+            "URMA SEND post failed with {posted_since_completion} uncheckpointed WRs; shared endpoint flush started: {error}"
+        ))),
+        Err(flush_error) => Err(Error::Protocol(format!(
+            "URMA SEND post failed with {posted_since_completion} uncheckpointed WRs and shared endpoint flush failed: post={error}; flush={flush_error}"
+        ))),
     }
 }
 
@@ -976,8 +1064,29 @@ mod tests {
     }
 
     #[test]
+    fn send_completion_selection_honors_interval_and_window_tail() {
+        let mut since = 0;
+        let flags = (0..20)
+            .map(|index| select_send_completion(&mut since, 16, index == 19))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flags
+                .iter()
+                .enumerate()
+                .filter_map(|(index, enabled)| enabled.then_some(index))
+                .collect::<Vec<_>>(),
+            vec![15, 19]
+        );
+        assert_eq!(since, 0);
+
+        let mut since = 0;
+        assert!((0..4).all(|_| select_send_completion(&mut since, 1, false)));
+        assert_eq!(since, 0);
+    }
+
+    #[test]
     fn draining_peer_rejects_new_credit_and_requires_send_drain_before_close() {
-        let mut peer = PeerTarget::new(7, 2, capability(), 1).unwrap();
+        let mut peer = PeerTarget::new(7, 2, capability(), 1, 1).unwrap();
         // Native import is independently covered at the FFI boundary. Set the
         // pure lifecycle state directly so this test needs no provider.
         peer.state = PeerTargetLifecycle::Ready;

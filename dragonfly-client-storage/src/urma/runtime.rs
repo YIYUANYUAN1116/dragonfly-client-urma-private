@@ -410,6 +410,7 @@ mod native {
         pub(crate) fn create_peer_target(
             &mut self,
             post_list_size: u32,
+            send_completion_interval: u32,
         ) -> Result<(u16, JettyDescriptor)> {
             if !self.accepting {
                 return Err(Error::InvalidConfiguration(
@@ -460,6 +461,7 @@ mod native {
                     .min(self.endpoint_config.send_depth)
                     .min(self.endpoint_config.recv_depth)
                     .min(self.max_post_list_size),
+                send_completion_interval,
             ) {
                 Ok(peer) => peer,
                 Err(error) => {
@@ -553,6 +555,10 @@ mod native {
                     sequences,
                     completion,
                 )
+        }
+
+        pub(crate) fn endpoint_is_flushing(&self) -> bool {
+            self.completions.endpoint_is_flushing()
         }
 
         pub(crate) fn poll_once(&mut self) -> Result<usize> {

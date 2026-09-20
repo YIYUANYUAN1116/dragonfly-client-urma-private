@@ -104,6 +104,8 @@ typedef struct dfurma_post_entry {
     uint32_t length;
     uint64_t user_ctx;
     uint64_t imm_data;
+    /* Generate a local SEND completion for this list entry. Ignored for RECV. */
+    uint8_t complete_enable;
 } dfurma_post_entry_t;
 
 /* Bounds shim stack storage and the maximum native doorbell batch. */

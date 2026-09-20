@@ -426,6 +426,11 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
     }
 
     jfs_cfg.depth = config->send_depth;
+    /* Selective SEND completion relies on one ordered local-completion
+     * frontier for the shared RM JFS. Keep out-of-order completion disabled
+     * explicitly instead of depending on the zero initializer. */
+    jfs_cfg.flag.value = 0;
+    jfs_cfg.flag.bs.outorder_comp = 0;
     jfs_cfg.trans_mode = URMA_TM_RM;
     jfs_cfg.priority = tp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
@@ -899,7 +904,8 @@ static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
         wr->send_wr.opcode =
             with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
         wr->send_wr.flag.value = 0;
-        wr->send_wr.flag.bs.complete_enable = 1;
+        wr->send_wr.flag.bs.complete_enable =
+            entries[i].complete_enable != 0;
         wr->target = target;
         wr->send_wr.tjetty = target->target;
         wr->send_wr.user_ctx = entries[i].user_ctx;

@@ -349,6 +349,7 @@ impl UrmaServer {
             rx_registered_bytes = fabric.rx_registered_bytes(),
             pipeline_depth = urma_config.pipeline_depth,
             post_list_size = urma_config.post_list_size,
+            send_completion_interval = urma_config.send_completion_interval,
             "urma process registration budget ready"
         );
         collect_urma_registered_bytes_metrics(
@@ -362,6 +363,7 @@ impl UrmaServer {
         );
         let peer_config = PeerTargetConfig {
             post_list_size: urma_config.post_list_size,
+            send_completion_interval: urma_config.send_completion_interval,
             pipeline_depth: urma_config.pipeline_depth,
             // This side only posts SEND. RX guarantees are registered by the
             // downloader-side PeerTarget created in `UrmaClientSession`.

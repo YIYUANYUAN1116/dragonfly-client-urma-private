@@ -293,6 +293,10 @@ fn default_storage_server_urma_post_list_size() -> u32 {
     1
 }
 
+fn default_storage_server_urma_send_completion_interval() -> u32 {
+    1
+}
+
 fn default_storage_server_urma_max_concurrent_transfers() -> u32 {
     64
 }
@@ -1077,6 +1081,12 @@ pub struct UrmaServer {
     #[validate(range(min = 1, max = 64))]
     pub post_list_size: u32,
 
+    /// Number of ordered SEND WRs retired by one local completion record.
+    /// One preserves the per-WR completion path and is the safe default.
+    #[serde(default = "default_storage_server_urma_send_completion_interval")]
+    #[validate(range(min = 1, max = 4096))]
+    pub send_completion_interval: u32,
+
     #[serde(default = "default_storage_server_urma_pipeline_depth")]
     #[validate(range(min = 1, max = 2))]
     pub pipeline_depth: u32,
@@ -1146,6 +1156,7 @@ impl Default for UrmaServer {
             tx_registered_bytes: default_storage_server_urma_tx_registered_bytes(),
             max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
             post_list_size: default_storage_server_urma_post_list_size(),
+            send_completion_interval: default_storage_server_urma_send_completion_interval(),
             pipeline_depth: default_storage_server_urma_pipeline_depth(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
             peer_guaranteed_rx_credits: default_storage_server_urma_peer_guaranteed_rx_credits(),
@@ -2688,6 +2699,7 @@ mod urma_config_tests {
         assert_eq!(urma.tx_registered_bytes, ByteSize::mib(8));
         assert_eq!(urma.max_inflight_chunks, 512);
         assert_eq!(urma.post_list_size, 1);
+        assert_eq!(urma.send_completion_interval, 1);
         assert_eq!(urma.pipeline_depth, 2);
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.peer_guaranteed_rx_credits, 0);
@@ -2697,11 +2709,14 @@ mod urma_config_tests {
     #[test]
     fn deserialize_rm_mode_explicitly() {
         let urma: UrmaServer =
-            serde_yaml::from_str("transportMode: rm\ntpType: ctp\npeerGuaranteedRxCredits: 8")
-                .unwrap();
+            serde_yaml::from_str(
+                "transportMode: rm\ntpType: ctp\npeerGuaranteedRxCredits: 8\nsendCompletionInterval: 16",
+            )
+            .unwrap();
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
         assert_eq!(urma.tp_type, UrmaTpType::Ctp);
         assert_eq!(urma.peer_guaranteed_rx_credits, 8);
+        assert_eq!(urma.send_completion_interval, 16);
     }
 
     #[test]
@@ -2743,6 +2758,14 @@ mod urma_config_tests {
         for post_list_size in [0, 65] {
             assert!(UrmaServer {
                 post_list_size,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for send_completion_interval in [0, 4097] {
+            assert!(UrmaServer {
+                send_completion_interval,
                 ..Default::default()
             }
             .validate()
