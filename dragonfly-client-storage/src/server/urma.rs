@@ -813,53 +813,28 @@ impl UrmaServerHandler {
         let mut tx_second_lease_fallback = false;
         let mut tx_fill_ns = 0u64;
         let mut tx_send_wait_ns = 0u64;
-        let mut tx_required_acquire_attempts = 0u64;
+        let tx_required_acquire_attempts = 1u64;
 
         let first_lengths =
             tx_window_chunk_lengths(piece.length, chunk_size, max_inflight_chunks, 0)?;
         let tx_required_acquire_start = Instant::now();
-        // Required windows wait for an existing owner to recycle its lease.
-        // The allocator itself is intentionally non-blocking, so a timeout
-        // around one call only bounded command latency and returned
-        // BufferUnavailable immediately. While a required waiter exists,
-        // optional second-ring allocations stand down to prevent starvation.
+        // Required windows reserve their physical TX slot count before one
+        // owner command is submitted. Recycling returns those permits only
+        // after the owner has restored the slots to the free-list. While a
+        // required waiter exists, optional second-ring allocations stand down
+        // to prevent starvation.
         let acquired = {
             let _waiter = RequiredTxWaiter::new(&self.required_tx_waiters);
-            let deadline = time::Instant::now() + self.transfer_timeout;
-            let mut tx_recycled = self.fabric.subscribe_tx_recycles();
-            loop {
-                let remaining = deadline.saturating_duration_since(time::Instant::now());
-                if remaining.is_zero() {
-                    break None;
-                }
-                tx_required_acquire_attempts += 1;
-                match time::timeout(
-                    remaining,
-                    self.fabric.acquire_tx_window_chunks(first_lengths.clone()),
-                )
-                .await
-                {
-                    Ok(Err(UrmaError::BufferUnavailable { .. })) => {
-                        match time::timeout(
-                            remaining,
-                            self.fabric.wait_for_tx_recycle(&mut tx_recycled),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => break Some(Err(error)),
-                            Err(_) => break None,
-                        }
-                    }
-                    Ok(result) => break Some(result),
-                    Err(_) => break None,
-                }
-            }
+            time::timeout(
+                self.transfer_timeout,
+                self.fabric.acquire_tx_window_chunks(first_lengths),
+            )
+            .await
         };
         let tx_required_acquire_ns = tx_required_acquire_start.elapsed().as_nanos() as u64;
         let mut current = match acquired {
-            Some(Ok(lease)) => lease,
-            Some(Err(error)) => {
+            Ok(Ok(lease)) => lease,
+            Ok(Err(error)) => {
                 if matches!(error, UrmaError::BufferUnavailable { .. }) {
                     collect_urma_budget_pressure_metrics("tx", "required");
                     session
@@ -873,7 +848,7 @@ impl UrmaServerHandler {
                     .await;
                 return Err(client_error(error));
             }
-            None => {
+            Err(_) => {
                 let message = format!(
                     "URMA TX registration unavailable after {:?}",
                     self.transfer_timeout
