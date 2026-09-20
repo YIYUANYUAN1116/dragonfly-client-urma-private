@@ -29,6 +29,8 @@ mod read_owners;
 mod read_protocol;
 #[allow(dead_code)]
 mod read_session;
+#[cfg(test)]
+mod read_session_harness;
 #[allow(dead_code)]
 mod read_source_owner;
 #[allow(dead_code)]

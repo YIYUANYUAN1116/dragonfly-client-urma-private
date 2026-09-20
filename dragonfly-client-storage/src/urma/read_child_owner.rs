@@ -97,18 +97,36 @@ pub(crate) struct ChildProgress {
 /// Kept private to this transport module; no CPU buffer access is exposed.
 pub(crate) trait ChildResources {
     type Wr;
+    /// The extracted registered destination buffer, owned outside the bundle
+    /// between publish and recycle.
+    type Lease;
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError>;
     /// # Safety
     /// The WR has independently verified retirement, checked by ChildOwner.
     unsafe fn complete(&mut self, wr: Self::Wr);
     fn unimport(&mut self) -> Result<(), FfiError>;
     fn close_buffer(&mut self) -> Result<(), FfiError>;
+    /// Moves the registered destination buffer out for Storage consumption.
+    /// ChildOwner guarantees no outstanding WRs and a closed import.
+    fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError>;
+    /// Closes a previously extracted lease buffer (unregister + release).
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError>;
+}
+
+/// CPU-visible span of an extracted registered destination buffer. The pointer
+/// stays valid until the lease is successfully closed; the content is final
+/// because every READ WR retired before extraction.
+#[derive(Clone, Copy)]
+pub(crate) struct LeaseSpan {
+    pub(crate) data: *mut u8,
+    pub(crate) length: usize,
 }
 
 pub(crate) struct NativeChild<K> {
     jetty: std::rc::Rc<std::cell::RefCell<JettyHandle>>,
     target: std::rc::Rc<TargetHandle>,
-    local: SegmentHandle,
+    // Taken out by extract_lease; close_buffer is a no-op afterwards.
+    local: Option<SegmentHandle>,
     remote: Option<ImportedReadSegment>,
     import_uncertain: bool,
     _keepalive: K,
@@ -129,7 +147,7 @@ impl<K> NativeChild<K> {
         Self {
             jetty,
             target,
-            local,
+            local: Some(local),
             remote: Some(remote),
             import_uncertain: false,
             _keepalive: keepalive,
@@ -186,7 +204,7 @@ impl<K> NativeChild<K> {
         let mut owner = Self {
             jetty,
             target,
-            local,
+            local: Some(local),
             remote: None,
             import_uncertain: false,
             _keepalive: keepalive,
@@ -215,7 +233,7 @@ impl<K> NativeChild<K> {
                         error,
                     };
                 }
-                match owner.local.close() {
+                match owner.local.as_mut().expect("created local buffer").close() {
                     Ok(()) => ChildCreation::Rejected(error),
                     Err(cleanup_error) => ChildCreation::Uncertain {
                         resources: owner,
@@ -229,7 +247,18 @@ impl<K> NativeChild<K> {
 
 impl<K> ChildResources for NativeChild<K> {
     type Wr = ReadWrHandle;
+    type Lease = SegmentHandle;
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
+        let Some(remote) = self.remote.as_ref() else {
+            return Ok(ChildPost::Rejected(FfiError::Contract(
+                "READ import missing",
+            )));
+        };
+        let Some(local) = self.local.as_ref() else {
+            return Ok(ChildPost::Rejected(FfiError::Contract(
+                "READ destination lease already extracted",
+            )));
+        };
         // SAFETY: Exclusive ownership and admission are required by construction;
         // ChildOwner issues disjoint sequential ranges and retains every accepted WR.
         let Ok(mut jetty) = self.jetty.try_borrow_mut() else {
@@ -237,12 +266,7 @@ impl<K> ChildResources for NativeChild<K> {
                 "shared Jetty is busy",
             )));
         };
-        let Some(remote) = self.remote.as_ref() else {
-            return Ok(ChildPost::Rejected(FfiError::Contract(
-                "READ import missing",
-            )));
-        };
-        unsafe { jetty.post_read(&self.target, &self.local, remote, request) }.map(
+        unsafe { jetty.post_read(&self.target, local, remote, request) }.map(
             |post| match post {
                 ReadPost::Posted(wr) => ChildPost::Posted(wr),
                 ReadPost::Rejected(error) => ChildPost::Rejected(error),
@@ -265,7 +289,27 @@ impl<K> ChildResources for NativeChild<K> {
         Ok(())
     }
     fn close_buffer(&mut self) -> Result<(), FfiError> {
-        self.local.close()
+        if let Some(local) = &mut self.local {
+            return local.close();
+        }
+        Ok(())
+    }
+    fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError> {
+        let local = self
+            .local
+            .take()
+            .ok_or(FfiError::Contract("READ lease already extracted"))?;
+        // SAFETY: Unique wrapper; the CPU span stays registered until close.
+        let (data, length) = local.data()?;
+        let span = LeaseSpan {
+            data: data.as_ptr(),
+            length,
+        };
+        Ok((local, span))
+    }
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError> {
+        let mut lease = lease;
+        lease.close()
     }
 }
 
@@ -288,6 +332,9 @@ pub(crate) struct ChildOwner<R: ChildResources> {
     lost_handle: bool,
     imported: bool,
     closed: bool,
+    // Extracted destination lease awaiting Storage recycle. While set, ordinary
+    // reap stays Pending: only recycle_lease may close a consumable buffer.
+    published: Option<R::Lease>,
     pending: BTreeMap<u64, Pending<R::Wr>>,
     resources: ManuallyDrop<R>,
 }
@@ -319,6 +366,7 @@ impl<R: ChildResources> ChildOwner<R> {
             lost_handle: false,
             imported: true,
             closed: false,
+            published: None,
             pending: BTreeMap::new(),
             resources: ManuallyDrop::new(resources),
         }
@@ -440,9 +488,11 @@ impl<R: ChildResources> ChildOwner<R> {
     }
     /// For registry.reap_with after retirement/quarantine. No successful Piece is
     /// published here: this is cleanup only, including cancellation and shutdown.
+    /// A published destination lease is never closed here; its consumer may still
+    /// read the buffer, so recycle_lease is the only release path.
     pub(crate) fn reap(&mut self) -> Result<ReapDecision, FfiError> {
         self.stop();
-        if self.lost_handle || !self.pending.is_empty() {
+        if self.lost_handle || !self.pending.is_empty() || self.published.is_some() {
             return Ok(ReapDecision::Pending);
         }
         if self.imported {
@@ -459,6 +509,50 @@ impl<R: ChildResources> ChildOwner<R> {
         Ok(ReapDecision::Retired(unsafe {
             VerifiedRetirement::new(self.id)
         }))
+    }
+
+    /// First stage of the lease flow: stop posting and close the import while
+    /// keeping the registered buffer and the full budget charge. Never returns
+    /// Retired; the lease publication keeps the owner in the registry.
+    pub(crate) fn drain_for_lease(&mut self) -> Result<ReapDecision, FfiError> {
+        self.stop();
+        if self.lost_handle || !self.pending.is_empty() {
+            return Ok(ReapDecision::Pending);
+        }
+        if self.imported {
+            self.resources.unimport()?;
+            self.imported = false;
+        }
+        Ok(ReapDecision::Pending)
+    }
+
+    /// Extracts the registered destination buffer for Storage consumption.
+    /// Requires a fully successful READ, closed import, and no prior lease.
+    /// The budget stays charged until recycle_lease completes the reap.
+    pub(crate) fn publish_lease(&mut self) -> Result<LeaseSpan, FfiError> {
+        if self.lost_handle
+            || !self.pending.is_empty()
+            || self.imported
+            || self.closed
+            || self.published.is_some()
+        {
+            return Err(FfiError::Contract("READ destination lease is not extractable"));
+        }
+        if !self.read_succeeded() {
+            return Err(FfiError::Contract("READ did not fully succeed"));
+        }
+        let (lease, span) = self.resources.extract_lease()?;
+        self.published = Some(lease);
+        Ok(span)
+    }
+
+    /// Closes the published lease and finishes the ordinary reap, releasing the
+    /// budget. Call only after consumer workers joined.
+    pub(crate) fn recycle_lease(&mut self) -> Result<ReapDecision, FfiError> {
+        if let Some(lease) = self.published.take() {
+            self.resources.close_lease(lease)?;
+        }
+        self.reap()
     }
 }
 // ManuallyDrop retains resources on accidental Drop. Pending native WR handles
@@ -482,6 +576,7 @@ mod tests {
     struct Mock(Rc<RefCell<Trace>>);
     impl ChildResources for Mock {
         type Wr = u64;
+        type Lease = ();
         fn post(&mut self, r: &ReadRequest) -> Result<ChildPost<u64>, FfiError> {
             let mut t = self.0.borrow_mut();
             t.contexts.push(r.user_ctx);
@@ -511,6 +606,21 @@ mod tests {
             if std::mem::take(&mut t.fail_close) {
                 return Err(FfiError::Status(-4));
             }
+            Ok(())
+        }
+        fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
+            self.0.borrow_mut().events.push("lease-extract");
+            Ok((
+                (),
+                LeaseSpan {
+                    // SAFETY: Mock never dereferences the span.
+                    data: std::ptr::NonNull::dangling().as_ptr(),
+                    length: 8,
+                },
+            ))
+        }
+        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
+            self.0.borrow_mut().events.push("lease-close");
             Ok(())
         }
     }
@@ -702,6 +812,41 @@ mod tests {
                 o.reap()
             }),
             Ok(true)
+        );
+    }
+    #[test]
+    fn lease_flow_keeps_owner_and_budget_until_recycle() {
+        let (mut registry, id, trace) = setup();
+        let owner = registry.active_owner(id).unwrap();
+        let a = owner.post(4).unwrap();
+        let b = owner.post(4).unwrap();
+        owner.complete(completion(id, a, true)).unwrap();
+        owner.complete(completion(id, b, true)).unwrap();
+        // Drain closes the import but never retires the owner or the budget.
+        assert_eq!(owner.drain_for_lease(), Ok(ReapDecision::Pending));
+        let span = owner.publish_lease().unwrap();
+        assert_eq!(span.length, 8);
+        // Double publication is rejected and the reap stays Pending.
+        assert!(owner.publish_lease().is_err());
+        registry.retire(id).unwrap();
+        assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(false));
+        assert_eq!(registry.usage().bytes, 8);
+        // Only recycle_lease releases the consumable buffer and the charge.
+        assert_eq!(registry.reap_with(id, |o| o.recycle_lease()), Ok(true));
+        assert!(registry.drained());
+        assert_eq!(
+            trace.borrow().events,
+            [
+                "post",
+                "post",
+                "complete",
+                "complete",
+                "unimport",
+                "lease-extract",
+                "lease-close",
+                "buffer-close",
+                "drop"
+            ]
         );
     }
 }

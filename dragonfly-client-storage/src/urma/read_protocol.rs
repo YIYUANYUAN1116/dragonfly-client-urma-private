@@ -537,6 +537,20 @@ impl ParentReadState {
                 self.phase = ParentPhase::WaitingCancelDrain(*expected);
                 Ok(ParentAction::WaitForChildDrain)
             }
+            // The Child cancelled before consuming the Offer. It must still
+            // drain the late Offer and answer with a matching-generation
+            // CancelDrained, so this generation-less Cancel never releases the
+            // export.
+            (
+                ParentPhase::Offered(expected),
+                ReadFrame::Cancel {
+                    segment_generation: None,
+                    ..
+                },
+            ) => {
+                self.phase = ParentPhase::WaitingCancelDrain(*expected);
+                Ok(ParentAction::WaitForChildDrain)
+            }
             (
                 ParentPhase::WaitingCancelDrain(expected),
                 ReadFrame::CancelDrained {
@@ -549,6 +563,16 @@ impl ParentReadState {
                 self.phase = ParentPhase::RevokingCancel(Some(*expected));
                 Ok(ParentAction::RevokeSource)
             }
+            // A generation-less CancelDrained only proves the Child had no
+            // accepted WR when it drained before seeing the late Offer. The
+            // Child still owes a matching-generation declaration afterwards.
+            (
+                ParentPhase::WaitingCancelDrain(_),
+                ReadFrame::CancelDrained {
+                    segment_generation: None,
+                    ..
+                },
+            ) => Ok(ParentAction::WaitForChildDrain),
             (
                 ParentPhase::TerminalSuccess(expected),
                 ReadFrame::ReadDone {
@@ -985,6 +1009,107 @@ mod tests {
             child.import_drained(0, 0).unwrap(),
             ChildAction::SendCancelDrained {
                 segment_generation: Some(12)
+            }
+        );
+    }
+
+    #[test]
+    fn child_cancel_after_offer_requires_full_drain_before_cancelled() {
+        let mut child = ChildReadState::new(ID, 64 * 1024, 4096).unwrap();
+        assert_eq!(
+            child.on_frame(&segment_offer(11)).unwrap(),
+            ChildAction::StartRead
+        );
+        assert_eq!(
+            child.cancel().unwrap(),
+            ChildAction::SendCancel {
+                segment_generation: Some(11)
+            }
+        );
+        assert!(child.import_drained(4, 3).is_err());
+        assert_eq!(
+            child.import_drained(4, 4).unwrap(),
+            ChildAction::SendCancelDrained {
+                segment_generation: Some(11)
+            }
+        );
+        assert_eq!(
+            child
+                .on_frame(&ReadFrame::Cancelled {
+                    identity: ID,
+                    segment_generation: Some(11),
+                })
+                .unwrap(),
+            ChildAction::Cancelled
+        );
+        assert_eq!(
+            child
+                .on_frame(&ReadFrame::Cancelled {
+                    identity: ID,
+                    segment_generation: Some(11),
+                })
+                .unwrap(),
+            ChildAction::DuplicateTerminal
+        );
+    }
+
+    #[test]
+    fn offered_phase_generation_less_cancel_waits_for_matched_drain() {
+        let mut parent = ParentReadState::new(ID, 64 * 1024).unwrap();
+        parent
+            .on_frame(&ReadFrame::BufferReady {
+                identity: ID,
+                accepted_length: 64 * 1024,
+            })
+            .unwrap();
+        parent.offer_published(21).unwrap();
+        // Child cancelled before consuming the Offer: no release yet.
+        assert_eq!(
+            parent
+                .on_frame(&ReadFrame::Cancel {
+                    identity: ID,
+                    segment_generation: None,
+                    reason: "child failure".into(),
+                })
+                .unwrap(),
+            ParentAction::WaitForChildDrain
+        );
+        // Child drained before seeing the late Offer; the matched declaration
+        // is still owed.
+        assert_eq!(
+            parent
+                .on_frame(&ReadFrame::CancelDrained {
+                    identity: ID,
+                    segment_generation: None,
+                    accepted_wr_count: 0,
+                    retired_wr_count: 0,
+                })
+                .unwrap(),
+            ParentAction::WaitForChildDrain
+        );
+        assert!(parent
+            .on_frame(&ReadFrame::CancelDrained {
+                identity: ID,
+                segment_generation: Some(22),
+                accepted_wr_count: 0,
+                retired_wr_count: 0,
+            })
+            .is_err());
+        assert_eq!(
+            parent
+                .on_frame(&ReadFrame::CancelDrained {
+                    identity: ID,
+                    segment_generation: Some(21),
+                    accepted_wr_count: 0,
+                    retired_wr_count: 0,
+                })
+                .unwrap(),
+            ParentAction::RevokeSource
+        );
+        assert_eq!(
+            parent.source_released().unwrap(),
+            ParentAction::SendCancelled {
+                segment_generation: Some(21)
             }
         );
     }

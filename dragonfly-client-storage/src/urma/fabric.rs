@@ -15,8 +15,8 @@ use super::{
     credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
     runtime::{
-        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadSourceAdmission,
-        ReadSourceId, ReadSourceRequest, RuntimeConfig, UrmaRuntime,
+        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadLeaseSpan,
+        ReadSourceAdmission, ReadSourceId, ReadSourceRequest, RuntimeConfig, UrmaRuntime,
     },
     Error, Result,
 };
@@ -544,6 +544,45 @@ impl UrmaFabricHandle {
             .await
     }
 
+    /// First lease stage: stop posting and close the native import while
+    /// keeping the registered destination buffer and the full budget charge.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn drain_read_child_for_lease(&self, id: ReadChildId) -> Result<()> {
+        self.submit(|reply| FabricCommand::DrainReadChildForLease { id, reply })
+            .await
+    }
+
+    /// Extracts the CPU span of the fully read registered destination buffer
+    /// for Storage. The lease itself stays on the owner thread until recycle.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn publish_read_child_lease(&self, id: ReadChildId) -> Result<ReadLeaseSpan> {
+        self.submit(|reply| FabricCommand::PublishReadChildLease { id, reply })
+            .await
+    }
+
+    /// Final lease stage: close the published lease and finish the reap.
+    /// Requires a retired (or quarantined) Child and joined consumer workers.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn recycle_read_child_lease(&self, id: ReadChildId) -> Result<bool> {
+        self.submit_urgent(|reply| FabricCommand::RecycleReadChildLease { id, reply })
+            .await
+    }
+
+    /// Consumes a published destination lease: retires the Child owner and
+    /// closes the lease buffer, releasing the budget. Call only after Storage
+    /// consumers have joined and the published span will never be dereferenced
+    /// again. `Ok(true)` proves the full release; `Ok(false)` or an error
+    /// keeps the owner retained for a later cleanup pass.
+    #[allow(dead_code)] // Used by the gated READ session state machine.
+    pub(crate) async fn recycle_published_child_lease(&self, id: ReadChildId) -> Result<bool> {
+        // Retire is a state transition the recycle stage requires; a repeated
+        // retire of an already retiring owner is harmless.
+        self.submit_urgent(|reply| FabricCommand::RetireReadChild { id, reply })
+            .await?;
+        self.submit_urgent(|reply| FabricCommand::RecycleReadChildLease { id, reply })
+            .await
+    }
+
     /// # Safety
     /// The caller must hold immutable exact-Piece backing and authenticate and
     /// generation-bind this source to the requesting peer and transfer.
@@ -964,6 +1003,21 @@ enum FabricCommand {
         id: ReadChildId,
         reply: oneshot::Sender<Result<bool>>,
     },
+    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+    DrainReadChildForLease {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+    PublishReadChildLease {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<ReadLeaseSpan>>,
+    },
+    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+    RecycleReadChildLease {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<bool>>,
+    },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
     RegisterReadSource {
         request: ReadSourceRequest,
@@ -1208,6 +1262,24 @@ fn handle_command(
         }
         FabricCommand::RetireReadChild { id, reply } => {
             let _ = reply.send(runtime.retire_read_child_for_cleanup(id));
+            OwnerControl::Continue
+        }
+        FabricCommand::DrainReadChildForLease { id, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.drain_read_child_for_lease(id));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::PublishReadChildLease { id, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.publish_read_child_lease(id));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::RecycleReadChildLease { id, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.recycle_read_child_lease(id));
+            let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::RegisterReadSource { request, reply } => {

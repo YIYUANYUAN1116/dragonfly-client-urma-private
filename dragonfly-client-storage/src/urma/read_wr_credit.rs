@@ -2,7 +2,7 @@
 //! verified completion; accidental Drop does not return native capacity.
 use super::{
     ffi::{read::ReadRequest, FfiError},
-    read_child_owner::{ChildPost, ChildResources},
+    read_child_owner::{ChildPost, ChildResources, LeaseSpan},
     read_owner::ReadPeer,
 };
 use std::{cell::RefCell, collections::BTreeMap, mem::ManuallyDrop, rc::Rc};
@@ -79,6 +79,7 @@ impl<R> CreditedChild<R> {
 }
 impl<R: ChildResources> ChildResources for CreditedChild<R> {
     type Wr = CreditedWr<R::Wr>;
+    type Lease = R::Lease;
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
         let permit = match ReadWrCredits::acquire(&self.credits, self.peer) {
             Ok(permit) => permit,
@@ -119,6 +120,12 @@ impl<R: ChildResources> ChildResources for CreditedChild<R> {
     fn close_buffer(&mut self) -> Result<(), FfiError> {
         self.resources.close_buffer()
     }
+    fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError> {
+        self.resources.extract_lease()
+    }
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError> {
+        self.resources.close_lease(lease)
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +134,7 @@ mod tests {
     struct Mock(u8);
     impl ChildResources for Mock {
         type Wr = ();
+        type Lease = ();
         fn post(&mut self, _: &ReadRequest) -> Result<ChildPost<()>, FfiError> {
             match self.0 {
                 1 => Ok(ChildPost::Rejected(FfiError::Status(-1))),
@@ -140,6 +148,12 @@ mod tests {
             Ok(())
         }
         fn close_buffer(&mut self) -> Result<(), FfiError> {
+            Ok(())
+        }
+        fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
+            Err(FfiError::Contract("mock has no lease"))
+        }
+        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
             Ok(())
         }
     }

@@ -1,8 +1,16 @@
 //! Gated READ session adapters.
 //!
-//! The Child adapter below is transport-only: it proves the wire/native
-//! lifecycle and then closes the destination. It does not publish bytes to
-//! Storage until a separate destination lease handoff is implemented.
+//! The Child adapter proves the wire/native lifecycle and then publishes the
+//! fully read destination lease: drain (stop posting, close the import) →
+//! publish (extract the registered buffer's CPU span) → caller-driven recycle
+//! (close the buffer and release the budget) after Storage consumption. The
+//! registered lease itself never leaves the native owner thread.
+//!
+//! Failure and cancel paths keep native owners fail closed: the Child reports
+//! a retained owner id whenever cleanup cannot prove a full drain/close, and
+//! the Parent reports a retained source whenever its export could not be
+//! released inside the attempt. Wire cancel exchanges are best-effort and
+//! never substitute for provider-side revocation evidence.
 
 use super::{
     fabric::UrmaFabricHandle,
@@ -13,13 +21,13 @@ use super::{
         ReadTransferIdentity,
     },
     runtime::{
-        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadSourceAdmission,
-        ReadSourceId, ReadSourceOffer, ReadSourceRequest,
+        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadLeaseSpan,
+        ReadSourceAdmission, ReadSourceId, ReadSourceOffer, ReadSourceRequest,
     },
     Error, Result,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 static NEXT_SEGMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -84,6 +92,42 @@ pub(crate) struct ReadTransportResult {
     pub(crate) read_wr_count: u64,
 }
 
+/// A published destination lease awaiting Storage consumption. The CPU span is
+/// final READ content; the caller must consume it and then recycle the lease
+/// through [`UrmaFabricHandle::recycle_published_child_lease`] to close the
+/// buffer and release the transfer budget.
+pub(crate) struct PublishedChildLease {
+    pub(crate) child_id: ReadChildId,
+    pub(crate) span: ReadLeaseSpan,
+}
+
+/// Success outcome of the Child transport adapter including the published
+/// destination lease.
+pub(crate) struct ChildTransportSuccess {
+    pub(crate) completed_bytes: u64,
+    pub(crate) read_wr_count: u64,
+    pub(crate) lease: PublishedChildLease,
+}
+
+/// Failure outcome of the Child transport adapter. `retained_child` is set
+/// only when the native Child owner could not be proven fully drained and
+/// closed: the caller must keep this id for a later cleanup owner pass and
+/// must not treat the transfer budget as released.
+pub(crate) struct ChildTransportFailure {
+    pub(crate) error: Error,
+    pub(crate) retained_child: Option<ReadChildId>,
+}
+
+/// Best-effort extraction of a matched drain declaration from the last
+/// observed Child progress. Counts are only usable when the accepted and
+/// retired WR counts are already equal; otherwise no CancelDrained may be
+/// sent.
+fn drainable_wr_counts(progress: Option<ReadChildProgress>) -> Option<(u64, u64)> {
+    progress
+        .filter(|progress| progress.accepted_wr_count == progress.retired_wr_count)
+        .map(|progress| (progress.accepted_wr_count, progress.retired_wr_count))
+}
+
 pub(crate) struct ChildTransportSession {
     fabric: UrmaFabricHandle,
     lane_id: u16,
@@ -133,26 +177,77 @@ impl ChildTransportSession {
         })
     }
 
-    /// Runs one Piece through READ and terminal control, then closes the native
-    /// destination. No Storage success may be reported from this transport-only
-    /// result because the destination bytes are deliberately not handed out.
+    /// Runs one Piece through READ and terminal control, then publishes the
+    /// destination lease. No implicit native release happens here: the caller
+    /// owns the lease handoff and must recycle it after Storage consumption.
+    ///
+    /// On failure the adapter runs the cooperative cancel exchange and a
+    /// cleanup-only retirement. `ChildTransportFailure::retained_child` is set
+    /// only when that retirement could not prove a full drain/close; the id
+    /// then stays valid for a later cleanup owner pass. A lease published
+    /// before a late failure keeps its owner retained as well: the buffer
+    /// content is already final, so the caller may still consume and recycle
+    /// it through the retained id. Dropping the future without running this
+    /// path keeps the native owner retained in the registry (fail closed) but
+    /// skips the wire cancel exchange.
     ///
     /// # Safety
     /// The caller must bind this lane/identity to an authenticated handshake and
     /// guarantee exclusive ownership of the destination Piece allocation.
-    pub(crate) async unsafe fn run_transport_only(mut self) -> Result<ReadTransportResult> {
+    pub(crate) async unsafe fn run_transport_only(
+        mut self,
+    ) -> std::result::Result<ChildTransportSuccess, ChildTransportFailure> {
+        // SAFETY: The method contract supplies authenticated identity and
+        // exclusive destination ownership.
+        match self.run_inner().await {
+            Ok((result, segment_generation, lease)) => {
+                self.control
+                    .finish(Some(segment_generation))
+                    .map_err(|error| ChildTransportFailure {
+                        error,
+                        retained_child: None,
+                    })?;
+                Ok(ChildTransportSuccess {
+                    completed_bytes: result.completed_bytes,
+                    read_wr_count: result.read_wr_count,
+                    lease,
+                })
+            }
+            Err((error, child_id)) => Err(self.cancel_after_failure(child_id, error).await),
+        }
+    }
+
+    /// Normal path. Errors carry the still-existing native Child id so the
+    /// cancel/cleanup path can address it; `None` means no owner exists or it
+    /// was already fully closed. Success additionally returns the terminal
+    /// segment generation and the published destination lease so the owning
+    /// call can finish the control route and hand the lease to Storage.
+    async fn run_inner(
+        &mut self,
+    ) -> std::result::Result<
+        (ReadTransportResult, u64, PublishedChildLease),
+        (Error, Option<ReadChildId>),
+    > {
         self.control
             .send(ReadFrame::BufferReady {
                 identity: self.identity,
                 accepted_length: self.piece_length,
             })
-            .await?;
-        let frame = self.control.receive().await?;
-        if self.state.on_frame(&frame)? != ChildAction::StartRead {
-            return Err(protocol("Child did not receive a usable SegmentOffer"));
+            .await
+            .map_err(|error| (error, None))?;
+        let frame = self
+            .control
+            .receive()
+            .await
+            .map_err(|error| (error, None))?;
+        if self.state.on_frame(&frame).map_err(|error| (error, None))? != ChildAction::StartRead {
+            return Err((
+                protocol("Child did not receive a usable SegmentOffer"),
+                None,
+            ));
         }
         let ReadFrame::SegmentOffer { offer, .. } = frame else {
-            return Err(protocol("Child expected SegmentOffer"));
+            return Err((protocol("Child expected SegmentOffer"), None));
         };
         let max_read_size = offer.effective_max_read_size;
         let (descriptor, token) = native_descriptor(&offer);
@@ -168,47 +263,159 @@ impl ChildTransportSession {
                     descriptor,
                     token,
                 })
-                .await?
+                .await
         };
         let child_id = match admission {
-            ReadChildAdmission::Ready(id) => id,
-            ReadChildAdmission::Quarantined { id, error } => {
-                let _ = self.fabric.retire_read_child_for_cleanup(id).await;
-                return Err(error);
+            Ok(ReadChildAdmission::Ready(id)) => id,
+            Ok(ReadChildAdmission::Quarantined { id, error }) => return Err((error, Some(id))),
+            Err(error) => return Err((error, None)),
+        };
+        let result = match self.drive_reads(child_id, max_read_size).await {
+            Ok(result) => result,
+            Err(error) => return Err((error, Some(child_id))),
+        };
+        // Lease flow stage 1: stop posting and close the import while keeping
+        // the registered destination buffer and the full budget charge.
+        if let Err(error) = self.fabric.drain_read_child_for_lease(child_id).await {
+            return Err((error, Some(child_id)));
+        }
+        // Stage 2: extract the CPU span of the final READ content. The lease
+        // itself stays on the native owner thread until the caller recycles.
+        let span = match self.fabric.publish_read_child_lease(child_id).await {
+            Ok(span) => span,
+            Err(error) => return Err((error, Some(child_id))),
+        };
+        // From here the destination lease is published; later failures keep
+        // the owner retained (the content is final) and only abandon the
+        // control exchange.
+        let action = match self
+            .state
+            .read_finished(result.completed_bytes, result.read_wr_count)
+        {
+            Ok(ChildAction::SendReadDone { segment_generation }) => segment_generation,
+            Ok(_) | Err(_) => {
+                return Err((
+                    protocol("Child READ completion produced an invalid action"),
+                    None,
+                ))
             }
         };
-        let result = self.drive_reads(child_id, max_read_size).await;
-        if result.is_err() {
-            let _ = self.fabric.retire_read_child_for_cleanup(child_id).await;
-            return result;
-        }
-        let result = result.expect("checked successful READ drive");
-        // No Storage lease is exported by this transport-only adapter. Close
-        // import/destination after all CQEs and before ReadDone allows Parent
-        // to start source revocation.
-        if !self.fabric.retire_read_child_for_cleanup(child_id).await? {
-            return Err(protocol("successful Child destination did not drain"));
-        }
-        let action = self
-            .state
-            .read_finished(result.completed_bytes, result.read_wr_count)?;
-        let ChildAction::SendReadDone { segment_generation } = action else {
-            return Err(protocol("Child READ completion produced an invalid action"));
-        };
-        self.control
+        if let Err(error) = self
+            .control
             .send(ReadFrame::ReadDone {
                 identity: self.identity,
-                segment_generation,
+                segment_generation: action,
                 completed_length: result.completed_bytes,
                 read_wr_count: result.read_wr_count,
             })
-            .await?;
-        let terminal = self.control.receive().await?;
-        if self.state.on_frame(&terminal)? != ChildAction::Complete {
-            return Err(protocol("Child expected Done after ReadDone"));
+            .await
+        {
+            return Err((error, None));
         }
-        self.control.finish(Some(segment_generation))?;
-        Ok(result)
+        let terminal = match self.control.receive().await {
+            Ok(terminal) => terminal,
+            Err(error) => return Err((error, None)),
+        };
+        if self
+            .state
+            .on_frame(&terminal)
+            .map_err(|error| (error, None))?
+            != ChildAction::Complete
+        {
+            return Err((protocol("Child expected Done after ReadDone"), None));
+        }
+        Ok((
+            result,
+            action,
+            PublishedChildLease {
+                child_id,
+                span,
+            },
+        ))
+    }
+
+    /// Cancel/cleanup path for a failed transport attempt. The wire exchange
+    /// is best-effort: the native cleanup decision never depends on it. The
+    /// owner is retained only when `retire_read_child_for_cleanup` could not
+    /// prove a full drain and close.
+    async fn cancel_after_failure(
+        mut self,
+        child_id: Option<ReadChildId>,
+        error: Error,
+    ) -> ChildTransportFailure {
+        let Some(child_id) = child_id else {
+            return ChildTransportFailure {
+                error,
+                retained_child: None,
+            };
+        };
+        // The state machine is in Reading(generation) whenever a native Child
+        // exists. A failed transition skips only the wire exchange, never the
+        // local cleanup below.
+        let generation = match self.state.cancel() {
+            Ok(ChildAction::SendCancel {
+                segment_generation: Some(generation),
+            }) => Some(generation),
+            _ => None,
+        };
+        if let Some(generation) = generation {
+            let _ = self
+                .control
+                .send(ReadFrame::Cancel {
+                    identity: self.identity,
+                    segment_generation: Some(generation),
+                    reason: "child READ transport failure".into(),
+                })
+                .await;
+        }
+        let counts = match self.fabric.read_child_progress(child_id).await {
+            Ok(progress) => drainable_wr_counts(Some(progress)),
+            Err(_) => None,
+        };
+        let drained = self.fabric.retire_read_child_for_cleanup(child_id).await;
+        let drained = match drained {
+            Ok(true) => true,
+            Ok(false) | Err(_) => false,
+        };
+        if !drained {
+            return ChildTransportFailure {
+                error,
+                retained_child: Some(child_id),
+            };
+        }
+        if let (Some(published_generation), Some((accepted, retired))) = (generation, counts) {
+            if let Ok(ChildAction::SendCancelDrained {
+                segment_generation: Some(wire_generation),
+            }) = self.state.import_drained(accepted, retired)
+            {
+                if wire_generation == published_generation
+                    && self
+                        .control
+                        .send(ReadFrame::CancelDrained {
+                            identity: self.identity,
+                            segment_generation: Some(wire_generation),
+                            accepted_wr_count: accepted,
+                            retired_wr_count: retired,
+                        })
+                        .await
+                        .is_ok()
+                {
+                    let cancelled = timeout(self.completion_timeout, self.control.receive()).await;
+                    if let Ok(Ok(frame)) = cancelled {
+                        if matches!(self.state.on_frame(&frame), Ok(ChildAction::Cancelled)) {
+                            let _ = self.control.finish(Some(wire_generation));
+                        }
+                    }
+                }
+            }
+        }
+        // The native owner is proven closed, but the wire terminal may have
+        // been abandoned. Dropping the control tombstones the lane and the
+        // Parent keeps its export until its own fail-closed cleanup.
+        ChildTransportFailure {
+            error,
+            retained_child: None,
+        }
     }
 
     async fn drive_reads(
@@ -275,11 +482,34 @@ pub(crate) struct ParentSourceSession {
     published_source: Option<(ReadSourceId, u64)>,
 }
 
+/// Terminal kind recorded while waiting for ReadDone. `Cancelled` means the
+/// Child declared a full cancel drain instead of a successful READ; the
+/// release step then answers with `Cancelled` rather than `Done`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ParentTerminal {
+    Success,
+    Cancelled,
+}
+
 pub(crate) struct PendingSourceRevoke {
     pub(crate) source_id: ReadSourceId,
     pub(crate) segment_generation: u64,
     pub(crate) completed_length: u64,
     pub(crate) read_wr_count: u64,
+    pub(crate) terminal: ParentTerminal,
+}
+
+/// A registered Parent source owner that the caller must keep for a later
+/// cleanup pass: the export could not be released inside this attempt.
+/// `segment_generation` is `None` while the Offer was never published.
+pub(crate) struct RetainedSourceOwner {
+    pub(crate) source_id: ReadSourceId,
+    pub(crate) segment_generation: Option<u64>,
+}
+
+pub(crate) struct ParentTransportFailure {
+    pub(crate) error: Error,
+    pub(crate) retained_source: Option<RetainedSourceOwner>,
 }
 
 impl ParentSourceSession {
@@ -305,8 +535,11 @@ impl ParentSourceSession {
         })
     }
 
-    /// Registers and publishes a source, then waits until ReadDone requests the
-    /// provider-specific revoke step. It never fabricates that proof.
+    /// Registers and publishes a source, then waits until ReadDone or a full
+    /// cancel drain requests the provider-specific revoke step. It never
+    /// fabricates that proof. Failures return a `ParentTransportFailure`
+    /// whose retained source must stay registered (and budgeted) until a
+    /// later cleanup pass proves revocation.
     ///
     /// # Safety
     /// `request` must hold the authenticated immutable exact-Piece backing for
@@ -314,44 +547,146 @@ impl ParentSourceSession {
     pub(crate) async unsafe fn publish_and_wait_read_done(
         mut self,
         request: ReadSourceRequest,
-    ) -> Result<(Self, PendingSourceRevoke)> {
+    ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
+        let fail =
+            |error: Error, retained_source: Option<RetainedSourceOwner>| ParentTransportFailure {
+                error,
+                retained_source,
+            };
         if request.peer_id != self.lane_id {
-            return Err(protocol("Parent source request uses the wrong lane"));
+            return Err(fail(
+                protocol("Parent source request uses the wrong lane"),
+                None,
+            ));
         }
-        let ready = self.control.receive().await?;
-        if self.state.on_frame(&ready)? != ParentAction::RegisterSource {
-            return Err(protocol("Parent expected BufferReady"));
+        let ready = match self.control.receive().await {
+            Ok(ready) => ready,
+            Err(error) => return Err(fail(error, None)),
+        };
+        if self.state.on_frame(&ready) != Ok(ParentAction::RegisterSource) {
+            return Err(fail(protocol("Parent expected BufferReady"), None));
         }
         // SAFETY: Supplied by the method contract and validated state identity.
-        let admission = unsafe { self.fabric.register_read_source(request).await? };
+        let admission = unsafe { self.fabric.register_read_source(request).await };
         let offer = match admission {
-            ReadSourceAdmission::Ready(offer) => offer,
-            ReadSourceAdmission::Quarantined { error, .. } => return Err(error),
+            Ok(ReadSourceAdmission::Ready(offer)) => offer,
+            Ok(ReadSourceAdmission::Quarantined { id, error }) => {
+                return Err(fail(
+                    error,
+                    Some(RetainedSourceOwner {
+                        source_id: id,
+                        segment_generation: None,
+                    }),
+                ));
+            }
+            Err(error) => return Err(fail(error, None)),
         };
-        let segment_generation = next_segment_generation()?;
+        let source_id = offer.id;
+        let unpublished = |error: Error| ParentTransportFailure {
+            error,
+            retained_source: Some(RetainedSourceOwner {
+                source_id,
+                segment_generation: None,
+            }),
+        };
+        let segment_generation = match next_segment_generation() {
+            Ok(generation) => generation,
+            Err(error) => return Err(unpublished(error)),
+        };
         let (source_id, offer) =
-            wire_offer(offer, segment_generation, self.effective_max_read_size)?;
-        self.control
+            match wire_offer(offer, segment_generation, self.effective_max_read_size) {
+                Ok(offer) => offer,
+                Err(error) => return Err(unpublished(error)),
+            };
+        if let Err(error) = self
+            .control
             .send(ReadFrame::SegmentOffer {
                 identity: self.identity,
                 offer,
             })
-            .await?;
-        self.state.offer_published(segment_generation)?;
-        self.published_source = Some((source_id, segment_generation));
-        let done = self.control.receive().await?;
-        if self.state.on_frame(&done)? != ParentAction::RevokeSource {
-            return Err(protocol("Parent expected ReadDone"));
+            .await
+        {
+            return Err(ParentTransportFailure {
+                error,
+                retained_source: Some(RetainedSourceOwner {
+                    source_id,
+                    segment_generation: Some(segment_generation),
+                }),
+            });
         }
-        let ReadFrame::ReadDone {
-            completed_length,
-            read_wr_count,
-            ..
-        } = done
-        else {
-            return Err(protocol("Parent expected ReadDone"));
+        if let Err(error) = self.state.offer_published(segment_generation) {
+            return Err(ParentTransportFailure {
+                error,
+                retained_source: Some(RetainedSourceOwner {
+                    source_id,
+                    segment_generation: Some(segment_generation),
+                }),
+            });
+        }
+        self.published_source = Some((source_id, segment_generation));
+        let published = |error: Error| ParentTransportFailure {
+            error,
+            retained_source: Some(RetainedSourceOwner {
+                source_id,
+                segment_generation: Some(segment_generation),
+            }),
         };
-        self.fabric.retire_read_source(source_id).await?;
+        // Only ReadDone and a matching-generation CancelDrained reach the
+        // release stage; Cancel frames only switch the wait target.
+        let (terminal, completed_length, read_wr_count) = loop {
+            let frame = match self.control.receive().await {
+                Ok(frame) => frame,
+                Err(error) => return Err(published(error)),
+            };
+            let terminal = match &frame {
+                ReadFrame::ReadDone { .. } => ParentTerminal::Success,
+                ReadFrame::CancelDrained { .. } => ParentTerminal::Cancelled,
+                _ => match self.state.on_frame(&frame) {
+                    Ok(ParentAction::WaitForChildDrain) => continue,
+                    Ok(_) | Err(_) => {
+                        return Err(published(protocol(
+                            "Parent expected ReadDone or a full cancel drain",
+                        )));
+                    }
+                },
+            };
+            let (completed_length, read_wr_count) = match &frame {
+                ReadFrame::ReadDone {
+                    completed_length,
+                    read_wr_count,
+                    ..
+                } => (*completed_length, *read_wr_count),
+                ReadFrame::CancelDrained {
+                    accepted_wr_count,
+                    retired_wr_count,
+                    ..
+                } => (*accepted_wr_count, *retired_wr_count),
+                _ => {
+                    return Err(published(protocol(
+                        "Parent release stage requires ReadDone or CancelDrained",
+                    )));
+                }
+            };
+            match self.state.on_frame(&frame) {
+                Ok(ParentAction::RevokeSource) => {
+                    break (terminal, completed_length, read_wr_count)
+                }
+                Ok(_) | Err(_) => {
+                    return Err(published(protocol(
+                        "Parent release stage was not authorized by the READ state machine",
+                    )));
+                }
+            }
+        };
+        if let Err(error) = self.fabric.retire_read_source(source_id).await {
+            return Err(ParentTransportFailure {
+                error,
+                retained_source: Some(RetainedSourceOwner {
+                    source_id,
+                    segment_generation: Some(segment_generation),
+                }),
+            });
+        }
         Ok((
             self,
             PendingSourceRevoke {
@@ -359,17 +694,19 @@ impl ParentSourceSession {
                 segment_generation,
                 completed_length,
                 read_wr_count,
+                terminal,
             },
         ))
     }
 
-    /// Executes unregister/release and sends Done after the caller supplies the
-    /// external provider revocation proof.
+    /// Executes unregister/release and sends Done or Cancelled after the
+    /// caller supplies the external provider revocation proof.
     ///
     /// # Safety
     /// The provider's unregister preconditions must hold and remote access to
     /// this exact source generation must have ceased and be unable to resume.
-    /// ReadDone, EOF or timeout alone do not satisfy this contract.
+    /// ReadDone, CancelDrained, EOF or timeout alone do not satisfy this
+    /// contract.
     pub(crate) async unsafe fn revoke_and_finish(
         mut self,
         pending: PendingSourceRevoke,
@@ -393,26 +730,65 @@ impl ParentSourceSession {
         } {
             return Err(protocol("source remained pending after revocation proof"));
         }
-        let ParentAction::SendDone { segment_generation } = self.state.source_released()? else {
-            return Err(protocol("Parent source release produced invalid action"));
-        };
-        if segment_generation != pending.segment_generation {
-            return Err(protocol("Parent source release generation mismatch"));
+        match self.state.source_released()? {
+            ParentAction::SendDone { segment_generation } => {
+                if pending.terminal != ParentTerminal::Success
+                    || segment_generation != pending.segment_generation
+                {
+                    return Err(protocol("Parent terminal mismatch"));
+                }
+                self.control
+                    .send(ReadFrame::Done {
+                        identity: self.identity,
+                        segment_generation,
+                    })
+                    .await?;
+            }
+            ParentAction::SendCancelled { segment_generation } => {
+                if pending.terminal != ParentTerminal::Cancelled
+                    || segment_generation != Some(pending.segment_generation)
+                {
+                    return Err(protocol("Parent terminal mismatch"));
+                }
+                self.control
+                    .send(ReadFrame::Cancelled {
+                        identity: self.identity,
+                        segment_generation,
+                    })
+                    .await?;
+            }
+            _ => return Err(protocol("Parent source release produced invalid action")),
         }
-        self.control
-            .send(ReadFrame::Done {
-                identity: self.identity,
-                segment_generation,
-            })
-            .await?;
         self.published_source = None;
-        self.control.finish(Some(segment_generation))
+        self.control.finish(Some(pending.segment_generation))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wr_progress(accepted: u64, retired: u64) -> ReadChildProgress {
+        ReadChildProgress {
+            piece_length: 8192,
+            accepted_bytes: 8192,
+            retired_bytes: 8192,
+            accepted_wr_count: accepted,
+            retired_wr_count: retired,
+            outstanding_wr_count: usize::try_from(accepted - retired).unwrap_or(usize::MAX),
+            posting_stopped: false,
+            failed: false,
+            read_succeeded: false,
+        }
+    }
+
+    #[test]
+    fn drainable_counts_require_matched_wr_retirement() {
+        assert_eq!(drainable_wr_counts(None), None);
+        assert_eq!(drainable_wr_counts(Some(wr_progress(4, 2))), None);
+        assert_eq!(drainable_wr_counts(Some(wr_progress(4, 4))), Some((4, 4)));
+        assert_eq!(drainable_wr_counts(Some(wr_progress(0, 0))), Some((0, 0)));
+    }
 
     #[test]
     fn progress_validation_requires_exact_monotonic_accounting() {

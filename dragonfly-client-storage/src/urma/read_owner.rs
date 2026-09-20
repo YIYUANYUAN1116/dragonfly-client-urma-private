@@ -119,6 +119,7 @@ pub(crate) struct ReadUsage {
 }
 
 /// This cannot be constructed from a timeout, TCP message or local-only CQE.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedRetirement(ReadOwnerId);
 
 impl VerifiedRetirement {
@@ -132,6 +133,7 @@ impl VerifiedRetirement {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ReapDecision {
     Pending,
     Retired(VerifiedRetirement),

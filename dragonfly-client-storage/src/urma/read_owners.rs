@@ -6,11 +6,12 @@ use super::{
         FfiError, NativeRuntime,
     },
     read_child_owner::{
-        is_read_context, ChildOwner, ChildPostOutcome, ChildProgress, ChildResources, ReadRetired,
+        is_read_context, ChildOwner, ChildPostOutcome, ChildProgress, ChildResources, LeaseSpan,
+        ReadRetired,
     },
     read_owner::{
         OwnerError, QuarantineReason, ReadBudget, ReadDirection, ReadOwnerId, ReadOwnerRegistry,
-        ReadPeer, ReadUsage, ReapError,
+        ReadPeer, ReadUsage, ReapDecision, ReapError,
     },
     read_source_owner::{
         SourceAdmission, SourceAdmissionError, SourceOwner, SourceRevoked, SourceSlot,
@@ -337,6 +338,50 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         self.registry
             .reap_with(id, |bundle| bundle.child_mut()?.reap())
     }
+
+    /// First lease stage: stop posting and close the import while keeping the
+    /// registered buffer and the full budget charge. The owner stays in the
+    /// registry either way.
+    pub(crate) fn drain_child_for_lease(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<(), ReadDispatchError> {
+        let decision = self
+            .registry
+            .retained_owner(id)?
+            .child_mut()?
+            .drain_for_lease()?;
+        match decision {
+            ReapDecision::Pending => Ok(()),
+            ReapDecision::Retired(_) => Err(FfiError::Contract(
+                "lease drain must retain the Child owner",
+            )
+            .into()),
+        }
+    }
+
+    /// Extracts the CPU span of the fully read registered destination buffer.
+    /// The lease itself never leaves the owner thread; only the span crosses.
+    pub(crate) fn publish_child_lease(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<LeaseSpan, ReadDispatchError> {
+        self.registry
+            .retained_owner(id)?
+            .child_mut()?
+            .publish_lease()
+            .map_err(Into::into)
+    }
+
+    /// Final lease stage: close the published lease and complete the reap.
+    /// Requires a retired (or quarantined) owner per registry rules.
+    pub(crate) fn recycle_child_lease(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<bool, ReapError<FfiError>> {
+        self.registry
+            .reap_with(id, |bundle| bundle.child_mut()?.recycle_lease())
+    }
 }
 
 impl<K, R: ChildResources> super::completion::ReadCompletionSink for ReadOwners<K, R> {
@@ -369,6 +414,7 @@ mod tests {
     }
     impl ChildResources for Mock {
         type Wr = ();
+        type Lease = ();
         fn post(&mut self, _: &ReadRequest) -> Result<ChildPost<()>, FfiError> {
             Ok(ChildPost::Posted(()))
         }
@@ -378,6 +424,20 @@ mod tests {
             Ok(())
         }
         fn close_buffer(&mut self) -> Result<(), FfiError> {
+            self.closes.set(self.closes.get() + 1);
+            Ok(())
+        }
+        fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
+            Ok((
+                (),
+                LeaseSpan {
+                    // SAFETY: Mock never dereferences the span.
+                    data: std::ptr::NonNull::dangling().as_ptr(),
+                    length: 0,
+                },
+            ))
+        }
+        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
             self.closes.set(self.closes.get() + 1);
             Ok(())
         }
@@ -570,6 +630,7 @@ mod tests {
         }
         impl ChildResources for UncertainMock {
             type Wr = ();
+            type Lease = ();
             fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<()>, FfiError> {
                 self.context.set(request.user_ctx);
                 Ok(ChildPost::Uncertain((), FfiError::Status(-5)))
@@ -579,6 +640,12 @@ mod tests {
                 Ok(())
             }
             fn close_buffer(&mut self) -> Result<(), FfiError> {
+                Ok(())
+            }
+            fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
+                Err(FfiError::Contract("mock has no lease"))
+            }
+            fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
                 Ok(())
             }
         }

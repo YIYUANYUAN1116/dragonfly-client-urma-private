@@ -41,6 +41,22 @@ pub(crate) struct ReadChildProgress {
     pub(crate) read_succeeded: bool,
 }
 
+/// CPU-visible span of a published READ destination lease. The registered
+/// buffer itself stays owned by the Child owner on the fabric owner thread;
+/// only the pointer identity crosses to Storage. Content is final because
+/// every READ WR retired before publication, so CPU reads cannot race DMA.
+/// The pointer stays valid until recycle_read_child_lease succeeds.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Consumed by the gated READ session state machine.
+pub(crate) struct ReadLeaseSpan {
+    pub(crate) data: *mut u8,
+    pub(crate) length: usize,
+}
+// SAFETY: The span carries no ownership; the backing registered buffer remains
+// on the fabric owner thread until recycle. The pointer is dereferenced only by
+// the Storage consumer between publish and a successful recycle.
+unsafe impl Send for ReadLeaseSpan {}
+
 pub(crate) struct ReadSourceRequest {
     pub(crate) peer_id: u16,
     pub(crate) backing: ReadBacking<()>,
@@ -858,6 +874,52 @@ mod native {
                 posting_stopped: progress.posting_stopped,
                 failed: progress.failed,
                 read_succeeded: progress.read_succeeded,
+            })
+        }
+
+        /// First lease stage: stop posting and close the native import while
+        /// keeping the registered destination buffer and the full budget charge.
+        pub(crate) fn drain_read_child_for_lease(&mut self, id: ReadChildId) -> Result<()> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners
+                .drain_child_for_lease(id.0)
+                .map_err(read_dispatch_error)
+        }
+
+        /// Extracts the CPU span of the fully read registered destination buffer
+        /// for Storage. The lease itself stays on the owner thread until recycle;
+        /// the budget stays charged until the reap completes.
+        pub(crate) fn publish_read_child_lease(&mut self, id: ReadChildId) -> Result<ReadLeaseSpan> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            let span = owners.publish_child_lease(id.0).map_err(read_dispatch_error)?;
+            Ok(ReadLeaseSpan {
+                data: span.data,
+                length: span.length,
+            })
+        }
+
+        /// Final lease stage: close the published lease and finish the reap,
+        /// releasing the budget. Requires a retired (or quarantined) Child and
+        /// joined Storage consumer workers.
+        pub(crate) fn recycle_read_child_lease(&mut self, id: ReadChildId) -> Result<bool> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners.recycle_child_lease(id.0).map_err(|error| match error {
+                super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
+                super::super::read_owner::ReapError::Cleanup(error) => {
+                    native_error("recycle_read_child_lease", error)
+                }
             })
         }
 
