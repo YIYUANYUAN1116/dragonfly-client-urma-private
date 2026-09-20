@@ -7,7 +7,9 @@
 //! UMDK handle.
 
 use super::{
-    buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
+    buffer::{
+        LeaseKind, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease,
+    },
     completion::{
         RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
         RegisteredTxCompletionTx,
@@ -285,9 +287,11 @@ impl UrmaFabric {
         let command_slots = Arc::new(Semaphore::new(command_capacity));
         let (readiness_tx, readiness_rx) = watch::channel(FabricReadiness::Starting);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
+        let (tx_recycled, _) = watch::channel(0u64);
 
         let runtime_config = config.clone();
         let recycle_command_tx = command_tx.clone();
+        let owner_tx_recycled = tx_recycled.clone();
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
             .spawn(move || {
@@ -295,6 +299,7 @@ impl UrmaFabric {
                     config,
                     command_rx,
                     recycle_command_tx,
+                    owner_tx_recycled,
                     readiness_tx,
                     startup_tx,
                 )
@@ -328,6 +333,7 @@ impl UrmaFabric {
                         required_rx_waiters: RequiredRxWaiters::default(),
                         shared_rx_admission: PeerCreditAdmission::new(shared_rx_depth)?,
                         shared_tx_admission: Mutex::new(SharedDepthAdmission::default()),
+                        tx_recycled,
                         shutdown: AsyncMutex::new(()),
                         join: Mutex::new(Some(join)),
                     }),
@@ -660,6 +666,40 @@ impl UrmaFabricHandle {
         .await
     }
 
+    /// Subscribes before an allocator attempt so a recycle between the failed
+    /// reply and the subsequent wait remains observable. Every waiter owns an
+    /// independent watch cursor and sees the same capacity-change generation.
+    pub(crate) fn subscribe_tx_recycles(&self) -> watch::Receiver<u64> {
+        self.inner.tx_recycled.subscribe()
+    }
+
+    pub(crate) async fn wait_for_tx_recycle(
+        &self,
+        tx_recycled: &mut watch::Receiver<u64>,
+    ) -> Result<()> {
+        let mut readiness = self.inner.readiness.clone();
+        match readiness.borrow().clone() {
+            FabricReadiness::Ready => {}
+            FabricReadiness::Failed(error) => {
+                return Err(Error::Protocol(format!("URMA Fabric failed: {error}")))
+            }
+            FabricReadiness::Starting | FabricReadiness::Stopped => return Err(fabric_stopped()),
+        }
+        tokio::select! {
+            changed = tx_recycled.changed() => changed.map_err(|_| fabric_stopped()),
+            changed = readiness.changed() => {
+                changed.map_err(|_| fabric_stopped())?;
+                match readiness.borrow().clone() {
+                    FabricReadiness::Failed(error) => {
+                        Err(Error::Protocol(format!("URMA Fabric failed: {error}")))
+                    }
+                    FabricReadiness::Stopped => Err(fabric_stopped()),
+                    FabricReadiness::Starting | FabricReadiness::Ready => Ok(()),
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)] // B1 ownership API, consumed by B4.
     pub(crate) async fn recycle_tx_window(&self, lease: TxWindowLease) -> Result<usize> {
         self.submit_urgent(|reply| FabricCommand::RecycleTxWindow { lease, reply })
@@ -844,6 +884,7 @@ struct FabricInner {
     required_rx_waiters: RequiredRxWaiters,
     shared_rx_admission: PeerCreditAdmission,
     shared_tx_admission: Mutex<SharedDepthAdmission>,
+    tx_recycled: watch::Sender<u64>,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -950,6 +991,7 @@ fn run_owner(
     config: RuntimeConfig,
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
+    tx_recycled: watch::Sender<u64>,
     readiness_tx: watch::Sender<FabricReadiness>,
     startup_tx: std_mpsc::SyncSender<StartupResult>,
 ) {
@@ -986,9 +1028,12 @@ fn run_owner(
         if runtime.outstanding() == 0 {
             match command_rx.blocking_recv() {
                 Some(envelope) => {
-                    if let OwnerControl::Shutdown(reply) =
-                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
-                    {
+                    if let OwnerControl::Shutdown(reply) = handle_command(
+                        envelope.command,
+                        &mut runtime,
+                        poisoned.as_deref(),
+                        &tx_recycled,
+                    ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
                     }
@@ -1004,9 +1049,12 @@ fn run_owner(
         for _ in 0..MAX_COMMANDS_PER_TICK {
             match command_rx.try_recv() {
                 Ok(envelope) => {
-                    if let OwnerControl::Shutdown(reply) =
-                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
-                    {
+                    if let OwnerControl::Shutdown(reply) = handle_command(
+                        envelope.command,
+                        &mut runtime,
+                        poisoned.as_deref(),
+                        &tx_recycled,
+                    ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
                     }
@@ -1045,6 +1093,7 @@ fn handle_command(
     command: FabricCommand,
     runtime: &mut UrmaRuntime,
     poisoned: Option<&str>,
+    tx_recycled: &watch::Sender<u64>,
 ) -> OwnerControl {
     match command {
         FabricCommand::CreateLane { config, reply } => {
@@ -1111,7 +1160,11 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::RecycleTxWindow { lease, reply } => {
-            let _ = reply.send(runtime.recycle_tx_window(lease));
+            let result = runtime.recycle_tx_window(lease);
+            if result.is_ok() {
+                publish_tx_recycle(tx_recycled);
+            }
+            let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::RecycleRxWindow { lease, reply } => {
@@ -1140,13 +1193,26 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::RecycleLease { recycle } => {
-            if let Err(error) = runtime.recycle_dropped_lease(recycle) {
-                tracing::error!(%error, "failed to recycle dropped URMA registered lease");
+            match runtime.recycle_dropped_lease(recycle) {
+                Ok((_count, kind)) => {
+                    if kind == LeaseKind::Tx {
+                        publish_tx_recycle(tx_recycled);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to recycle dropped URMA registered lease");
+                }
             }
             OwnerControl::Continue
         }
         FabricCommand::Shutdown { reply } => OwnerControl::Shutdown(reply),
     }
+}
+
+fn publish_tx_recycle(tx_recycled: &watch::Sender<u64>) {
+    tx_recycled.send_modify(|generation| {
+        *generation = generation.wrapping_add(1);
+    });
 }
 
 fn poison_once(
@@ -1229,6 +1295,22 @@ fn join_owner(join: &Mutex<Option<JoinHandle<()>>>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::urma::buffer::{LeaseBook, LeaseKind, SlotId};
+
+    #[tokio::test]
+    async fn tx_recycle_generation_closes_wait_race_and_wakes_all_subscribers() {
+        let (tx_recycled, _) = watch::channel(0u64);
+        let mut first = tx_recycled.subscribe();
+        let mut second = tx_recycled.subscribe();
+
+        // Publication happens before either waiter polls `changed`, matching
+        // the allocator-failed/task-descheduled race in the server.
+        publish_tx_recycle(&tx_recycled);
+
+        first.changed().await.unwrap();
+        second.changed().await.unwrap();
+        assert_eq!(*first.borrow_and_update(), 1);
+        assert_eq!(*second.borrow_and_update(), 1);
+    }
 
     #[test]
     fn zero_command_capacity_is_rejected_before_spawning() {

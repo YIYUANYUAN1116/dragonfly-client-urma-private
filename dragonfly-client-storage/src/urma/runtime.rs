@@ -1,6 +1,6 @@
 use super::{
     buffer::{
-        BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
+        BufferPoolConfig, LeaseKind, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
         RxBufferStateCounts, TxWindowLease,
     },
     Error, Result,
@@ -593,14 +593,17 @@ mod native {
             self.completions.outstanding()
         }
 
-        pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
-            let count = self
+        pub(crate) fn recycle_dropped_lease(
+            &mut self,
+            recycle: LeaseRecycle,
+        ) -> Result<(usize, LeaseKind)> {
+            let recycled = self
                 .buffer_pool
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
                 .recycle_dropped_lease(recycle)?;
             self.verify_shared_rx_state()?;
-            Ok(count)
+            Ok(recycled)
         }
 
         pub(crate) fn acquire_tx_window(&mut self, length: usize) -> Result<TxWindowLease> {

@@ -53,8 +53,6 @@ use tracing::{debug, error, info, instrument, warn, Span};
 
 use dragonfly_client_util::shutdown;
 
-const REQUIRED_TX_RETRY_INTERVAL: Duration = Duration::from_millis(1);
-
 /// Absorbs short scheduler hand-off delays while a completed persistent-lane
 /// Piece releases its process-wide transfer permit. Sustained overload still
 /// receives a transfer-local BUSY response.
@@ -828,6 +826,7 @@ impl UrmaServerHandler {
         let acquired = {
             let _waiter = RequiredTxWaiter::new(&self.required_tx_waiters);
             let deadline = time::Instant::now() + self.transfer_timeout;
+            let mut tx_recycled = self.fabric.subscribe_tx_recycles();
             loop {
                 let remaining = deadline.saturating_duration_since(time::Instant::now());
                 if remaining.is_zero() {
@@ -841,7 +840,16 @@ impl UrmaServerHandler {
                 .await
                 {
                     Ok(Err(UrmaError::BufferUnavailable { .. })) => {
-                        time::sleep(REQUIRED_TX_RETRY_INTERVAL.min(remaining)).await;
+                        match time::timeout(
+                            remaining,
+                            self.fabric.wait_for_tx_recycle(&mut tx_recycled),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => break Some(Err(error)),
+                            Err(_) => break None,
+                        }
                     }
                     Ok(result) => break Some(result),
                     Err(_) => break None,

@@ -609,10 +609,11 @@ mod native {
                     })
                     .collect(),
                 free_tx: (0..states.len())
-                    .filter(|&index| states[index].0 == SlotKind::Tx)
+                    .filter(|&index| states[index] == (SlotKind::Tx, SlotState::Free))
+                    .rev()
                     .collect(),
                 free_rx: (0..states.len())
-                    .filter(|&index| states[index].0 == SlotKind::Rx)
+                    .filter(|&index| states[index] == (SlotKind::Rx, SlotState::Free))
                     .collect(),
                 leases: LeaseBook::new(),
                 recycle_notifier: Arc::new(|_| {}),
@@ -973,6 +974,22 @@ mod native {
             self.acquire_tx_window_chunks(&[length])
         }
 
+        pub(super) fn free_tx_candidates(&self, count: usize) -> Result<Vec<usize>> {
+            let available = if self.accepting {
+                self.free_tx.len()
+            } else {
+                0
+            };
+            if count == 0 || available < count {
+                return Err(Error::BufferUnavailable {
+                    kind: "TX",
+                    requested: count,
+                    available,
+                });
+            }
+            Ok(self.free_tx.iter().rev().take(count).copied().collect())
+        }
+
         /// Leases one TX slot per message. Payload spans are logically packed
         /// even when a negotiated chunk is smaller than the fixed slot size;
         /// provider offsets still point at distinct slots so all SENDs may be
@@ -989,8 +1006,8 @@ mod native {
             }
             let slot_capacity = self
                 .slots
-                .iter()
-                .find(|slot| slot.kind == SlotKind::Tx)
+                .first()
+                .filter(|slot| slot.kind == SlotKind::Tx)
                 .map(|slot| slot.len)
                 .ok_or_else(|| Error::InvalidConfiguration("TX pool is empty".into()))?;
             if let Some(length) = chunk_lengths.iter().find(|length| **length > slot_capacity) {
@@ -1012,65 +1029,66 @@ mod native {
                     .checked_add(*length)
                     .ok_or_else(|| Error::InvalidConfiguration("TX window length overflow".into()))
             })?;
-            let available = self
-                .slots
-                .iter()
-                .take_while(|slot| slot.kind == SlotKind::Tx)
-                .filter(|slot| slot.state == SlotState::Free)
-                .count();
-            let start = self
-                .slots
-                .iter()
-                .take_while(|slot| slot.kind == SlotKind::Tx)
-                .map(|slot| slot.state)
-                .collect::<Vec<_>>()
-                .windows(slot_count)
-                .position(|states| states.iter().all(|state| *state == SlotState::Free))
-                .ok_or(Error::BufferUnavailable {
-                    kind: "TX",
-                    requested: slot_count,
-                    available,
-                })?;
             let (base, registered_len) = self
                 .segment_handle()?
                 .data()
                 .map_err(|error| native_error("borrow_tx_window", error))?;
+            let indices = self.free_tx_candidates(slot_count)?;
+            // Validate every fallible layout operation before removing indices
+            // from the free-list. Once reserved, only infallible state changes
+            // remain until LeaseBook issue, whose rollback releases all slots.
+            let prepared = indices
+                .into_iter()
+                .zip(chunk_lengths.iter().zip(&encoded_lengths))
+                .map(|(index, (chunk_length, encoded_length))| {
+                    let slot = self.slots.get(index).ok_or_else(|| {
+                        Error::Protocol("free TX index is outside this buffer pool".into())
+                    })?;
+                    if slot.kind != SlotKind::Tx || slot.state != SlotState::Free {
+                        return Err(Error::Protocol(
+                            "free TX index does not reference a free TX slot".into(),
+                        ));
+                    }
+                    let end = slot.offset.checked_add(*chunk_length).ok_or_else(|| {
+                        Error::InvalidConfiguration("TX window offset overflow".into())
+                    })?;
+                    if end > registered_len {
+                        return Err(Error::InvalidConfiguration(
+                            "TX window exceeds registered Segment".into(),
+                        ));
+                    }
+                    let generation = match slot.generation.wrapping_add(1) {
+                        0 => 1,
+                        generation => generation,
+                    };
+                    let id = SlotId::new(index, generation)?;
+                    let offset = u64::try_from(slot.offset).map_err(|_| {
+                        Error::InvalidConfiguration("TX slot offset exceeds u64".into())
+                    })?;
+                    // SAFETY: offset..end was checked against the live Segment.
+                    let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(slot.offset)) };
+                    Ok((index, id, data, offset, *chunk_length, *encoded_length))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.free_tx.truncate(self.free_tx.len() - slot_count);
             let mut slots = Vec::with_capacity(slot_count);
             let mut spans = Vec::with_capacity(slot_count);
             let mut layouts = Vec::with_capacity(slot_count);
-            for index in start..start + slot_count {
-                self.free_tx.retain(|free| *free != index);
+            for (index, id, data, offset, chunk_length, encoded_length) in prepared {
                 let slot = self
                     .slots
                     .get_mut(index)
-                    .expect("TX window was bounded by slots");
-                slot.generation = slot.generation.wrapping_add(1);
-                if slot.generation == 0 {
-                    slot.generation = 1;
-                }
+                    .expect("free TX index belongs to this pool");
+                slot.generation = id.generation();
                 slot.state = SlotState::LeasedTx;
-                let id = SlotId::new(index, slot.generation)?;
-                let chunk_length = chunk_lengths[slots.len()];
-                let end = slot.offset.checked_add(chunk_length).ok_or_else(|| {
-                    Error::InvalidConfiguration("TX window offset overflow".into())
-                })?;
-                if end > registered_len {
-                    return Err(Error::InvalidConfiguration(
-                        "TX window exceeds registered Segment".into(),
-                    ));
-                }
-                // SAFETY: this slot span was bounds checked against the live Segment.
-                let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(slot.offset)) };
                 spans.push(RegisteredSpan {
                     data,
                     length: chunk_length,
                 });
                 layouts.push(TxLeaseLayout {
                     slot: id,
-                    offset: u64::try_from(slot.offset).map_err(|_| {
-                        Error::InvalidConfiguration("TX slot offset exceeds u64".into())
-                    })?,
-                    length: encoded_lengths[slots.len()],
+                    offset,
+                    length: encoded_length,
                 });
                 slots.push(id);
             }
@@ -1121,9 +1139,12 @@ mod native {
             Ok(count)
         }
 
-        pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
+        pub(crate) fn recycle_dropped_lease(
+            &mut self,
+            recycle: LeaseRecycle,
+        ) -> Result<(usize, LeaseKind)> {
             let kind = self.leases.record(recycle)?.kind;
-            self.recycle(recycle, kind)
+            self.recycle(recycle, kind).map(|count| (count, kind))
         }
 
         fn recycle(&mut self, recycle: LeaseRecycle, expected: LeaseKind) -> Result<usize> {
@@ -1253,6 +1274,43 @@ mod tests {
         assert_eq!(counts.total, 5);
         assert_eq!(counts.accounted(), counts.total);
     }
+
+    #[test]
+    fn tx_free_list_allocates_fragmented_slots_without_scanning_pool_state() {
+        let pool = UrmaBufferPool::from_test_slot_states(&[
+            (SlotKind::Tx, SlotState::Free),
+            (SlotKind::Tx, SlotState::LeasedTx),
+            (SlotKind::Tx, SlotState::Free),
+            (SlotKind::Tx, SlotState::Free),
+            (SlotKind::Rx, SlotState::Free),
+        ]);
+
+        assert_eq!(pool.free_tx_candidates(3).unwrap(), vec![0, 2, 3]);
+        assert!(matches!(
+            pool.free_tx_candidates(4),
+            Err(Error::BufferUnavailable {
+                kind: "TX",
+                requested: 4,
+                available: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn stopped_pool_rejects_tx_free_list_allocation() {
+        let mut pool = UrmaBufferPool::from_test_slot_states(&[(SlotKind::Tx, SlotState::Free)]);
+        pool.stop();
+
+        assert!(matches!(
+            pool.free_tx_candidates(1),
+            Err(Error::BufferUnavailable {
+                kind: "TX",
+                requested: 1,
+                available: 0,
+            })
+        ));
+    }
+
     use std::sync::{mpsc, Mutex};
 
     #[test]
