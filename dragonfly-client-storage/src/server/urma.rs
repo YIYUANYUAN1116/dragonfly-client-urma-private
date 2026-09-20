@@ -1109,6 +1109,8 @@ impl UrmaServerHandler {
         let piece_total_ns = piece_total_start.elapsed().as_nanos() as u64;
         let tx_ring_depth = if tx_overlap_windows > 0 { 2 } else { 1 };
         debug!(
+            task_id = %request.task_id,
+            piece_number = request.piece_number,
             lane_id = session.lane_id(),
             piece_id,
             tx_source,
