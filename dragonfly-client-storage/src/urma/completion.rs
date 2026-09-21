@@ -243,6 +243,13 @@ struct EndpointLifecycle {
     flush_done: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PeerSendCompletionStats {
+    posted: u64,
+    retired: u64,
+    cqes: u64,
+}
+
 /// The single completion consumer for the process-shared JFCs. A JFC must not
 /// be polled independently by individual PeerTargets because any poll may return a
 /// completion belonging to any Jetty attached to that JFC.
@@ -257,6 +264,7 @@ pub(crate) struct CompletionRouter {
     /// belonging to other logical PeerTargets.
     send_order: VecDeque<u64>,
     outstanding_by_peer: HashMap<u16, usize>,
+    send_stats_by_peer: HashMap<u16, PeerSendCompletionStats>,
     /// The one process-shared RM endpoint; receive CQEs must resolve their
     /// source through the PeerTargetRegistry because posted RECV WRs are
     /// anonymous on the shared receive queue.
@@ -281,6 +289,7 @@ impl CompletionRouter {
             outstanding_recv: 0,
             send_order: VecDeque::new(),
             outstanding_by_peer: HashMap::new(),
+            send_stats_by_peer: HashMap::new(),
             endpoint: None,
             targets: PeerTargetRegistry::default(),
             failed_peers: Vec::new(),
@@ -452,6 +461,21 @@ impl CompletionRouter {
         }
         if self.targets.contains(peer_id) {
             self.targets.remove(peer_id)?;
+        }
+        if let Some(stats) = self.send_stats_by_peer.remove(&peer_id) {
+            let sends_per_cqe = if stats.cqes == 0 {
+                0.0
+            } else {
+                stats.retired as f64 / stats.cqes as f64
+            };
+            tracing::info!(
+                peer_id,
+                send_posted = stats.posted,
+                send_retired = stats.retired,
+                send_cqe = stats.cqes,
+                sends_per_cqe,
+                "urma SEND completion summary"
+            );
         }
         Ok(())
     }
@@ -676,6 +700,8 @@ impl CompletionRouter {
                 self.send_order.push_back(user_ctx);
                 self.outstanding_send += 1;
                 *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
+                let stats = self.send_stats_by_peer.entry(token.peer_id).or_default();
+                stats.posted = stats.posted.saturating_add(1);
                 self.stats.send_post += 1;
             }
             OperationType::Recv => {
@@ -977,8 +1003,17 @@ impl CompletionRouter {
             .iter()
             .position(|user_ctx| *user_ctx == record.user_ctx)
             .ok_or_else(|| Error::Protocol("SEND CQE has no ordered frontier".into()))?;
-        let frontier_entry = self.outstanding_for(record.user_ctx)?;
-        if record.status == 0 && !frontier_entry.signaled {
+        let frontier_token = WrToken::decode(record.user_ctx)?;
+        let (frontier_signaled, frontier_sequence) = {
+            let frontier_entry = self.outstanding_for(record.user_ctx)?;
+            (frontier_entry.signaled, frontier_entry.sequence)
+        };
+        let stats = self
+            .send_stats_by_peer
+            .entry(frontier_token.peer_id)
+            .or_default();
+        stats.cqes = stats.cqes.saturating_add(1);
+        if record.status == 0 && !frontier_signaled {
             self.stats.cqe_error += 1;
             return Err(Error::Protocol(
                 "successful SEND CQE corresponds to an unsignaled WR".into(),
@@ -991,7 +1026,7 @@ impl CompletionRouter {
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
-                sequence: frontier_entry.sequence,
+                sequence: frontier_sequence,
                 post_call: None,
             })
         } else {
@@ -1003,7 +1038,6 @@ impl CompletionRouter {
         } else {
             self.stats.send_cqe += 1;
         }
-
         let mut first_routing_error = None;
         for index in 0..=frontier {
             let user_ctx = self
@@ -1011,6 +1045,8 @@ impl CompletionRouter {
                 .pop_front()
                 .expect("frontier position proves a queued SEND");
             let token = WrToken::decode(user_ctx)?;
+            let stats = self.send_stats_by_peer.entry(token.peer_id).or_default();
+            stats.retired = stats.retired.saturating_add(1);
             let mut outstanding = self.take_outstanding(user_ctx)?;
             outstanding
                 .handle
@@ -2028,6 +2064,17 @@ mod tests {
         assert_eq!(router.outstanding_for_peer(1), 0);
         assert_eq!(router.stats().send_post, 3);
         assert_eq!(router.stats().send_cqe, 1);
+        assert_eq!(
+            router.send_stats_by_peer.get(&1),
+            Some(&PeerSendCompletionStats {
+                posted: 3,
+                retired: 3,
+                cqes: 1,
+            })
+        );
+        router.begin_peer_retirement(1).unwrap();
+        router.unregister_peer(1).unwrap();
+        assert!(!router.send_stats_by_peer.contains_key(&1));
     }
 
     #[test]
