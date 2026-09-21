@@ -18,7 +18,6 @@ use crate::content::MappedPiece;
 use crate::rendezvous::{
     PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
-use crate::urma::buffer::BufferPoolConfig;
 use crate::urma::fabric::{FabricReadiness, PeerTargetConfig, UrmaFabric, UrmaFabricHandle};
 use crate::urma::ffi::read::source::{ReadBacking, ReadSourceMemory};
 use crate::urma::ffi::read::ReadToken;
@@ -37,7 +36,7 @@ use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
 use crate::urma::TxWindowLease;
-use crate::urma::{read_owner::ReadBudget, read_owner::ReadCapacity, TpType, TransportMode};
+use crate::urma::{TpType, TransportMode};
 use crate::Storage;
 use dragonfly_client_config::dfdaemon::{Config, UrmaReadServer};
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};

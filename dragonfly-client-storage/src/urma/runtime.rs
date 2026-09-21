@@ -4,7 +4,7 @@ use super::{
         RxBufferStateCounts, TxWindowLease,
     },
     ffi::read::{source::ReadBacking, ReadDescriptor, ReadToken},
-    read_owner::{ReadBudget, ReadOwnerId},
+    read_owner::{ReadBudget, ReadCapacity, ReadOwnerId},
     Error, Result,
 };
 use dragonfly_client_metric::collect_urma_rx_state_metrics;

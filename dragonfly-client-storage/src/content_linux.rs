@@ -636,11 +636,16 @@ impl Content {
             .inspect_err(|error| error!("open {:?} failed: {}", task_path, error))?;
 
         // Digest and positional write share the immutable lease span on one
-        // blocking worker; the lease stays exclusively owned until recycle.
+        // blocking worker. The span points into pinned registered memory and
+        // the caller keeps the lease alive across the join, so the closure
+        // reconstructs the slice from its fixed address without extending
+        // ownership of it.
+        let (data_addr, data_len) = (data.as_ptr(), data.len());
         let (write_ns, pwrite_calls) = {
             let file = file.clone();
             tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
+                let data = unsafe { std::slice::from_raw_parts(data_addr, data_len) };
                 let mut buffers = [IoSlice::new(data)];
                 write_all_vectored_at(&file, &mut buffers, offset)?;
                 Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, 1))

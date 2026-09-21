@@ -267,7 +267,7 @@ impl ChildTransportSession {
         };
         let max_read_size = offer.effective_max_read_size;
         let piece_offset = offer.piece_offset;
-        let digest = offer.digest;
+        let digest = offer.digest.clone();
         let (descriptor, token) = native_descriptor(&offer);
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership; the state machine validated Offer.

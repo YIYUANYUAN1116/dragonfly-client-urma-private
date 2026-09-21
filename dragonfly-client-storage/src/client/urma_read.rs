@@ -113,7 +113,6 @@ impl Drop for UrmaReadPieceLease {
 /// UrmaReadClient downloads pieces over the RM-READ data plane. Errors must
 /// let the caller fall back to the TCP piece transport; READ never has to
 /// succeed for a piece to complete.
-#[derive(Clone)]
 pub struct UrmaReadClient {
     /// config is the configuration of the dfdaemon.
     config: Arc<Config>,
@@ -134,8 +133,23 @@ pub struct UrmaReadClient {
     /// session owns the persistent READ lane shared by pieces of this parent.
     session: ReadSessionSlot,
 
-    /// next_transfer_id allocates per-lane transfer identities.
-    next_transfer_id: AtomicU32,
+    /// next_transfer_id allocates per-lane transfer identities. Clones share
+    /// the counter so concurrent transfers never collide on one identity.
+    next_transfer_id: Arc<AtomicU32>,
+}
+
+impl Clone for UrmaReadClient {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+            fabric: self.fabric.clone(),
+            capability: self.capability.clone(),
+            addr: self.addr.clone(),
+            transfer_timeout: self.transfer_timeout,
+            session: Arc::clone(&self.session),
+            next_transfer_id: Arc::clone(&self.next_transfer_id),
+        }
+    }
 }
 
 impl UrmaReadClient {
@@ -167,7 +181,7 @@ impl UrmaReadClient {
             capability,
             addr,
             session: Arc::new(tokio::sync::Mutex::new(None)),
-            next_transfer_id: AtomicU32::new(1),
+            next_transfer_id: Arc::new(AtomicU32::new(1)),
         }
     }
 
