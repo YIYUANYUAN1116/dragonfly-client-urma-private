@@ -68,10 +68,28 @@ typedef struct dfurma_jetty_descriptor_meta {
     uint32_t opaque_len;
 } dfurma_jetty_descriptor_meta_t;
 
+#define DFURMA_EID_SIZE 16U
+
+#define DFURMA_IMPORT_STAGE_NONE 0U
+#define DFURMA_IMPORT_STAGE_GET_TP 1U
+#define DFURMA_IMPORT_STAGE_IMPORT_EX 2U
+#define DFURMA_IMPORT_STAGE_IMPORT 3U
+
+/* Failure-only diagnostics for Jetty import. EIDs and TP configuration are
+ * connection metadata; bearer tokens are deliberately excluded. */
+typedef struct dfurma_import_diagnostics {
+    uint32_t stage;
+    int32_t native_status;
+    int32_t system_errno;
+    uint32_t tp_count;
+    uint64_t tp_handle;
+    uint32_t tx_psn;
+    uint8_t local_eid[DFURMA_EID_SIZE];
+    uint8_t peer_eid[DFURMA_EID_SIZE];
+} dfurma_import_diagnostics_t;
+
 #define DFURMA_TP_RTP 0U
 #define DFURMA_TP_CTP 1U
-
-#define DFURMA_EID_SIZE 16U
 
 /* Explicit DTO fields, not a memcpy of a provider ABI structure. Version 1 only
  * represents pinned, non-cacheable READ/plain-token Segments without extensions.
@@ -217,7 +235,8 @@ void dfurma_descriptor_free(uint8_t *opaque_data);
 int dfurma_jetty_import(dfurma_jetty_t *jetty,
                         const dfurma_jetty_descriptor_meta_t *meta,
                         const uint8_t *opaque_data, uint32_t opaque_len,
-                        uint32_t token, dfurma_target_t **out);
+                        uint32_t token, dfurma_target_t **out,
+                        dfurma_import_diagnostics_t *diagnostics);
 int dfurma_target_remote_id(dfurma_target_t *target,
                             uint8_t eid[DFURMA_EID_SIZE], uint32_t *uasid,
                             uint32_t *jetty_id);

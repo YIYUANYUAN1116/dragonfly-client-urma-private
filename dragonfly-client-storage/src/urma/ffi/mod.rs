@@ -27,6 +27,9 @@ pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM
 pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
 pub(crate) const TP_RTP: u32 = sys::DFURMA_TP_RTP;
 pub(crate) const TP_CTP: u32 = sys::DFURMA_TP_CTP;
+pub(crate) const IMPORT_STAGE_GET_TP: u32 = sys::DFURMA_IMPORT_STAGE_GET_TP;
+pub(crate) const IMPORT_STAGE_IMPORT_EX: u32 = sys::DFURMA_IMPORT_STAGE_IMPORT_EX;
+pub(crate) const IMPORT_STAGE_IMPORT: u32 = sys::DFURMA_IMPORT_STAGE_IMPORT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {
@@ -116,6 +119,19 @@ pub(crate) enum FfiError {
     Contract(&'static str),
     NullHandle,
     Status(c_int),
+    Import(ImportFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ImportFailure {
+    pub(crate) stage: u32,
+    pub(crate) native_status: i32,
+    pub(crate) system_errno: i32,
+    pub(crate) tp_count: u32,
+    pub(crate) tp_handle: u64,
+    pub(crate) tx_psn: u32,
+    pub(crate) local_eid: [u8; EID_SIZE],
+    pub(crate) peer_eid: [u8; EID_SIZE],
 }
 
 /// Unique Rust owner of the opaque C shim runtime.
@@ -446,6 +462,7 @@ impl JettyHandle {
         // SAFETY: Descriptor bytes are validated by the safe wire layer and
         // remain live for the synchronous shim import call.
         let mut raw_target = std::ptr::null_mut();
+        let mut diagnostics = std::mem::MaybeUninit::<sys::dfurma_import_diagnostics_t>::zeroed();
         let status = unsafe {
             sys::dfurma_jetty_import(
                 jetty.as_ptr(),
@@ -454,10 +471,26 @@ impl JettyHandle {
                 opaque_len,
                 token,
                 &mut raw_target,
+                diagnostics.as_mut_ptr(),
             )
         };
         if status != 0 {
-            return Err(FfiError::Status(status));
+            // SAFETY: The shim requires a diagnostics pointer and initializes
+            // the complete pointer-free DTO before any provider operation.
+            let diagnostics = unsafe { diagnostics.assume_init() };
+            if diagnostics.stage == sys::DFURMA_IMPORT_STAGE_NONE {
+                return Err(FfiError::Status(status));
+            }
+            return Err(FfiError::Import(ImportFailure {
+                stage: diagnostics.stage,
+                native_status: diagnostics.native_status,
+                system_errno: diagnostics.system_errno,
+                tp_count: diagnostics.tp_count,
+                tp_handle: diagnostics.tp_handle,
+                tx_psn: diagnostics.tx_psn,
+                local_eid: diagnostics.local_eid,
+                peer_eid: diagnostics.peer_eid,
+            }));
         }
         Ok(TargetHandle {
             raw: Some(NonNull::new(raw_target).ok_or(FfiError::NullHandle)?),

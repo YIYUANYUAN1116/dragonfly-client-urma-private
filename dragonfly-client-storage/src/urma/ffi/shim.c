@@ -620,9 +620,12 @@ void dfurma_descriptor_free(uint8_t *opaque_data)
 int dfurma_jetty_import(dfurma_jetty_t *jetty,
                           const dfurma_jetty_descriptor_meta_t *meta,
                           const uint8_t *opaque_data, uint32_t opaque_len,
-                          uint32_t token, dfurma_target_t **out)
+                          uint32_t token, dfurma_target_t **out,
+                          dfurma_import_diagnostics_t *diagnostics)
 {
     urma_rjetty_t *rjetty;
+    urma_rjetty_t minimal_rjetty = {0};
+    urma_rjetty_t *import_rjetty;
     dfurma_target_t *target;
     urma_token_t token_value = {0};
     urma_get_tp_cfg_t tp_cfg = {0};
@@ -634,12 +637,13 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
     if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
         meta == NULL || opaque_data == NULL || opaque_len == 0 ||
         opaque_len != meta->opaque_len || opaque_len < sizeof(urma_rjetty_t) ||
-        out == NULL ||
+        out == NULL || diagnostics == NULL ||
         meta->transport_type != (uint32_t)jetty->runtime->device->type ||
         meta->tp_type != (uint32_t)jetty->tp_type) {
         return -EINVAL;
     }
     *out = NULL;
+    (void)memset(diagnostics, 0, sizeof(*diagnostics));
 
     rjetty = malloc(opaque_len);
     if (rjetty == NULL) {
@@ -658,6 +662,26 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
      * the same value before this provider-facing override. */
     rjetty->tp_type = jetty->tp_type;
 
+    /* Single-device perftest and Mooncake exchange only the remote identity
+     * and build a zeroed rjetty. Do the same for descriptors without provider
+     * extensions. Bonding descriptors keep their complete extension payload. */
+    import_rjetty = rjetty;
+    if (opaque_len == sizeof(*rjetty) &&
+        rjetty->flag.bs.has_drv_ext == 0 &&
+        rjetty->flag.bs.has_user_info == 0) {
+        minimal_rjetty.jetty_id = rjetty->jetty_id;
+        minimal_rjetty.trans_mode = URMA_TM_RM;
+        minimal_rjetty.type = URMA_JETTY;
+        minimal_rjetty.tp_type = jetty->tp_type;
+        minimal_rjetty.flag.value = 0;
+        import_rjetty = &minimal_rjetty;
+    }
+
+    (void)memcpy(diagnostics->local_eid,
+                 jetty->jetty->jetty_id.eid.raw, DFURMA_EID_SIZE);
+    (void)memcpy(diagnostics->peer_eid,
+                 import_rjetty->jetty_id.eid.raw, DFURMA_EID_SIZE);
+
     target = calloc(1, sizeof(*target));
     if (target == NULL) {
         free(rjetty);
@@ -674,30 +698,46 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
         tp_cfg.flag.bs.ctp = 1;
         tp_cfg.trans_mode = URMA_TM_RM;
         tp_cfg.local_eid = jetty->jetty->jetty_id.eid;
-        tp_cfg.peer_eid = rjetty->jetty_id.eid;
+        tp_cfg.peer_eid = import_rjetty->jetty_id.eid;
         tp_count = 1;
+        diagnostics->stage = DFURMA_IMPORT_STAGE_GET_TP;
         status = urma_get_tp_list(jetty->runtime->context, &tp_cfg,
                                   &tp_count, &tp_info);
+        diagnostics->native_status = (int32_t)status;
+        diagnostics->system_errno = errno;
+        diagnostics->tp_count = tp_count;
         if (status != URMA_SUCCESS || tp_count != 1) {
+            if (status == URMA_SUCCESS) {
+                diagnostics->native_status = -EPROTO;
+            }
             free(target);
             free(rjetty);
             return status != URMA_SUCCESS ? (int)status : -EPROTO;
         }
         active_cfg.tp_handle = tp_info.tp_handle;
         active_cfg.tp_attr.tx_psn = (uint32_t)rand();
+        diagnostics->stage = DFURMA_IMPORT_STAGE_IMPORT_EX;
+        diagnostics->tp_handle = tp_info.tp_handle;
+        diagnostics->tx_psn = active_cfg.tp_attr.tx_psn;
+        errno = 0;
         target->target = urma_import_jetty_ex(jetty->runtime->context,
-                                              rjetty, &token_value,
+                                              import_rjetty, &token_value,
                                               &active_cfg);
+        diagnostics->system_errno = errno;
     } else {
-        target->target = urma_import_jetty(jetty->runtime->context, rjetty,
+        diagnostics->stage = DFURMA_IMPORT_STAGE_IMPORT;
+        target->target = urma_import_jetty(jetty->runtime->context, import_rjetty,
                                            &token_value);
+        diagnostics->system_errno = errno;
     }
     free(rjetty);
     if (target->target == NULL) {
         int status = dfurma_pointer_error(-EIO);
+        diagnostics->native_status = status;
         free(target);
         return status;
     }
+    diagnostics->stage = DFURMA_IMPORT_STAGE_NONE;
     target->jetty = jetty;
     jetty->target_count++;
     *out = target;

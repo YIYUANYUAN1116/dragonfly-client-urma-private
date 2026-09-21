@@ -53,6 +53,16 @@ pub enum NativeFailure {
     Contract(&'static str),
     MissingHandle,
     Status(i32),
+    Import {
+        stage: u32,
+        native_status: i32,
+        system_errno: i32,
+        tp_count: u32,
+        tp_handle: u64,
+        tx_psn: u32,
+        local_eid: [u8; super::ffi::EID_SIZE],
+        peer_eid: [u8; super::ffi::EID_SIZE],
+    },
 }
 
 pub(crate) fn native_error(operation: &'static str, error: FfiError) -> Error {
@@ -60,6 +70,16 @@ pub(crate) fn native_error(operation: &'static str, error: FfiError) -> Error {
         FfiError::Contract(detail) => NativeFailure::Contract(detail),
         FfiError::NullHandle => NativeFailure::MissingHandle,
         FfiError::Status(status) => NativeFailure::Status(status),
+        FfiError::Import(failure) => NativeFailure::Import {
+            stage: failure.stage,
+            native_status: failure.native_status,
+            system_errno: failure.system_errno,
+            tp_count: failure.tp_count,
+            tp_handle: failure.tp_handle,
+            tx_psn: failure.tx_psn,
+            local_eid: failure.local_eid,
+            peer_eid: failure.peer_eid,
+        },
     };
     Error::Native { operation, failure }
 }
@@ -160,9 +180,44 @@ impl fmt::Display for Error {
                         )
                     }
                 }
+                NativeFailure::Import {
+                    stage,
+                    native_status,
+                    system_errno,
+                    tp_count,
+                    tp_handle,
+                    tx_psn,
+                    local_eid,
+                    peer_eid,
+                } => write!(
+                    f,
+                    "liburma operation {operation} failed during {}: status={} errno={} ({}) tp_count={} tp_handle={} tx_psn={} local_eid={} peer_eid={}",
+                    import_stage_name(*stage),
+                    native_status,
+                    system_errno,
+                    std::io::Error::from_raw_os_error(*system_errno),
+                    tp_count,
+                    tp_handle,
+                    tx_psn,
+                    format_eid(local_eid),
+                    format_eid(peer_eid),
+                ),
             },
         }
     }
+}
+
+fn import_stage_name(stage: u32) -> &'static str {
+    match stage {
+        super::ffi::IMPORT_STAGE_GET_TP => "get_tp_list",
+        super::ffi::IMPORT_STAGE_IMPORT_EX => "import_jetty_ex",
+        super::ffi::IMPORT_STAGE_IMPORT => "import_jetty",
+        _ => "validation",
+    }
+}
+
+fn format_eid(eid: &[u8; super::ffi::EID_SIZE]) -> String {
+    eid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl std::error::Error for Error {}
@@ -177,5 +232,27 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("status -1"));
         assert!(display.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn import_failure_identifies_provider_stage_and_connection_metadata() {
+        let error = native_error(
+            "import_jetty",
+            FfiError::Import(super::super::ffi::ImportFailure {
+                stage: super::super::ffi::IMPORT_STAGE_IMPORT_EX,
+                native_status: -1,
+                system_errno: 1,
+                tp_count: 1,
+                tp_handle: 42,
+                tx_psn: 7,
+                local_eid: [0x11; super::super::ffi::EID_SIZE],
+                peer_eid: [0x22; super::super::ffi::EID_SIZE],
+            }),
+        );
+        let display = error.to_string();
+        assert!(display.contains("during import_jetty_ex"));
+        assert!(display.contains("tp_count=1 tp_handle=42 tx_psn=7"));
+        assert!(display.contains("local_eid=11111111111111111111111111111111"));
+        assert!(display.contains("peer_eid=22222222222222222222222222222222"));
     }
 }
