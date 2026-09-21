@@ -1321,7 +1321,7 @@ impl UrmaServerHandler {
         Ok(PieceSource::Reader(reader))
     }
 
-    /// Serves one RM-READ lane: version-5 handshake, jetty cross-import, and
+    /// Serves one RM-READ lane: version-5 handshake, Child-side Jetty import, and
     /// Child-initiated transfer admission. Only control frames use this TCP
     /// stream; Piece bytes move inside the registered READ budget.
     async fn handle_read_lane(
@@ -1342,21 +1342,13 @@ impl UrmaServerHandler {
                 ));
             }
         };
-        let child_descriptor = match &connect {
-            ReadHandshake::Connect { descriptor, .. } => descriptor.clone(),
-            ReadHandshake::Connected { .. } => {
-                return Err(client_error(UrmaError::Protocol(
-                    "READ lane handshake must begin with Connect".to_string(),
-                )));
-            }
-        };
         let (session_generation, effective_max_read_size, _) = connect
             .validate_connect(&read.capability)
             .map_err(client_error)?;
 
-        // READ rides on the shared RM PeerTarget namespace. Exchange both
-        // descriptors before importing: CTP TP-aware import needs both peers
-        // to know the opposite EID before they activate local TP handles.
+        // READ has a fixed one-sided direction. The Child imports this local
+        // endpoint and posts READs; the Parent only registers source memory,
+        // so importing the Child Jetty would create an unused reverse target.
         let (lane_id, parent_descriptor) = self
             .fabric
             .create_lane(self.peer_config)
@@ -1372,10 +1364,6 @@ impl UrmaServerHandler {
         )
         .await
         {
-            let _ = self.fabric.close_lane(lane_id).await;
-            return Err(client_error(error));
-        }
-        if let Err(error) = self.fabric.connect_lane(lane_id, child_descriptor).await {
             let _ = self.fabric.close_lane(lane_id).await;
             return Err(client_error(error));
         }

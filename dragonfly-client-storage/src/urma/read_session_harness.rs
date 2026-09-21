@@ -5,8 +5,8 @@
 //! in-memory source, the Child owns a fabric-registered destination, and TCP
 //! carries the production version-5 control protocol. With no explicit role,
 //! the test also starts a local Child process for providers that support RM
-//! loopback. This covers handshake, peer import, transfer routing, READ
-//! completion, publication, CPU consumption, recycle, and native shutdown.
+//! loopback. This covers handshake, Child-side peer import, transfer routing,
+//! READ completion, publication, CPU consumption, recycle, and native shutdown.
 //!
 //! Gated behind `#[ignore]` because initialization opens a real provider.
 //! Run with:
@@ -251,10 +251,9 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
         .await
         .map_err(|error| Error::Protocol(format!("Parent handshake read failed: {error}")))?;
     let capability = lane_capability(&fabric);
-    let (session_generation, _, child_descriptor) = connect
+    let (session_generation, _, _) = connect
         .validate_connect(&capability)
         .map_err(|error| Error::Protocol(format!("Parent Connect rejected: {error}")))?;
-    let child_descriptor = child_descriptor.to_vec();
     let (lane_id, parent_descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
     write_handshake(
         &mut stream,
@@ -266,13 +265,9 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
     )
     .await
     .map_err(|error| Error::Protocol(format!("Parent Connected write failed: {error}")))?;
-    // CTP TP-aware import needs both peers to know the opposite EID before
-    // either side activates its local TP handle. Publish our descriptor before
-    // importing the Child so both sides can enter connect concurrently.
-    fabric
-        .connect_lane(lane_id, child_descriptor)
-        .await
-        .map_err(|error| Error::Protocol(format!("Parent lane connect failed: {error}")))?;
+    // This lane has a fixed one-sided direction: only the Child posts READs.
+    // The Parent registers source memory and therefore does not need an
+    // imported target for the Child Jetty.
 
     let lane = ReadLaneControl::spawn(stream, session_generation, 4, 16)?;
     let identity = ReadTransferIdentity {
