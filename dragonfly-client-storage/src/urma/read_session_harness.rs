@@ -1,15 +1,16 @@
-//! Single-process memory-to-memory READ session harness.
+//! Two-process memory-to-memory READ session harness.
 //!
-//! One process runs both endpoints on one real URMA fabric: the Parent hosts a
-//! boxed in-memory source, the Child owns a fabric-registered destination, and
-//! the control plane is a tokio duplex pair. The test proves the full lease
-//! flow end to end: wire handshake → registration → READ → drain → publish →
-//! CPU consumption of the final span → recycle (budget release).
+//! The test executable starts a second copy of itself so each endpoint owns an
+//! independent real URMA context and RM Jetty. The Parent hosts a boxed
+//! in-memory source, the Child owns a fabric-registered destination, and TCP
+//! carries the production version-5 control protocol. This covers handshake,
+//! peer import, transfer routing, READ completion, publication, CPU
+//! consumption, recycle, and orderly native shutdown.
 //!
 //! Gated behind `#[ignore]` because initialization opens a real provider.
 //! Run with:
 //! `URMA_TEST_DEVICE=urma0 cargo test -p dragonfly-client-storage --features urma \
-//!  single_process_memory_to_memory -- --ignored`
+//!  single_process_memory_to_memory -- --ignored --nocapture`
 
 use super::{
     fabric::{PeerTargetConfig, UrmaFabric},
@@ -33,7 +34,11 @@ use crate::urma::{
     read_owner::{ReadBudget, ReadCapacity},
     TpType,
 };
-use std::time::Duration;
+use std::{
+    process::{Command, ExitStatus, Stdio},
+    time::Duration,
+};
+use tokio::net::{TcpListener, TcpStream};
 
 const PIECE_LENGTH: u64 = 256 * 1024;
 const MAX_READ_SIZE: u32 = 1024 * 1024;
@@ -41,6 +46,10 @@ const MAX_JFS_SGE: u32 = 4;
 const MAX_OUTSTANDING: usize = 8;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const CHILD_ROLE_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_CHILD";
+const CONTROL_ADDR_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_ADDR";
+const EXACT_TEST_NAME: &str =
+    "urma::read_session_harness::single_process_memory_to_memory_read_session";
 
 fn read_budget() -> ReadRuntimeConfig {
     let cap = |bytes: u64, entries| ReadCapacity { bytes, entries };
@@ -59,8 +68,6 @@ fn read_budget() -> ReadRuntimeConfig {
 }
 
 fn harness_fabric(device: &str, eid_index: u32) -> Result<UrmaFabricHandle> {
-    // The source registration and the destination allocation both live in the
-    // registered budget; tx bytes only reserve room for the source direction.
     let config = RuntimeConfig::new(device, eid_index)
         .with_registered_budget(4 * 1024 * 1024, 2 * 1024 * 1024)?
         .with_tp_type(TpType::Rtp)
@@ -81,145 +88,161 @@ fn lane_capability(fabric: &UrmaFabricHandle) -> ReadLaneCapability {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a real URMA provider; set URMA_TEST_DEVICE and URMA_TEST_EID_INDEX"]
-async fn single_process_memory_to_memory_read_session() -> Result<()> {
-    let device = std::env::var("URMA_TEST_DEVICE").unwrap_or_else(|_| "urma0".to_string());
-    let eid_index: u32 = std::env::var("URMA_TEST_EID_INDEX")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let fabric = harness_fabric(&device, eid_index)?;
+fn source_bytes() -> Vec<u8> {
+    (0..PIECE_LENGTH).map(|index| (index % 251) as u8).collect()
+}
 
-    // Lanes: created in the fabric namespace, then cross-connected so each
-    // side resolves the other as its RM peer target.
-    let (parent_lane_id, parent_descriptor) =
-        fabric.create_lane(PeerTargetConfig::default()).await?;
-    let (child_lane_id, child_descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
+async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
+    let fabric = harness_fabric(device, eid_index)?;
+    let (lane_id, descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
+    let capability = lane_capability(&fabric);
+    let session_generation = next_session_generation()?;
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| Error::Protocol(format!("Child control connect failed: {error}")))?;
+
+    write_handshake(
+        &mut stream,
+        &ReadHandshake::Connect {
+            capability: capability.clone(),
+            session_generation,
+            descriptor,
+        },
+    )
+    .await
+    .map_err(|error| Error::Protocol(format!("Child Connect write failed: {error}")))?;
+    let connected = read_handshake(&mut stream)
+        .await
+        .map_err(|error| Error::Protocol(format!("Child handshake read failed: {error}")))?;
+    let (_, parent_descriptor) = connected
+        .validate_connected(&capability, session_generation)
+        .map_err(|error| Error::Protocol(format!("Child Connected rejected: {error}")))?;
     fabric
-        .connect_lane(child_lane_id, parent_descriptor)
+        .connect_lane(lane_id, parent_descriptor.to_vec())
         .await
         .map_err(|error| Error::Protocol(format!("Child lane connect failed: {error}")))?;
-    fabric
-        .connect_lane(parent_lane_id, child_descriptor)
-        .await
-        .map_err(|error| Error::Protocol(format!("Parent lane connect failed: {error}")))?;
 
-    // Version 5 READ handshake over a duplex stream: the Child sends Connect,
-    // the Parent validates it and answers with Connected. Each side then
-    // spawns its transfer dispatcher on the same stream.
-    let (mut parent_io, mut child_io) = tokio::io::duplex(64 * 1024);
-    let session_generation = next_session_generation()?;
-    let parent_capability = lane_capability(&fabric);
-    let child_capability = lane_capability(&fabric);
-    let parent_side = async {
-        let connect = read_handshake(&mut parent_io)
-            .await
-            .map_err(|error| Error::Protocol(format!("Parent handshake read failed: {error}")))?;
-        connect
-            .validate_connect(&parent_capability)
-            .map_err(|error| Error::Protocol(format!("Parent Connect rejected: {error}")))?;
-        write_handshake(
-            &mut parent_io,
-            &ReadHandshake::Connected {
-                capability: parent_capability,
-                session_generation: connect.session_generation(),
-                descriptor: b"parent-lane".to_vec(),
-            },
-        )
-        .await
-        .map_err(|error| Error::Protocol(format!("Parent Connected write failed: {error}")))?;
-        ReadLaneControl::spawn(parent_io, session_generation, 4, 16)
-    };
-    let child_side = async {
-        write_handshake(
-            &mut child_io,
-            &ReadHandshake::Connect {
-                capability: child_capability.clone(),
-                session_generation,
-                descriptor: b"child-lane".to_vec(),
-            },
-        )
-        .await
-        .map_err(|error| Error::Protocol(format!("Child Connect write failed: {error}")))?;
-        let connected = read_handshake(&mut child_io)
-            .await
-            .map_err(|error| Error::Protocol(format!("Child handshake read failed: {error}")))?;
-        connected
-            .validate_connected(&child_capability, session_generation)
-            .map_err(|error| Error::Protocol(format!("Child Connected rejected: {error}")))?;
-        ReadLaneControl::spawn(child_io, session_generation, 4, 16)
-    };
-    let (parent_lane, child_lane) = tokio::join!(parent_side, child_side);
-    let parent_lane = parent_lane?;
-    let child_lane = child_lane?;
-
-    // Route the transfer identity through the lane dispatchers. The Child
-    // registers statically (it knows its own identity); the Parent admits the
-    // transfer dynamically when the initiating BufferReady arrives.
+    let lane = ReadLaneControl::spawn(stream, session_generation, 4, 16)?;
     let identity = ReadTransferIdentity {
         session_generation,
         transfer_id: 1,
         metadata_generation: 1,
     };
-    let child_control = child_lane.register(identity)?;
-    let parent_fabric = fabric.clone();
-
-    let mut source_bytes = vec![0u8; PIECE_LENGTH as usize];
-    for (index, byte) in source_bytes.iter_mut().enumerate() {
-        *byte = (index % 251) as u8;
+    let control = lane.register(identity)?;
+    // SAFETY: The version-5 handshake generation-binds the authenticated peer
+    // descriptor and this process exclusively owns the destination Piece.
+    let session = ChildTransportSession::new(
+        fabric.clone(),
+        lane_id,
+        control,
+        identity,
+        ReadPieceLocator {
+            kind: crate::rendezvous::PieceKind::Piece,
+            task_id: "harness-task".to_string(),
+            piece_number: 1,
+        },
+        PIECE_LENGTH,
+        PIECE_LENGTH,
+        MAX_READ_SIZE,
+        MAX_OUTSTANDING,
+        POLL_INTERVAL,
+        COMPLETION_TIMEOUT,
+    )?;
+    let success = unsafe { session.run_transport_only().await }.map_err(|failure| failure.error)?;
+    let lease = success.lease;
+    if lease.span.length as u64 != PIECE_LENGTH {
+        return Err(Error::Protocol(
+            "published READ lease length mismatch".into(),
+        ));
     }
-    let expected_bytes = source_bytes.clone();
+    // SAFETY: all READ WRs retired before publication. The lease prevents
+    // recycle while the immutable span is consumed here.
+    let consumed = unsafe { std::slice::from_raw_parts(lease.span.data, lease.span.length) };
+    if consumed != source_bytes().as_slice() {
+        return Err(Error::Protocol(
+            "published READ lease content diverged from the Parent source".into(),
+        ));
+    }
+    if !fabric.recycle_published_child_lease(lease.child_id).await? {
+        return Err(Error::Protocol(
+            "recycled READ lease did not prove full budget release".into(),
+        ));
+    }
 
-    // Child: run the lease-flow transport, consume the published span, recycle.
-    let child_fabric = fabric.clone();
-    let child_task = tokio::spawn(async move {
-        // SAFETY: The harness performs the authenticated duplex handshake and
-        // the destination allocation is exclusively owned by this transfer.
-        let session = ChildTransportSession::new(
-            child_fabric.clone(),
-            child_lane_id,
-            child_control,
-            identity,
-            ReadPieceLocator {
-                kind: crate::rendezvous::PieceKind::Piece,
-                task_id: "harness-task".to_string(),
-                piece_number: 1,
-            },
-            PIECE_LENGTH,
-            PIECE_LENGTH,
-            MAX_READ_SIZE,
-            MAX_OUTSTANDING,
-            POLL_INTERVAL,
-            COMPLETION_TIMEOUT,
-        )?;
-        let success =
-            unsafe { session.run_transport_only().await }.map_err(|failure| failure.error)?;
-        let lease = success.lease;
-        assert_eq!(lease.span.length as u64, PIECE_LENGTH);
-        // SAFETY: Every READ WR retired before publication, so the content is
-        // final and no DMA touches the buffer until recycle closes it.
-        let consumed = unsafe { std::slice::from_raw_parts(lease.span.data, lease.span.length) };
-        if consumed != expected_bytes.as_slice() {
-            return Err(Error::Protocol(
-                "published READ lease content diverged from the Parent source".into(),
-            ));
-        }
-        if !child_fabric
-            .recycle_published_child_lease(lease.child_id)
-            .await?
+    drop(lane);
+    fabric.close_lane(lane_id).await?;
+    fabric.shutdown().await
+}
+
+struct ActiveParent {
+    lane: ReadLaneControl,
+    fabric: UrmaFabricHandle,
+    lane_id: u16,
+}
+
+impl ActiveParent {
+    async fn shutdown(self) -> Result<()> {
+        drop(self.lane);
+        self.fabric.close_lane(self.lane_id).await?;
+        self.fabric.shutdown().await
+    }
+}
+
+async fn wait_child(child: &mut std::process::Child) -> Result<ExitStatus> {
+    let deadline = tokio::time::Instant::now() + COMPLETION_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| Error::Protocol(format!("wait for Child process failed: {error}")))?
         {
-            return Err(Error::Protocol(
-                "recycled READ lease did not prove full budget release".into(),
-            ));
+            return Ok(status);
         }
-        Ok(())
-    });
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Protocol("Child process exit timed out".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
-    // Parent: accept the dynamically admitted transfer, publish the immutable
-    // in-memory source, and wait at the revoke gate until the Child reports
-    // ReadDone.
-    let accepted = parent_lane
+async fn run_parent(device: &str, eid_index: u32, listener: TcpListener) -> Result<ActiveParent> {
+    let fabric = harness_fabric(device, eid_index)?;
+    let (mut stream, _) = tokio::time::timeout(COMPLETION_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| Error::Protocol("Parent control accept timed out".into()))?
+        .map_err(|error| Error::Protocol(format!("Parent control accept failed: {error}")))?;
+    let connect = read_handshake(&mut stream)
+        .await
+        .map_err(|error| Error::Protocol(format!("Parent handshake read failed: {error}")))?;
+    let capability = lane_capability(&fabric);
+    let (session_generation, _, child_descriptor) = connect
+        .validate_connect(&capability)
+        .map_err(|error| Error::Protocol(format!("Parent Connect rejected: {error}")))?;
+    let child_descriptor = child_descriptor.to_vec();
+    let (lane_id, parent_descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
+    fabric
+        .connect_lane(lane_id, child_descriptor)
+        .await
+        .map_err(|error| Error::Protocol(format!("Parent lane connect failed: {error}")))?;
+    write_handshake(
+        &mut stream,
+        &ReadHandshake::Connected {
+            capability,
+            session_generation,
+            descriptor: parent_descriptor,
+        },
+    )
+    .await
+    .map_err(|error| Error::Protocol(format!("Parent Connected write failed: {error}")))?;
+
+    let lane = ReadLaneControl::spawn(stream, session_generation, 4, 16)?;
+    let identity = ReadTransferIdentity {
+        session_generation,
+        transfer_id: 1,
+        metadata_generation: 1,
+    };
+    let accepted = lane
         .accept_transfer(COMPLETION_TIMEOUT)
         .await
         .ok_or_else(|| Error::Protocol("Parent READ accept timed out".into()))?;
@@ -228,9 +251,9 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
             "Parent accepted a READ transfer with the wrong identity".into(),
         ));
     }
-    let (parent_session, _locator) = ParentSourceSession::accept(
-        parent_fabric,
-        parent_lane_id,
+    let (session, _locator) = ParentSourceSession::accept(
+        fabric.clone(),
+        lane_id,
         accepted.control,
         accepted.buffer_ready,
         0,
@@ -238,11 +261,11 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
         MAX_READ_SIZE,
     )?;
     let (parent, pending) = unsafe {
-        parent_session
+        session
             .publish_and_wait_read_done(super::runtime::ReadSourceRequest {
-                peer_id: parent_lane_id,
+                peer_id: lane_id,
                 backing: ReadBacking::new(
-                    ReadSourceMemory::Bytes(source_bytes.into_boxed_slice()),
+                    ReadSourceMemory::Bytes(source_bytes().into_boxed_slice()),
                     (),
                 ),
                 token: ReadToken::new(0x1234_5678),
@@ -250,19 +273,84 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
             .await
     }
     .map_err(|failure| failure.error)?;
-    assert_eq!(
-        pending.terminal,
-        super::read_session::ParentTerminal::Success
-    );
-    assert_eq!(pending.completed_length, PIECE_LENGTH);
+    if pending.terminal != super::read_session::ParentTerminal::Success
+        || pending.completed_length != PIECE_LENGTH
+    {
+        return Err(Error::Protocol(
+            "Parent received an invalid READ terminal state".into(),
+        ));
+    }
 
-    // Provider revocation proof: single-process harness where the Child has
-    // closed its import and the Parent received the matching ReadDone, so
-    // remote access to this source generation has ceased.
+    // SAFETY: this controlled child is the only descriptor recipient and its
+    // state machine closed the import before sending the matching ReadDone.
+    // This proves this test's cooperative lifetime; it does not establish the
+    // provider-wide stale-descriptor revocation property used by production.
     unsafe { parent.revoke_and_finish(pending).await }?;
 
-    child_task
+    // Done is queued on the control writer. Keep the lane alive until the
+    // Child exits so dropping it cannot race delivery of the terminal frame.
+    Ok(ActiveParent {
+        lane,
+        fabric,
+        lane_id,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real URMA provider; set URMA_TEST_DEVICE and URMA_TEST_EID_INDEX"]
+async fn single_process_memory_to_memory_read_session() -> Result<()> {
+    let device = std::env::var("URMA_TEST_DEVICE").unwrap_or_else(|_| "urma0".to_string());
+    let eid_index: u32 = std::env::var("URMA_TEST_EID_INDEX")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    if std::env::var_os(CHILD_ROLE_ENV).is_some() {
+        let address = std::env::var(CONTROL_ADDR_ENV).map_err(|_| {
+            Error::InvalidConfiguration(format!("{CONTROL_ADDR_ENV} is not set for child"))
+        })?;
+        return run_child(&device, eid_index, &address).await;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|error| Error::Protocol(format!("Child task failed: {error}")))??;
+        .map_err(|error| Error::Protocol(format!("Parent control bind failed: {error}")))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| Error::Protocol(format!("Parent local address failed: {error}")))?;
+    let executable = std::env::current_exe()
+        .map_err(|error| Error::Protocol(format!("resolve test executable failed: {error}")))?;
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            EXACT_TEST_NAME,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ROLE_ENV, "1")
+        .env(CONTROL_ADDR_ENV, address.to_string())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| Error::Protocol(format!("spawn Child test process failed: {error}")))?;
+
+    let parent = match run_parent(&device, eid_index, listener).await {
+        Ok(parent) => parent,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let status = wait_child(&mut child).await;
+    let shutdown = parent.shutdown().await;
+    let status = status?;
+    shutdown?;
+    if !status.success() {
+        return Err(Error::Protocol(format!(
+            "Child test process exited with {status}"
+        )));
+    }
     Ok(())
 }
