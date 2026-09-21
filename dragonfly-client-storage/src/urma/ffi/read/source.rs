@@ -1,5 +1,6 @@
-//! Parent-side source registration with explicit backing retention.
-//! Native unregister, remote revocation proof and backing release are separate.
+//! Parent-side source registration with explicit Storage keepalive retention.
+//! The shim owns the aligned registered copy; native unregister, remote
+//! revocation proof and keepalive release remain separate.
 
 use super::{sys, FfiError, ReadDescriptor, ReadToken};
 use crate::urma::ffi::{status_result, NativeRuntime};
@@ -42,7 +43,8 @@ impl<K> ReadBacking<K> {
 }
 
 /// Rejected means no registration call occurred and backing may be released.
-/// Uncertain owns the backing and token even though registration returned NULL.
+/// Uncertain owns the Storage keepalive and native copy/token even when the
+/// registration result cannot be classified as a clean rejection.
 pub(crate) enum SourceRegistration<K> {
     Registered(ReadSource<K>),
     Rejected {
@@ -57,7 +59,7 @@ pub(crate) enum SourceRegistration<K> {
 
 pub(crate) struct ReadSource<K> {
     raw: Option<NonNull<sys::dfurma_read_source_t>>,
-    backing: Option<ReadBacking<K>>,
+    keepalive: Option<K>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -95,13 +97,15 @@ impl<K> ReadSource<K> {
         };
         let Some(raw) = NonNull::new(raw) else {
             if status == 0 {
-                // Broken shim contract: we cannot prove backing was not granted.
-                // Retain it even without a usable native cleanup handle.
+                // Broken shim contract: retain the Storage guard even without
+                // a usable cleanup handle. The caller memory can be dropped
+                // because the shim contract copied it synchronously.
+                let (_, keepalive) = backing.into_parts();
                 return SourceRegistration::Uncertain {
                     error: FfiError::NullHandle,
                     source: Self {
                         raw: None,
-                        backing: Some(backing),
+                        keepalive: Some(keepalive),
                         _not_send_sync: PhantomData,
                     },
                 };
@@ -111,9 +115,10 @@ impl<K> ReadSource<K> {
                 backing,
             };
         };
+        let (_, keepalive) = backing.into_parts();
         let source = Self {
             raw: Some(raw),
-            backing: Some(backing),
+            keepalive: Some(keepalive),
             _not_send_sync: PhantomData,
         };
         if status == 0 {
@@ -133,7 +138,8 @@ impl<K> ReadSource<K> {
             .raw
             .ok_or(FfiError::Contract("READ source is closed"))?;
         let mut descriptor = std::mem::MaybeUninit::<sys::dfurma_read_descriptor_t>::uninit();
-        // SAFETY: Source owns its backing; successful export initializes this DTO.
+        // SAFETY: Source owns its native registration; successful export
+        // initializes this DTO.
         status_result(unsafe {
             sys::dfurma_read_source_descriptor(raw.as_ptr(), descriptor.as_mut_ptr())
         })?;
@@ -161,8 +167,9 @@ impl<K> ReadSource<K> {
         let raw = self
             .raw
             .ok_or(FfiError::Contract("READ source is closed"))?;
-        // SAFETY: Unique live wrapper; no backing is freed. Provider preconditions
-        // are the caller's responsibility; the shim retains the wrapper on success.
+        // SAFETY: Unique live wrapper; no native memory or keepalive is freed.
+        // Provider preconditions are the caller's responsibility; the shim
+        // retains the wrapper on success.
         status_result(unsafe { sys::dfurma_read_source_unregister(raw.as_ptr()) })
     }
 
@@ -170,8 +177,8 @@ impl<K> ReadSource<K> {
     /// Independently prove that all remote access has ceased and cannot resume,
     /// including stale-token access. Native unregister success is insufficient.
     /// For failed registration, verify any provider grant/pin rollback as well.
-    /// Success returns the memory and Storage/budget guards; dropping them is then safe.
-    pub(crate) unsafe fn release_after_revoke(&mut self) -> Result<ReadBacking<K>, FfiError> {
+    /// Success returns the Storage/budget guard; dropping it is then safe.
+    pub(crate) unsafe fn release_after_revoke(&mut self) -> Result<K, FfiError> {
         let raw = self
             .raw
             .ok_or(FfiError::Contract("READ source is closed"))?;
@@ -179,17 +186,20 @@ impl<K> ReadSource<K> {
         // and retains the wrapper/token on token-release failure.
         status_result(unsafe { sys::dfurma_read_source_release_after_revoke(raw.as_ptr()) })?;
         self.raw = None;
-        Ok(self.backing.take().expect("live READ source owns backing"))
+        Ok(self
+            .keepalive
+            .take()
+            .expect("live READ source owns a keepalive"))
     }
 }
 
 impl<K> Drop for ReadSource<K> {
     fn drop(&mut self) {
-        // Drop cannot establish remote revocation. Retain memory AND Storage/budget
-        // guards, even after successful native unregister. Runtime integration must
-        // keep this owner in an explicit quarantine/reap registry instead of dropping.
-        if let Some(backing) = self.backing.take() {
-            std::mem::forget(backing);
+        // Drop cannot establish remote revocation. Retain the Storage/budget
+        // guard even after successful native unregister. The native shim owns
+        // and retains its aligned registered memory until explicit release.
+        if let Some(keepalive) = self.keepalive.take() {
+            std::mem::forget(keepalive);
         }
     }
 }
@@ -207,25 +217,21 @@ mod tests {
     }
 
     #[test]
-    fn source_drop_retains_memory_and_keepalive_without_native_cleanup() {
+    fn source_drop_retains_keepalive_without_native_cleanup() {
         let drops = Rc::new(Cell::new(0));
-        let mut memory = vec![1u8, 2, 3].into_boxed_slice();
-        let memory_pointer = memory.as_mut() as *mut [u8];
         let mut guard = Box::new(Guard(drops.clone()));
         let guard_pointer = guard.as_mut() as *mut Guard;
         let source = ReadSource {
             // No native resource exists in this test; Drop must not call FFI.
             raw: Some(NonNull::dangling()),
-            backing: Some(ReadBacking::new(ReadSourceMemory::Bytes(memory), guard)),
+            keepalive: Some(guard),
             _not_send_sync: PhantomData,
         };
         drop(source);
         assert_eq!(drops.get(), 0);
-        // SAFETY: These exact Box allocations were deliberately retained by Drop.
-        // No native DMA exists in this test; reclaim them to avoid test-only leaks.
+        // SAFETY: This exact Box allocation was deliberately retained by Drop.
+        // No native DMA exists in this test; reclaim it to avoid a test-only leak.
         unsafe {
-            assert_eq!(&*memory_pointer, &[1, 2, 3]);
-            drop(Box::from_raw(memory_pointer));
             drop(Box::from_raw(guard_pointer));
         }
         assert_eq!(drops.get(), 1);

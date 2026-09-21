@@ -622,7 +622,7 @@ pub mod urma {
             // A concurrent request may have recorded a failure while this one
             // waited for the parent gate. Re-check before reusing anything.
             self.check_parent(addr)?;
-            {
+            let retired = {
                 let mut clients = self.read_clients.lock().await;
                 match clients.get_mut(addr) {
                     Some(cached) if cached.last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT => {
@@ -631,17 +631,22 @@ pub mod urma {
                                 parent_addr = addr,
                                 "retiring cached urma READ client after fabric failure"
                             );
-                            clients.remove(addr);
+                            clients.remove(addr).map(|cached| cached.client)
                         } else {
                             cached.last_used = Instant::now();
-                            return Ok(cached.client.clone());
+                            return Ok(Some(cached.client.clone()));
                         }
                     }
                     Some(_) => {
                         debug!(parent_addr = addr, "retiring idle cached urma READ client");
-                        clients.remove(addr);
+                        clients.remove(addr).map(|cached| cached.client)
                     }
-                    None => {}
+                    None => None,
+                }
+            };
+            if let Some(retired) = retired {
+                if let Err(error) = retired.close().await {
+                    warn!(parent_addr = addr, %error, "failed to close retired urma READ lane");
                 }
             }
             let (fabric, capability) = self.fabric().await?;
@@ -701,6 +706,9 @@ pub mod urma {
                 Err(err) => {
                     let fabric_failed = client.fabric_failed();
                     self.read_clients.lock().await.remove(addr);
+                    if let Err(close_error) = client.close().await {
+                        warn!(parent_addr = addr, %close_error, "failed to close failed urma READ lane");
+                    }
                     if fabric_failed {
                         self.retire_failed_fabric().await;
                     }

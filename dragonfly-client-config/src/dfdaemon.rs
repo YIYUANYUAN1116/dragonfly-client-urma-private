@@ -1113,6 +1113,13 @@ pub struct UrmaServer {
 #[validate(schema(function = "validate_urma_read_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UrmaReadServer {
+    /// Enables production publication of the READ listener only after the
+    /// deployment provider has passed the source-revocation gate. The normal
+    /// READ completion handshake is not itself proof that an old descriptor
+    /// and token can no longer access the source.
+    #[serde(default)]
+    pub provider_revocation_validated: bool,
+
     /// Total registered bytes reserved across sources, destinations, and
     /// quarantine.
     #[serde(with = "bytesize_serde", default = "default_urma_read_total_bytes")]
@@ -1162,6 +1169,7 @@ pub struct UrmaReadServer {
 impl Default for UrmaReadServer {
     fn default() -> Self {
         Self {
+            provider_revocation_validated: false,
             total_bytes: default_urma_read_total_bytes(),
             source_bytes: default_urma_read_source_bytes(),
             destination_bytes: default_urma_read_destination_bytes(),
@@ -2829,6 +2837,7 @@ mod urma_config_tests {
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.peer_guaranteed_rx_credits, 0);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
+        assert!(!UrmaReadServer::default().provider_revocation_validated);
     }
 
     #[test]

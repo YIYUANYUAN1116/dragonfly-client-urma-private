@@ -50,8 +50,8 @@ impl<K> SourceResource for ReadSource<K> {
     }
     fn release(&mut self) -> Result<(), FfiError> {
         // SAFETY: cleanup requires an independent identity-bound revocation proof.
-        let backing = unsafe { self.release_after_revoke()? };
-        drop(backing);
+        let keepalive = unsafe { self.release_after_revoke()? };
+        drop(keepalive);
         Ok(())
     }
 }

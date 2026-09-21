@@ -31,7 +31,7 @@ use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
     UrmaAdvertisement, UrmaCapability, SESSION_TRANSFER_ID,
 };
-use crate::urma::runtime::{ReadRuntimeConfig, ReadSourceRequest};
+use crate::urma::runtime::{ReadRuntimeConfig, ReadSourceId, ReadSourceRequest};
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
@@ -47,6 +47,7 @@ use dragonfly_client_metric::{
 };
 use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -55,7 +56,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn, Span};
@@ -403,10 +404,17 @@ impl UrmaServer {
             pipeline_depth = urma_config.pipeline_depth,
             "configured URMA server send depths"
         );
-        let read_parent = urma_config
-            .read
-            .as_ref()
-            .map(|read| read_parent_config(read, &fabric, fabric_tag));
+        let read_parent = urma_config.read.as_ref().and_then(|read| {
+            if read.provider_revocation_validated {
+                Some(read_parent_config(read, &fabric, fabric_tag))
+            } else {
+                warn!(
+                    "urma READ runtime is active but production publication is disabled until providerRevocationValidated is set"
+                );
+                None
+            }
+        });
+        let publish_read = read_parent.is_some();
         let handler = Arc::new(UrmaServerHandler::new(
             self.storage.clone(),
             self.upload_bandwidth_limiter.clone(),
@@ -452,11 +460,7 @@ impl UrmaServer {
             registry.publish(UrmaAdvertisement {
                 capability,
                 port: self.addr.port(),
-                read_port: if urma_config.read.is_some() {
-                    self.addr.port()
-                } else {
-                    0
-                },
+                read_port: if publish_read { self.addr.port() } else { 0 },
             });
             PublishedCapability(registry.clone())
         });
@@ -559,13 +563,20 @@ struct UrmaServerHandler {
     required_tx_waiters: AtomicUsize,
     /// READ-only data plane. `None` rejects READ lanes at the version split.
     read: Option<ReadParentConfig>,
+    retained_read_sources: Mutex<HashMap<u16, Vec<ReadSourceId>>>,
 }
 
 /// Parent-side READ lane parameters derived from the process configuration.
 #[derive(Clone)]
 struct ReadParentConfig {
     capability: ReadLaneCapability,
+    _revocation_gate: ProviderRevocationValidated,
 }
+
+/// Startup evidence that the deployment provider passed the external source
+/// revocation gate. It cannot be constructed from ReadDone/CancelDrained.
+#[derive(Clone)]
+struct ProviderRevocationValidated;
 
 /// Converts the configured READ byte budgets into the runtime budget. Entry
 /// counts follow the registered slot size so one entry equals one slot.
@@ -577,8 +588,16 @@ fn read_runtime_config(read: &UrmaReadServer) -> ClientResult<ReadRuntimeConfig>
 /// process-unique so a stale offer can never arm a new export.
 static NEXT_READ_TOKEN: AtomicU32 = AtomicU32::new(1);
 
-fn next_read_token() -> u32 {
-    NEXT_READ_TOKEN.fetch_add(1, Ordering::Relaxed)
+fn next_read_token() -> ClientResult<u32> {
+    allocate_read_token(&NEXT_READ_TOKEN)
+}
+
+fn allocate_read_token(counter: &AtomicU32) -> ClientResult<u32> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| ClientError::Unknown("urma READ token space exhausted".to_string()))
 }
 
 /// Builds the READ lane capability advertised during the version-5 handshake.
@@ -598,6 +617,7 @@ fn read_parent_config(
                 descriptor_version: READ_DESCRIPTOR_VERSION,
             },
         },
+        _revocation_gate: ProviderRevocationValidated,
     }
 }
 
@@ -652,6 +672,7 @@ impl UrmaServerHandler {
             transfer_admission: Arc::new(Semaphore::new(max_concurrent_transfers)),
             required_tx_waiters: AtomicUsize::new(0),
             read,
+            retained_read_sources: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1344,7 +1365,7 @@ impl UrmaServerHandler {
             let _ = self.fabric.close_lane(lane_id).await;
             return Err(client_error(error));
         }
-        write_handshake(
+        if let Err(error) = write_handshake(
             &mut stream,
             &ReadHandshake::Connected {
                 capability: read.capability.clone(),
@@ -1353,7 +1374,10 @@ impl UrmaServerHandler {
             },
         )
         .await
-        .map_err(client_error)?;
+        {
+            let _ = self.fabric.close_lane(lane_id).await;
+            return Err(client_error(error));
+        }
         info!(
             %remote_address,
             lane_id,
@@ -1362,19 +1386,24 @@ impl UrmaServerHandler {
             "urma READ lane established"
         );
 
-        let lane = ReadLaneControl::spawn(
+        let lane = match ReadLaneControl::spawn(
             stream,
             session_generation,
             self.max_concurrent_transfers,
             self.max_concurrent_transfers.saturating_mul(2).max(16),
-        )
-        .map_err(client_error)?;
+        ) {
+            Ok(lane) => lane,
+            Err(error) => {
+                let _ = self.fabric.close_lane(lane_id).await;
+                return Err(client_error(error));
+            }
+        };
         let mut transfers = JoinSet::new();
         loop {
             let Some(accepted) = lane.accept_transfer(self.session_idle_timeout).await else {
                 while transfers.join_next().await.is_some() {}
                 debug!(lane_id, "urma READ lane closed or idle");
-                return Ok(());
+                break;
             };
             let handler = self.clone();
             transfers.spawn(async move {
@@ -1392,6 +1421,12 @@ impl UrmaServerHandler {
                 }
             }
         }
+        drop(lane);
+        self.fabric
+            .close_lane(lane_id)
+            .await
+            .map_err(client_error)?;
+        self.cleanup_retained_read_sources(lane_id).await
     }
 
     /// Publishes one Piece as a registered READ source and waits at the
@@ -1472,7 +1507,7 @@ impl UrmaServerHandler {
                 bytes.len()
             )));
         }
-        let token = ReadToken::new(next_read_token());
+        let token = ReadToken::new(next_read_token()?);
 
         // SAFETY: The version-5 handshake authenticated this lane and the
         // accepted length was proven to match the immutable Storage Piece.
@@ -1487,9 +1522,15 @@ impl UrmaServerHandler {
         {
             Ok(published) => published,
             Err(failure) => {
-                if failure.retained_source.is_some() {
+                if let Some(retained) = failure.retained_source {
                     // Fail closed: the source stays registered and budgeted
-                    // until a later cleanup pass proves revocation.
+                    // until lane close plus the provider gate proves revocation.
+                    self.retained_read_sources
+                        .lock()
+                        .await
+                        .entry(lane_id)
+                        .or_default()
+                        .push(retained.source_id);
                     warn!(piece_id, "urma READ source owner retained for cleanup");
                 }
                 return Err(client_error(failure.error));
@@ -1498,11 +1539,64 @@ impl UrmaServerHandler {
         collect_upload_piece_traffic_metrics(pending.completed_length);
         info!(piece_id, "urma READ source fully read; revoking export");
 
-        // SAFETY: The Child declared the full drain (ReadDone or CancelDrained)
-        // and the protocol forbids it from re-arming reads on this generation;
-        // the one-shot bearer token keeps late access off the wire.
+        // SAFETY: Construction of this handler required the deployment's
+        // explicit provider-revocation gate. ReadDone/CancelDrained supplies
+        // the cooperative Child drain, while the validated provider contract
+        // supplies the independent guarantee that successful unregister makes
+        // this descriptor/token generation unable to resume remote access.
         unsafe { parent.revoke_and_finish(pending).await }.map_err(client_error)?;
         collect_upload_piece_finished_metrics();
+        Ok(())
+    }
+
+    /// Reaps sources whose transfer failed after native registration. This is
+    /// called only after the lane target has closed, and this handler exists
+    /// only when startup supplied the provider revocation gate.
+    async fn cleanup_retained_read_sources(&self, lane_id: u16) -> ClientResult<()> {
+        let sources = self
+            .retained_read_sources
+            .lock()
+            .await
+            .remove(&lane_id)
+            .unwrap_or_default();
+        let mut retained = Vec::new();
+        let mut first_error = None;
+        for source_id in sources {
+            let result = async {
+                let _ = self.fabric.retire_read_source(source_id).await;
+                // SAFETY: The lane target is closed and startup required the
+                // deployment provider's synchronous revocation contract.
+                unsafe {
+                    self.fabric.unregister_read_source(source_id).await?;
+                    if !self
+                        .fabric
+                        .release_read_source_after_revoke(source_id)
+                        .await?
+                    {
+                        return Err(UrmaError::Protocol(
+                            "retained READ source remained pending after lane close".into(),
+                        ));
+                    }
+                }
+                Ok::<(), UrmaError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+                retained.push(source_id);
+            }
+        }
+        if !retained.is_empty() {
+            self.retained_read_sources
+                .lock()
+                .await
+                .insert(lane_id, retained);
+            return Err(ClientError::Unknown(first_error.unwrap_or_else(|| {
+                "retained READ source cleanup failed".to_string()
+            })));
+        }
         Ok(())
     }
 }
@@ -1565,6 +1659,14 @@ mod tests {
             assert_eq!(waiters.load(Ordering::Acquire), 1);
         }
         assert_eq!(waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn read_token_allocator_never_wraps_or_reuses_zero() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+        assert_eq!(allocate_read_token(&counter).unwrap(), u32::MAX - 1);
+        assert!(allocate_read_token(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Acquire), u32::MAX);
     }
 
     #[tokio::test]

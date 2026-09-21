@@ -123,7 +123,24 @@ pub(crate) struct ChildTransportSuccess {
 /// must not treat the transfer budget as released.
 pub(crate) struct ChildTransportFailure {
     pub(crate) error: Error,
-    pub(crate) retained_child: Option<ReadChildId>,
+    pub(crate) retained_child: Option<RetainedChildOwner>,
+}
+
+/// Identifies which cleanup operation can safely retry a retained Child. A
+/// published lease must be recycled; the generic cleanup path intentionally
+/// refuses to close it because a Storage consumer may still hold its span.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RetainedChildOwner {
+    Cleanup(ReadChildId),
+    PublishedLease(ReadChildId),
+}
+
+impl RetainedChildOwner {
+    pub(crate) fn id(self) -> ReadChildId {
+        match self {
+            Self::Cleanup(id) | Self::PublishedLease(id) => id,
+        }
+    }
 }
 
 /// Best-effort extraction of a matched drain declaration from the last
@@ -217,7 +234,7 @@ impl ChildTransportSession {
                     .finish(Some(segment_generation))
                     .map_err(|error| ChildTransportFailure {
                         error,
-                        retained_child: None,
+                        retained_child: Some(RetainedChildOwner::PublishedLease(lease.child_id)),
                     })?;
                 Ok(ChildTransportSuccess {
                     completed_bytes: result.completed_bytes,
@@ -241,7 +258,7 @@ impl ChildTransportSession {
         &mut self,
     ) -> std::result::Result<
         (ReadTransportResult, u64, u64, String, PublishedChildLease),
-        (Error, Option<ReadChildId>),
+        (Error, Option<RetainedChildOwner>),
     > {
         self.control
             .send(ReadFrame::BufferReady {
@@ -285,23 +302,25 @@ impl ChildTransportSession {
         };
         let child_id = match admission {
             Ok(ReadChildAdmission::Ready(id)) => id,
-            Ok(ReadChildAdmission::Quarantined { id, error }) => return Err((error, Some(id))),
+            Ok(ReadChildAdmission::Quarantined { id, error }) => {
+                return Err((error, Some(RetainedChildOwner::Cleanup(id))))
+            }
             Err(error) => return Err((error, None)),
         };
         let result = match self.drive_reads(child_id, max_read_size).await {
             Ok(result) => result,
-            Err(error) => return Err((error, Some(child_id))),
+            Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
         // Lease flow stage 1: stop posting and close the import while keeping
         // the registered destination buffer and the full budget charge.
         if let Err(error) = self.fabric.drain_read_child_for_lease(child_id).await {
-            return Err((error, Some(child_id)));
+            return Err((error, Some(RetainedChildOwner::Cleanup(child_id))));
         }
         // Stage 2: extract the CPU span of the final READ content. The lease
         // itself stays on the native owner thread until the caller recycles.
         let span = match self.fabric.publish_read_child_lease(child_id).await {
             Ok(span) => span,
-            Err(error) => return Err((error, Some(child_id))),
+            Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
         // From here the destination lease is published; later failures keep
         // the owner retained (the content is final) and only abandon the
@@ -314,7 +333,7 @@ impl ChildTransportSession {
             Ok(_) | Err(_) => {
                 return Err((
                     protocol("Child READ completion produced an invalid action"),
-                    None,
+                    Some(RetainedChildOwner::PublishedLease(child_id)),
                 ))
             }
         };
@@ -328,19 +347,22 @@ impl ChildTransportSession {
             })
             .await
         {
-            return Err((error, None));
+            return Err((error, Some(RetainedChildOwner::PublishedLease(child_id))));
         }
         let terminal = match self.control.receive().await {
             Ok(terminal) => terminal,
-            Err(error) => return Err((error, None)),
+            Err(error) => return Err((error, Some(RetainedChildOwner::PublishedLease(child_id)))),
         };
         if self
             .state
             .on_frame(&terminal)
-            .map_err(|error| (error, None))?
+            .map_err(|error| (error, Some(RetainedChildOwner::PublishedLease(child_id))))?
             != ChildAction::Complete
         {
-            return Err((protocol("Child expected Done after ReadDone"), None));
+            return Err((
+                protocol("Child expected Done after ReadDone"),
+                Some(RetainedChildOwner::PublishedLease(child_id)),
+            ));
         }
         Ok((
             result,
@@ -357,15 +379,26 @@ impl ChildTransportSession {
     /// prove a full drain and close.
     async fn cancel_after_failure(
         mut self,
-        child_id: Option<ReadChildId>,
+        child: Option<RetainedChildOwner>,
         error: Error,
     ) -> ChildTransportFailure {
-        let Some(child_id) = child_id else {
+        let Some(child) = child else {
             return ChildTransportFailure {
                 error,
                 retained_child: None,
             };
         };
+        if let RetainedChildOwner::PublishedLease(child_id) = child {
+            let retained_child = match self.fabric.recycle_published_child_lease(child_id).await {
+                Ok(true) => None,
+                Ok(false) | Err(_) => Some(child),
+            };
+            return ChildTransportFailure {
+                error,
+                retained_child,
+            };
+        }
+        let child_id = child.id();
         // The state machine is in Reading(generation) whenever a native Child
         // exists. A failed transition skips only the wire exchange, never the
         // local cleanup below.
@@ -397,7 +430,7 @@ impl ChildTransportSession {
         if !drained {
             return ChildTransportFailure {
                 error,
-                retained_child: Some(child_id),
+                retained_child: Some(RetainedChildOwner::Cleanup(child_id)),
             };
         }
         if let (Some(published_generation), Some((accepted, retired))) = (generation, counts) {
@@ -684,9 +717,9 @@ impl ParentSourceSession {
             self.piece_offset,
             self.digest.clone(),
         ) {
-                Ok(offer) => offer,
-                Err(error) => return Err(unpublished(error)),
-            };
+            Ok(offer) => offer,
+            Err(error) => return Err(unpublished(error)),
+        };
         if let Err(error) = self
             .control
             .send(ReadFrame::SegmentOffer {

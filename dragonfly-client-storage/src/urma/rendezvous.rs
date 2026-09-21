@@ -5,6 +5,7 @@
 //! `RecvPosted` window has granted matching remote receive credits.
 
 use super::lane::{TpType, TransportMode};
+pub use crate::rendezvous::PieceKind;
 use crate::rendezvous::{
     put_bytes, read_envelope, write_envelope, PayloadReader, MAX_PAYLOAD_LENGTH, MAX_STRING_LENGTH,
 };

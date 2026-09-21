@@ -32,7 +32,7 @@ use crate::urma::read_control::{
 use crate::urma::read_protocol::{
     ReadCapability, ReadPieceLocator, ReadTransferIdentity, READ_DESCRIPTOR_VERSION,
 };
-use crate::urma::read_session::ChildTransportSession;
+use crate::urma::read_session::{ChildTransportFailure, ChildTransportSession, RetainedChildOwner};
 use crate::urma::runtime::{ReadChildId, ReadLeaseSpan};
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -65,7 +65,14 @@ pub struct UrmaReadPieceLease {
     fabric: UrmaFabricHandle,
     child_id: ReadChildId,
     span: ReadLeaseSpan,
+    armed: bool,
 }
+
+// SAFETY: Publication happens only after every READ WR has retired and the
+// imported segment is closed. The lease exposes immutable slices only; recycle
+// consumes the lease, so safe Rust cannot release the owner while shared
+// readers still borrow it.
+unsafe impl Sync for UrmaReadPieceLease {}
 
 impl UrmaReadPieceLease {
     /// Length of the final READ content.
@@ -89,9 +96,16 @@ impl UrmaReadPieceLease {
     /// Releases the registered destination buffer and the transfer budget.
     /// Returns false when the native owner could not prove a full close; the
     /// id stays registered for a later cleanup pass.
-    pub async fn recycle(self) -> ClientResult<()> {
-        match self.fabric.recycle_published_child_lease(self.child_id).await {
-            Ok(true) => Ok(()),
+    pub async fn recycle(mut self) -> ClientResult<()> {
+        match self
+            .fabric
+            .recycle_published_child_lease(self.child_id)
+            .await
+        {
+            Ok(true) => {
+                self.armed = false;
+                Ok(())
+            }
             Ok(false) => Err(ClientError::Unknown(
                 "recycled READ lease did not prove full budget release".to_string(),
             )),
@@ -102,11 +116,12 @@ impl UrmaReadPieceLease {
 
 impl Drop for UrmaReadPieceLease {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         // Fail closed: an unconsumed lease keeps its native owner registered
         // and the destination budget charged until a cleanup pass recovers.
-        warn!(
-            "dropped an unread RM-READ lease; its owner stays retained and budgeted"
-        );
+        warn!("dropped an unread RM-READ lease; its owner stays retained and budgeted");
     }
 }
 
@@ -136,6 +151,11 @@ pub struct UrmaReadClient {
     /// next_transfer_id allocates per-lane transfer identities. Clones share
     /// the counter so concurrent transfers never collide on one identity.
     next_transfer_id: Arc<AtomicU32>,
+
+    /// Owners whose first cleanup attempt could not prove release. Their exact
+    /// cleanup stage is retained so later transfers can retry without confusing
+    /// an ordinary Child with a published destination lease.
+    retained_children: Arc<tokio::sync::Mutex<Vec<RetainedChildOwner>>>,
 }
 
 impl Clone for UrmaReadClient {
@@ -148,6 +168,7 @@ impl Clone for UrmaReadClient {
             transfer_timeout: self.transfer_timeout,
             session: Arc::clone(&self.session),
             next_transfer_id: Arc::clone(&self.next_transfer_id),
+            retained_children: Arc::clone(&self.retained_children),
         }
     }
 }
@@ -182,6 +203,7 @@ impl UrmaReadClient {
             addr,
             session: Arc::new(tokio::sync::Mutex::new(None)),
             next_transfer_id: Arc::new(AtomicU32::new(1)),
+            retained_children: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -202,8 +224,16 @@ impl UrmaReadClient {
         task_id: &str,
         piece_length: u64,
     ) -> ClientResult<(UrmaReadPieceLease, u64, String)> {
+        self.retry_retained_children().await;
         let (lane, reused_session) = self.lane().await?;
-        let transfer_id = self.next_transfer_id.fetch_add(1, Ordering::Relaxed);
+        let transfer_id = self
+            .next_transfer_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                ClientError::Unknown("urma READ transfer id space exhausted".to_string())
+            })?;
         let identity = ReadTransferIdentity {
             session_generation: lane.session_generation,
             transfer_id,
@@ -252,12 +282,24 @@ impl UrmaReadClient {
             self.transfer_timeout,
         )
         .map_err(|error| ClientError::Unknown(error.to_string()))?;
-        let success = unsafe { session.run_transport_only().await }
-            .map_err(|failure| ClientError::Unknown(failure.error.to_string()))?;
+        let success = match unsafe { session.run_transport_only().await } {
+            Ok(success) => success,
+            Err(ChildTransportFailure {
+                error,
+                retained_child,
+            }) => {
+                if let Some(owner) = retained_child {
+                    self.retained_children.lock().await.push(owner);
+                    self.retry_retained_children().await;
+                }
+                return Err(ClientError::Unknown(error.to_string()));
+            }
+        };
         let lease = UrmaReadPieceLease {
             fabric: self.fabric.clone(),
             child_id: success.lease.child_id,
             span: success.lease.span,
+            armed: true,
         };
         debug!(
             parent_addr = self.addr,
@@ -268,6 +310,55 @@ impl UrmaReadClient {
             "urma READ child finished transfer"
         );
         Ok((lease, success.piece_offset, success.digest))
+    }
+
+    /// Retries fail-closed owners without delaying the current transfer. An
+    /// owner remains queued until the native owner thread proves full release.
+    async fn retry_retained_children(&self) {
+        let pending = {
+            let mut retained = self.retained_children.lock().await;
+            std::mem::take(&mut *retained)
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let mut still_retained = Vec::new();
+        for owner in pending {
+            let released = match owner {
+                RetainedChildOwner::Cleanup(id) => {
+                    self.fabric.retire_read_child_for_cleanup(id).await
+                }
+                RetainedChildOwner::PublishedLease(id) => {
+                    self.fabric.recycle_published_child_lease(id).await
+                }
+            };
+            if !matches!(released, Ok(true)) {
+                still_retained.push(owner);
+            }
+        }
+        if !still_retained.is_empty() {
+            warn!(
+                retained_children = still_retained.len(),
+                "urma READ owners remain retained after cleanup retry"
+            );
+            self.retained_children.lock().await.extend(still_retained);
+        }
+    }
+
+    /// Retires the cached native lane after the caller removes this client from
+    /// peer reuse. Retained transfer owners are retried before lane close.
+    pub async fn close(&self) -> ClientResult<()> {
+        self.retry_retained_children().await;
+        let lane = self.session.lock().await.take();
+        let Some(lane) = lane else {
+            return Ok(());
+        };
+        let lane_id = lane.lane_id;
+        drop(lane);
+        self.fabric
+            .close_lane(lane_id)
+            .await
+            .map_err(|error| ClientError::Unknown(error.to_string()))
     }
 
     /// Returns the persistent lane, connecting and handshaking on first use.
@@ -295,58 +386,66 @@ impl UrmaReadClient {
             // The READ Child only posts READ; SEND credits are not needed.
             guaranteed_rx_credits: 0,
         };
-        let (lane_id, descriptor) = self
-            .fabric
-            .create_lane(peer_config)
-            .await
-            .map_err(|error| ClientError::Unknown(format!("urma READ lane create failed: {error}")))?;
-        let session_generation = next_session_generation().map_err(|error| {
-            ClientError::Unknown(format!("urma READ session generation failed: {error}"))
-        })?;
-        write_handshake(
-            &mut stream,
-            &ReadHandshake::Connect {
-                capability: self.capability.clone(),
-                session_generation,
-                descriptor,
-            },
-        )
-        .await
-        .map_err(|error| {
-            ClientError::Unknown(format!("urma READ handshake write failed: {error}"))
-        })?;
-        let connected = read_handshake(&mut stream)
+        let (lane_id, descriptor) =
+            self.fabric
+                .create_lane(peer_config)
+                .await
+                .map_err(|error| {
+                    ClientError::Unknown(format!("urma READ lane create failed: {error}"))
+                })?;
+        let established = async {
+            let session_generation = next_session_generation().map_err(|error| {
+                ClientError::Unknown(format!("urma READ session generation failed: {error}"))
+            })?;
+            write_handshake(
+                &mut stream,
+                &ReadHandshake::Connect {
+                    capability: self.capability.clone(),
+                    session_generation,
+                    descriptor,
+                },
+            )
             .await
             .map_err(|error| {
+                ClientError::Unknown(format!("urma READ handshake write failed: {error}"))
+            })?;
+            let connected = read_handshake(&mut stream).await.map_err(|error| {
                 ClientError::Unknown(format!("urma READ handshake read failed: {error}"))
             })?;
-        let (effective_max_read_size, parent_descriptor) = connected
-            .validate_connected(&self.capability, session_generation)
-            .map_err(|error| {
-                ClientError::Unknown(format!("urma READ Connected rejected: {error}"))
-            })?;
-        self.fabric
-            .connect_lane(lane_id, parent_descriptor.to_vec())
-            .await
-            .map_err(|error| {
-                ClientError::Unknown(format!("urma READ lane connect failed: {error}"))
-            })?;
-        let max_concurrent = urma_config.max_concurrent_transfers as usize;
-        let control = ReadLaneControl::spawn(stream, session_generation, max_concurrent, 16)
-            .map_err(|error| {
-                ClientError::Unknown(format!("urma READ lane spawn failed: {error}"))
-            })?;
-        debug!(
-            parent_addr = self.addr,
-            lane_id,
-            effective_max_read_size,
-            "urma READ lane established"
-        );
-        let lane = Arc::new(ReadLaneSession {
-            lane_id,
-            session_generation,
-            control: Arc::new(control),
-        });
+            let (effective_max_read_size, parent_descriptor) = connected
+                .validate_connected(&self.capability, session_generation)
+                .map_err(|error| {
+                    ClientError::Unknown(format!("urma READ Connected rejected: {error}"))
+                })?;
+            self.fabric
+                .connect_lane(lane_id, parent_descriptor.to_vec())
+                .await
+                .map_err(|error| {
+                    ClientError::Unknown(format!("urma READ lane connect failed: {error}"))
+                })?;
+            let max_concurrent = urma_config.max_concurrent_transfers as usize;
+            let control = ReadLaneControl::spawn(stream, session_generation, max_concurrent, 16)
+                .map_err(|error| {
+                    ClientError::Unknown(format!("urma READ lane spawn failed: {error}"))
+                })?;
+            debug!(
+                parent_addr = self.addr,
+                lane_id, effective_max_read_size, "urma READ lane established"
+            );
+            Ok::<_, ClientError>(Arc::new(ReadLaneSession {
+                lane_id,
+                session_generation,
+                control: Arc::new(control),
+            }))
+        }
+        .await;
+        let lane = match established {
+            Ok(lane) => lane,
+            Err(error) => {
+                let _ = self.fabric.close_lane(lane_id).await;
+                return Err(error);
+            }
+        };
         *slot = Some(lane.clone());
         Ok((lane, false))
     }

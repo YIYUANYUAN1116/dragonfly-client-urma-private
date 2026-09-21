@@ -640,12 +640,16 @@ impl Content {
         // the caller keeps the lease alive across the join, so the closure
         // reconstructs the slice from its fixed address without extending
         // ownership of it.
-        let (data_addr, data_len) = (data.as_ptr(), data.len());
+        // Store the address as an integer because raw pointers are not Send.
+        // The lease remains in this future until the blocking worker joins. If
+        // this future is cancelled, dropping the armed lease deliberately keeps
+        // the owner registered, so the worker cannot observe freed memory.
+        let (data_addr, data_len) = (data.as_ptr() as usize, data.len());
         let (write_ns, pwrite_calls) = {
             let file = file.clone();
             tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
-                let data = unsafe { std::slice::from_raw_parts(data_addr, data_len) };
+                let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
                 let mut buffers = [IoSlice::new(data)];
                 write_all_vectored_at(&file, &mut buffers, offset)?;
                 Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, 1))
