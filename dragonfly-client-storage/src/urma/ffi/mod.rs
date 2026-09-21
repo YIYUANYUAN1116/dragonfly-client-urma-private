@@ -30,6 +30,7 @@ pub(crate) const TP_CTP: u32 = sys::DFURMA_TP_CTP;
 pub(crate) const IMPORT_STAGE_GET_TP: u32 = sys::DFURMA_IMPORT_STAGE_GET_TP;
 pub(crate) const IMPORT_STAGE_IMPORT_EX: u32 = sys::DFURMA_IMPORT_STAGE_IMPORT_EX;
 pub(crate) const IMPORT_STAGE_IMPORT: u32 = sys::DFURMA_IMPORT_STAGE_IMPORT;
+pub(crate) const IMPORT_STAGE_CTP_AUTO_IMPORT: u32 = sys::DFURMA_IMPORT_STAGE_CTP_AUTO_IMPORT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceCapability {

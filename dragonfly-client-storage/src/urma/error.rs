@@ -212,6 +212,7 @@ fn import_stage_name(stage: u32) -> &'static str {
         super::ffi::IMPORT_STAGE_GET_TP => "get_tp_list",
         super::ffi::IMPORT_STAGE_IMPORT_EX => "import_jetty_ex",
         super::ffi::IMPORT_STAGE_IMPORT => "import_jetty",
+        super::ffi::IMPORT_STAGE_CTP_AUTO_IMPORT => "ctp_auto_import_after_get_tp_enomem",
         _ => "validation",
     }
 }

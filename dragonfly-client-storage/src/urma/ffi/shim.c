@@ -707,6 +707,28 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
         diagnostics->system_errno = errno;
         diagnostics->tp_count = tp_count;
         if (status != URMA_SUCCESS || tp_count != 1) {
+            /* get_tp_list is a query and returned no handle, so ENOMEM leaves
+             * no target ownership to unwind. Mooncake uses this provider's
+             * automatic CTP import path; use it only for this explicit lack
+             * of an assignable TP. Other query failures remain terminal. */
+            if (status != URMA_SUCCESS && errno == ENOMEM) {
+                diagnostics->stage = DFURMA_IMPORT_STAGE_CTP_AUTO_IMPORT;
+                diagnostics->tp_handle = 0;
+                diagnostics->tx_psn = 0;
+                errno = 0;
+                target->target = urma_import_jetty(jetty->runtime->context,
+                                                   import_rjetty,
+                                                   &token_value);
+                diagnostics->system_errno = errno;
+                if (target->target != NULL) {
+                    diagnostics->stage = DFURMA_IMPORT_STAGE_NONE;
+                    goto finish_import;
+                }
+                diagnostics->native_status = dfurma_pointer_error(-EIO);
+                free(target);
+                free(rjetty);
+                return diagnostics->native_status;
+            }
             if (status == URMA_SUCCESS) {
                 diagnostics->native_status = -EPROTO;
             }
@@ -730,6 +752,7 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
                                            &token_value);
         diagnostics->system_errno = errno;
     }
+finish_import:
     free(rjetty);
     if (target->target == NULL) {
         int status = dfurma_pointer_error(-EIO);

@@ -74,6 +74,7 @@ typedef struct dfurma_jetty_descriptor_meta {
 #define DFURMA_IMPORT_STAGE_GET_TP 1U
 #define DFURMA_IMPORT_STAGE_IMPORT_EX 2U
 #define DFURMA_IMPORT_STAGE_IMPORT 3U
+#define DFURMA_IMPORT_STAGE_CTP_AUTO_IMPORT 4U
 
 /* Failure-only diagnostics for Jetty import. EIDs and TP configuration are
  * connection metadata; bearer tokens are deliberately excluded. */
