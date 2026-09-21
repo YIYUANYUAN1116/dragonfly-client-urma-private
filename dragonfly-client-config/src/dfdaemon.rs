@@ -1025,11 +1025,11 @@ pub enum UrmaTransportMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UrmaTpType {
-    /// Reliable transport path. Kept as the default until CTP is validated
-    /// across nodes on the deployment provider.
-    #[default]
+    /// Reliable transport path. Available for providers whose deployment
+    /// profile has passed the cross-node import and READ gates.
     Rtp,
     /// Connection transport path, selected by `urma_perftest --ctp`.
+    #[default]
     Ctp,
 }
 
@@ -2826,7 +2826,7 @@ mod urma_config_tests {
         let urma = UrmaServer::default();
         assert!(!urma.enable);
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
-        assert_eq!(urma.tp_type, UrmaTpType::Rtp);
+        assert_eq!(urma.tp_type, UrmaTpType::Ctp);
         assert_eq!(urma.port, 4008);
         assert!(urma.device.is_none());
         assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));

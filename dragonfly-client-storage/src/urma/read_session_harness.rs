@@ -75,7 +75,7 @@ fn read_budget() -> ReadRuntimeConfig {
 fn harness_fabric(device: &str, eid_index: u32) -> Result<UrmaFabricHandle> {
     let config = RuntimeConfig::new(device, eid_index)
         .with_registered_budget(4 * 1024 * 1024, 2 * 1024 * 1024)?
-        .with_tp_type(TpType::Rtp)
+        .with_tp_type(TpType::Ctp)
         .with_read_only(read_budget());
     UrmaFabric::start(config)
 }
