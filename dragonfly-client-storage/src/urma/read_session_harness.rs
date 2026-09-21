@@ -1,16 +1,17 @@
 //! Two-process memory-to-memory READ session harness.
 //!
-//! The test executable starts a second copy of itself so each endpoint owns an
-//! independent real URMA context and RM Jetty. The Parent hosts a boxed
+//! Parent and Child can run on separate hosts so each endpoint owns an
+//! independent real URMA context, EID, and RM Jetty. The Parent hosts a boxed
 //! in-memory source, the Child owns a fabric-registered destination, and TCP
-//! carries the production version-5 control protocol. This covers handshake,
-//! peer import, transfer routing, READ completion, publication, CPU
-//! consumption, recycle, and orderly native shutdown.
+//! carries the production version-5 control protocol. With no explicit role,
+//! the test also starts a local Child process for providers that support RM
+//! loopback. This covers handshake, peer import, transfer routing, READ
+//! completion, publication, CPU consumption, recycle, and native shutdown.
 //!
 //! Gated behind `#[ignore]` because initialization opens a real provider.
 //! Run with:
 //! `URMA_TEST_DEVICE=urma0 cargo test -p dragonfly-client-storage --features urma \
-//!  single_process_memory_to_memory -- --ignored --nocapture`
+//!  rm_read_memory_to_memory_session -- --ignored --nocapture`
 
 use super::{
     fabric::{PeerTargetConfig, UrmaFabric},
@@ -38,6 +39,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const PIECE_LENGTH: u64 = 256 * 1024;
@@ -45,11 +47,14 @@ const MAX_READ_SIZE: u32 = 1024 * 1024;
 const MAX_JFS_SGE: u32 = 4;
 const MAX_OUTSTANDING: usize = 8;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const CHILD_ROLE_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_CHILD";
 const CONTROL_ADDR_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_ADDR";
-const EXACT_TEST_NAME: &str =
-    "urma::read_session_harness::single_process_memory_to_memory_read_session";
+const TEST_ROLE_ENV: &str = "URMA_TEST_ROLE";
+const TEST_CONTROL_ADDR_ENV: &str = "URMA_TEST_CONTROL_ADDR";
+const CHILD_COMPLETED: &[u8] = b"DFUR-RM-READ-PASS";
+const EXACT_TEST_NAME: &str = "urma::read_session_harness::rm_read_memory_to_memory_session";
 
 fn read_budget() -> ReadRuntimeConfig {
     let cap = |bytes: u64, entries| ReadCapacity { bytes, entries };
@@ -206,9 +211,39 @@ async fn wait_child(child: &mut std::process::Child) -> Result<ExitStatus> {
     }
 }
 
-async fn run_parent(device: &str, eid_index: u32, listener: TcpListener) -> Result<ActiveParent> {
+async fn report_child_completed(address: &str) -> Result<()> {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| Error::Protocol(format!("Child result connect failed: {error}")))?;
+    stream
+        .write_all(CHILD_COMPLETED)
+        .await
+        .map_err(|error| Error::Protocol(format!("Child result write failed: {error}")))
+}
+
+async fn wait_child_completed(listener: &TcpListener) -> Result<()> {
+    let result = tokio::time::timeout(PEER_TIMEOUT, async {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| Error::Protocol(format!("Parent result accept failed: {error}")))?;
+        let mut completed = [0u8; CHILD_COMPLETED.len()];
+        stream
+            .read_exact(&mut completed)
+            .await
+            .map_err(|error| Error::Protocol(format!("Parent result read failed: {error}")))?;
+        if completed != CHILD_COMPLETED {
+            return Err(Error::Protocol("Child result marker mismatch".into()));
+        }
+        Ok(())
+    })
+    .await;
+    result.map_err(|_| Error::Protocol("Child completion report timed out".into()))?
+}
+
+async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Result<ActiveParent> {
     let fabric = harness_fabric(device, eid_index)?;
-    let (mut stream, _) = tokio::time::timeout(COMPLETION_TIMEOUT, listener.accept())
+    let (mut stream, _) = tokio::time::timeout(PEER_TIMEOUT, listener.accept())
         .await
         .map_err(|_| Error::Protocol("Parent control accept timed out".into()))?
         .map_err(|error| Error::Protocol(format!("Parent control accept failed: {error}")))?;
@@ -298,59 +333,98 @@ async fn run_parent(device: &str, eid_index: u32, listener: TcpListener) -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real URMA provider; set URMA_TEST_DEVICE and URMA_TEST_EID_INDEX"]
-async fn single_process_memory_to_memory_read_session() -> Result<()> {
+async fn rm_read_memory_to_memory_session() -> Result<()> {
     let device = std::env::var("URMA_TEST_DEVICE").unwrap_or_else(|_| "urma0".to_string());
     let eid_index: u32 = std::env::var("URMA_TEST_EID_INDEX")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
 
-    if std::env::var_os(CHILD_ROLE_ENV).is_some() {
-        let address = std::env::var(CONTROL_ADDR_ENV).map_err(|_| {
-            Error::InvalidConfiguration(format!("{CONTROL_ADDR_ENV} is not set for child"))
-        })?;
-        return run_child(&device, eid_index, &address).await;
+    let external_role = std::env::var(TEST_ROLE_ENV).ok();
+    let is_child =
+        std::env::var_os(CHILD_ROLE_ENV).is_some() || external_role.as_deref() == Some("child");
+    if is_child {
+        let address = std::env::var(TEST_CONTROL_ADDR_ENV)
+            .or_else(|_| std::env::var(CONTROL_ADDR_ENV))
+            .map_err(|_| {
+                Error::InvalidConfiguration(format!("{TEST_CONTROL_ADDR_ENV} is not set for Child"))
+            })?;
+        run_child(&device, eid_index, &address).await?;
+        return report_child_completed(&address).await;
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    if external_role
+        .as_deref()
+        .is_some_and(|role| role != "parent")
+    {
+        return Err(Error::InvalidConfiguration(format!(
+            "{TEST_ROLE_ENV} must be parent or child"
+        )));
+    }
+
+    let bind_address = if external_role.as_deref() == Some("parent") {
+        std::env::var(TEST_CONTROL_ADDR_ENV).map_err(|_| {
+            Error::InvalidConfiguration(format!("{TEST_CONTROL_ADDR_ENV} is not set for Parent"))
+        })?
+    } else {
+        "127.0.0.1:0".to_string()
+    };
+    let listener = TcpListener::bind(&bind_address)
         .await
         .map_err(|error| Error::Protocol(format!("Parent control bind failed: {error}")))?;
     let address = listener
         .local_addr()
         .map_err(|error| Error::Protocol(format!("Parent local address failed: {error}")))?;
-    let executable = std::env::current_exe()
-        .map_err(|error| Error::Protocol(format!("resolve test executable failed: {error}")))?;
-    let mut child = Command::new(executable)
-        .args([
-            "--exact",
-            EXACT_TEST_NAME,
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD_ROLE_ENV, "1")
-        .env(CONTROL_ADDR_ENV, address.to_string())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| Error::Protocol(format!("spawn Child test process failed: {error}")))?;
+    let mut child = if external_role.as_deref() == Some("parent") {
+        None
+    } else {
+        let executable = std::env::current_exe()
+            .map_err(|error| Error::Protocol(format!("resolve test executable failed: {error}")))?;
+        Some(
+            Command::new(executable)
+                .args([
+                    "--exact",
+                    EXACT_TEST_NAME,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ROLE_ENV, "1")
+                .env(CONTROL_ADDR_ENV, address.to_string())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|error| {
+                    Error::Protocol(format!("spawn Child test process failed: {error}"))
+                })?,
+        )
+    };
 
-    let parent = match run_parent(&device, eid_index, listener).await {
+    let parent = match run_parent(&device, eid_index, &listener).await {
         Ok(parent) => parent,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             return Err(error);
         }
     };
-    let status = wait_child(&mut child).await;
+    let completed = wait_child_completed(&listener).await;
+    let status = match child.as_mut() {
+        Some(child) => Some(wait_child(child).await),
+        None => None,
+    };
     let shutdown = parent.shutdown().await;
-    let status = status?;
-    shutdown?;
-    if !status.success() {
-        return Err(Error::Protocol(format!(
-            "Child test process exited with {status}"
-        )));
+    completed?;
+    if let Some(status) = status {
+        let status = status?;
+        if !status.success() {
+            return Err(Error::Protocol(format!(
+                "Child test process exited with {status}"
+            )));
+        }
     }
+    shutdown?;
     Ok(())
 }
