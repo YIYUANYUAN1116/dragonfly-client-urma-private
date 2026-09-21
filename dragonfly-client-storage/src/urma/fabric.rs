@@ -249,6 +249,24 @@ impl UrmaFabric {
         Self::get_or_start_config(config)
     }
 
+    /// Returns the process Fabric with the READ-only data plane enabled. The
+    /// full effective JFS depth is reserved for READ; legacy SEND/RECV posts
+    /// are rejected by the runtime.
+    pub(crate) fn get_or_start_with_budget_tp_and_read(
+        device_name: impl Into<String>,
+        eid_index: u32,
+        max_registered_bytes: u64,
+        tx_registered_bytes: u64,
+        tp_type: crate::urma::TpType,
+        read: super::runtime::ReadRuntimeConfig,
+    ) -> Result<UrmaFabricHandle> {
+        let config = RuntimeConfig::new(device_name, eid_index)
+            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?
+            .with_tp_type(tp_type)
+            .with_read_only(read);
+        Self::get_or_start_config(config)
+    }
+
     fn get_or_start_config(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
         let mut shared = SHARED_FABRIC
             .get_or_init(|| Mutex::new(Weak::new()))

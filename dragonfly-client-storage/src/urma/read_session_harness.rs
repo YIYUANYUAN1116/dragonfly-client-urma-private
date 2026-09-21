@@ -13,12 +13,17 @@
 
 use super::{
     fabric::{PeerTargetConfig, UrmaFabric},
-    ffi::read::{source::{ReadBacking, ReadSourceMemory}, ReadToken},
+    ffi::read::{
+        source::{ReadBacking, ReadSourceMemory},
+        ReadToken,
+    },
     read_control::{
         next_session_generation, read_handshake, write_handshake, ReadHandshake,
         ReadLaneCapability, ReadLaneControl,
     },
-    read_protocol::{ReadCapability, ReadTransferIdentity, READ_DESCRIPTOR_VERSION},
+    read_protocol::{
+        ReadCapability, ReadPieceLocator, ReadTransferIdentity, READ_DESCRIPTOR_VERSION,
+    },
     read_session::{ChildTransportSession, ParentSourceSession},
     runtime::{ReadRuntimeConfig, RuntimeConfig},
     Error, Result,
@@ -149,14 +154,16 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
     let parent_lane = parent_lane?;
     let child_lane = child_lane?;
 
-    // Route the transfer identity through the lane dispatchers.
+    // Route the transfer identity through the lane dispatchers. The Child
+    // registers statically (it knows its own identity); the Parent admits the
+    // transfer dynamically when the initiating BufferReady arrives.
     let identity = ReadTransferIdentity {
         session_generation,
         transfer_id: 1,
         metadata_generation: 1,
     };
-    let parent_control = parent_lane.register(identity)?;
     let child_control = child_lane.register(identity)?;
+    let parent_fabric = fabric.clone();
 
     let mut source_bytes = vec![0u8; PIECE_LENGTH as usize];
     for (index, byte) in source_bytes.iter_mut().enumerate() {
@@ -174,6 +181,11 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
             child_lane_id,
             child_control,
             identity,
+            ReadPieceLocator {
+                kind: crate::rendezvous::PieceKind::Piece,
+                task_id: "harness-task".to_string(),
+                piece_number: 1,
+            },
             PIECE_LENGTH,
             PIECE_LENGTH,
             MAX_READ_SIZE,
@@ -187,9 +199,7 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
         assert_eq!(lease.span.length as u64, PIECE_LENGTH);
         // SAFETY: Every READ WR retired before publication, so the content is
         // final and no DMA touches the buffer until recycle closes it.
-        let consumed = unsafe {
-            std::slice::from_raw_parts(lease.span.data, lease.span.length)
-        };
+        let consumed = unsafe { std::slice::from_raw_parts(lease.span.data, lease.span.length) };
         if consumed != expected_bytes.as_slice() {
             return Err(Error::Protocol(
                 "published READ lease content diverged from the Parent source".into(),
@@ -206,14 +216,23 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
         Ok(())
     });
 
-    // Parent: publish the immutable in-memory source and wait at the revoke
-    // gate until the Child reports ReadDone.
-    let parent_session = ParentSourceSession::new(
-        fabric.clone(),
+    // Parent: accept the dynamically admitted transfer, publish the immutable
+    // in-memory source, and wait at the revoke gate until the Child reports
+    // ReadDone.
+    let accepted = parent_lane
+        .accept_transfer(COMPLETION_TIMEOUT)
+        .await
+        .ok_or_else(|| Error::Protocol("Parent READ accept timed out".into()))?;
+    if accepted.identity != identity {
+        return Err(Error::Protocol(
+            "Parent accepted a READ transfer with the wrong identity".into(),
+        ));
+    }
+    let (parent_session, _locator) = ParentSourceSession::accept(
+        parent_fabric,
         parent_lane_id,
-        parent_control,
-        identity,
-        PIECE_LENGTH,
+        accepted.control,
+        accepted.buffer_ready,
         MAX_READ_SIZE,
     )?;
     let (parent, pending) = unsafe {
@@ -229,7 +248,10 @@ async fn single_process_memory_to_memory_read_session() -> Result<()> {
             .await
     }
     .map_err(|failure| failure.error)?;
-    assert_eq!(pending.terminal, super::read_session::ParentTerminal::Success);
+    assert_eq!(
+        pending.terminal,
+        super::read_session::ParentTerminal::Success
+    );
     assert_eq!(pending.completed_length, PIECE_LENGTH);
 
     // Provider revocation proof: single-process harness where the Child has

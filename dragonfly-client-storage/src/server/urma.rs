@@ -18,18 +18,28 @@ use crate::content::MappedPiece;
 use crate::rendezvous::{
     PieceKind, ERROR_CODE_BUSY, ERROR_CODE_INTERNAL, ERROR_CODE_NOT_FOUND, ERROR_CODE_TOO_LARGE,
 };
+use crate::urma::buffer::BufferPoolConfig;
 use crate::urma::fabric::{FabricReadiness, PeerTargetConfig, UrmaFabric, UrmaFabricHandle};
+use crate::urma::ffi::read::source::{ReadBacking, ReadSourceMemory};
+use crate::urma::ffi::read::ReadToken;
+use crate::urma::read_control::{
+    read_handshake, write_handshake, AcceptedReadTransfer, ReadHandshake, ReadLaneCapability,
+    ReadLaneControl,
+};
+use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION, READ_DFUR_VERSION};
+use crate::urma::read_session::ParentSourceSession;
 use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
     UrmaAdvertisement, UrmaCapability, SESSION_TRANSFER_ID,
 };
+use crate::urma::runtime::{ReadRuntimeConfig, ReadSourceRequest};
 use crate::urma::server_session_idle_timeout;
 use crate::urma::session::{RegisteredSendTiming, UrmaServerSession, UrmaServerTransfer};
 use crate::urma::Error as UrmaError;
 use crate::urma::TxWindowLease;
-use crate::urma::{TpType, TransportMode};
+use crate::urma::{read_owner::ReadBudget, read_owner::ReadCapacity, TpType, TransportMode};
 use crate::Storage;
-use dragonfly_client_config::dfdaemon::Config;
+use dragonfly_client_config::dfdaemon::{Config, UrmaReadServer};
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use dragonfly_client_metric::{
     collect_upload_piece_failure_metrics, collect_upload_piece_finished_metrics,
@@ -40,7 +50,7 @@ use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -316,14 +326,32 @@ impl UrmaServer {
         let eid_index = urma_config.eid_index;
         let max_registered_bytes = urma_config.max_registered_bytes.as_u64();
         let tx_registered_bytes = urma_config.tx_registered_bytes.as_u64();
+        // When the READ plane is configured the fabric reserves its full
+        // effective JFS depth for RM-READ and rejects legacy SEND/RECV posts.
+        let read_runtime = urma_config
+            .read
+            .as_ref()
+            .map(read_runtime_config)
+            .transpose()?;
         let fabric = tokio::task::spawn_blocking(move || {
-            UrmaFabric::get_or_start_with_budget_and_tp_type(
-                device,
-                eid_index,
-                max_registered_bytes,
-                tx_registered_bytes,
-                tp_type,
-            )
+            if let Some(read) = read_runtime {
+                UrmaFabric::get_or_start_with_budget_tp_and_read(
+                    device,
+                    eid_index,
+                    max_registered_bytes,
+                    tx_registered_bytes,
+                    tp_type,
+                    read,
+                )
+            } else {
+                UrmaFabric::get_or_start_with_budget_and_tp_type(
+                    device,
+                    eid_index,
+                    max_registered_bytes,
+                    tx_registered_bytes,
+                    tp_type,
+                )
+            }
         })
         .await
         .map_err(|error| {
@@ -376,6 +404,10 @@ impl UrmaServer {
             pipeline_depth = urma_config.pipeline_depth,
             "configured URMA server send depths"
         );
+        let read_parent = urma_config
+            .read
+            .as_ref()
+            .map(|read| read_parent_config(read, &fabric, fabric_tag));
         let handler = Arc::new(UrmaServerHandler::new(
             self.storage.clone(),
             self.upload_bandwidth_limiter.clone(),
@@ -388,6 +420,7 @@ impl UrmaServer {
             self.config.download.piece_timeout,
             urma_config.mmap_content,
             urma_config.max_concurrent_transfers as usize,
+            read_parent,
         ));
         let admission = Arc::new(Semaphore::new(
             urma_config.max_concurrent_transfers as usize,
@@ -520,6 +553,96 @@ struct UrmaServerHandler {
     max_concurrent_transfers: usize,
     transfer_admission: Arc<Semaphore>,
     required_tx_waiters: AtomicUsize,
+    /// READ-only data plane. `None` rejects READ lanes at the version split.
+    read: Option<ReadParentConfig>,
+}
+
+/// Parent-side READ lane parameters derived from the process configuration.
+#[derive(Clone)]
+struct ReadParentConfig {
+    capability: ReadLaneCapability,
+}
+
+/// Converts the configured READ byte budgets into the runtime budget. Entry
+/// counts follow the registered slot size so one entry equals one slot.
+fn read_runtime_config(read: &UrmaReadServer) -> ClientResult<ReadRuntimeConfig> {
+    let slot_size = BufferPoolConfig::default().slot_size as u64;
+    if read.max_read_size.as_u64() > u64::from(u32::MAX) {
+        return Err(ClientError::Unsupported(
+            "storage.server.urma.read.maxReadSize must fit u32".to_string(),
+        ));
+    }
+    let capacity = |name: &str, bytes: u64| -> ClientResult<ReadCapacity> {
+        let entries = usize::try_from(bytes / slot_size).unwrap_or(0);
+        if entries == 0 {
+            return Err(ClientError::Unsupported(format!(
+                "storage.server.urma.read.{name} must reserve at least one {slot_size}-byte slot"
+            )));
+        }
+        Ok(ReadCapacity { bytes, entries })
+    };
+    Ok(ReadRuntimeConfig {
+        budget: ReadBudget {
+            total: capacity("totalBytes", read.total_bytes.as_u64())?,
+            source: capacity("sourceBytes", read.source_bytes.as_u64())?,
+            destination: capacity("destinationBytes", read.destination_bytes.as_u64())?,
+            per_peer_source: capacity("perPeerSourceBytes", read.per_peer_source_bytes.as_u64())?,
+            per_peer_destination: capacity(
+                "perPeerDestinationBytes",
+                read.per_peer_destination_bytes.as_u64(),
+            )?,
+            quarantine: capacity("quarantineBytes", read.quarantine_bytes.as_u64())?,
+        },
+        max_outstanding_per_peer: read.max_outstanding_per_peer as usize,
+        buffer_alignment: 4096,
+    })
+}
+
+/// One-shot bearer token generator for READ source publications. Tokens are
+/// process-unique so a stale offer can never arm a new export.
+static NEXT_READ_TOKEN: AtomicU32 = AtomicU32::new(1);
+
+fn next_read_token() -> u32 {
+    NEXT_READ_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Builds the READ lane capability advertised during the version-5 handshake.
+fn read_parent_config(
+    read: &UrmaReadServer,
+    fabric: &UrmaFabricHandle,
+    fabric_tag: &str,
+) -> ReadParentConfig {
+    ReadParentConfig {
+        capability: ReadLaneCapability {
+            transport_type: fabric.transport_type(),
+            tp_type: fabric.tp_type(),
+            fabric_tag: fabric_tag.to_string(),
+            read: ReadCapability {
+                max_read_size: read.max_read_size.as_u64() as u32,
+                max_jfs_sge: read.max_jfs_sge,
+                descriptor_version: READ_DESCRIPTOR_VERSION,
+            },
+        },
+    }
+}
+
+/// Peeks the shared 10-byte rendezvous envelope header without consuming it,
+/// returning the wire version once a full header is buffered. `None` means the
+/// peer closed before sending a header.
+async fn peek_envelope_version(stream: &TcpStream, timeout: Duration) -> ClientResult<Option<u8>> {
+    let deadline = time::Instant::now() + timeout;
+    let mut header = [0u8; 10];
+    loop {
+        let filled = time::timeout_at(deadline, stream.peek(&mut header))
+            .await
+            .map_err(|_| ClientError::Unknown("urma envelope header peek timeout".to_string()))??;
+        if filled >= header.len() {
+            return Ok(Some(header[4]));
+        }
+        if filled == 0 {
+            return Ok(None);
+        }
+    }
 }
 
 impl UrmaServerHandler {
@@ -536,6 +659,7 @@ impl UrmaServerHandler {
         piece_timeout: Duration,
         mmap_content: bool,
         max_concurrent_transfers: usize,
+        read: Option<ReadParentConfig>,
     ) -> Self {
         Self {
             storage,
@@ -552,6 +676,7 @@ impl UrmaServerHandler {
             max_concurrent_transfers,
             transfer_admission: Arc::new(Semaphore::new(max_concurrent_transfers)),
             required_tx_waiters: AtomicUsize::new(0),
+            read,
         }
     }
 
@@ -564,6 +689,13 @@ impl UrmaServerHandler {
         remote_address: String,
     ) -> ClientResult<()> {
         Span::current().record("remote_address", remote_address.as_str());
+        // Version split: RM-READ lanes share the rendezvous MAGIC but speak
+        // DFUR version 5. Peeking keeps the legacy session untouched.
+        if let Some(version) = peek_envelope_version(&stream, self.control_timeout).await? {
+            if version == READ_DFUR_VERSION {
+                return self.handle_read_lane(stream, remote_address).await;
+            }
+        }
         let session = UrmaServerSession::accept(
             stream,
             self.fabric.clone(),
@@ -1191,6 +1323,202 @@ impl UrmaServerHandler {
                 .map(|(_, reader)| Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>),
         }?;
         Ok(PieceSource::Reader(reader))
+    }
+
+    /// Serves one RM-READ lane: version-5 handshake, jetty cross-import, and
+    /// Child-initiated transfer admission. Only control frames use this TCP
+    /// stream; Piece bytes move inside the registered READ budget.
+    async fn handle_read_lane(
+        self: Arc<Self>,
+        mut stream: TcpStream,
+        remote_address: String,
+    ) -> ClientResult<()> {
+        let Some(read) = self.read.clone() else {
+            debug!(%remote_address, "rejecting READ lane: READ plane is not configured");
+            return Ok(());
+        };
+        let connect = match time::timeout(self.control_timeout, read_handshake(&mut stream)).await {
+            Ok(Ok(connect)) => connect,
+            Ok(Err(error)) => return Err(client_error(error)),
+            Err(_) => {
+                return Err(ClientError::Unknown(
+                    "urma READ lane handshake timeout".to_string(),
+                ));
+            }
+        };
+        let child_descriptor = match &connect {
+            ReadHandshake::Connect { descriptor, .. } => descriptor.clone(),
+            ReadHandshake::Connected { .. } => {
+                return Err(client_error(UrmaError::Protocol(
+                    "READ lane handshake must begin with Connect".to_string(),
+                )));
+            }
+        };
+        let (session_generation, effective_max_read_size, _) = connect
+            .validate_connect(&read.capability)
+            .map_err(client_error)?;
+
+        // READ rides on the shared RM PeerTarget namespace: cross-import the
+        // Child descriptor on a fresh lane and answer with the local one.
+        let (lane_id, parent_descriptor) = self
+            .fabric
+            .create_lane(self.peer_config)
+            .await
+            .map_err(client_error)?;
+        if let Err(error) = self.fabric.connect_lane(lane_id, child_descriptor).await {
+            let _ = self.fabric.close_lane(lane_id).await;
+            return Err(client_error(error));
+        }
+        write_handshake(
+            &mut stream,
+            &ReadHandshake::Connected {
+                capability: read.capability.clone(),
+                session_generation,
+                descriptor: parent_descriptor,
+            },
+        )
+        .await
+        .map_err(client_error)?;
+        info!(
+            %remote_address,
+            lane_id,
+            session_generation,
+            max_read_size = effective_max_read_size,
+            "urma READ lane established"
+        );
+
+        let lane = ReadLaneControl::spawn(
+            stream,
+            session_generation,
+            self.max_concurrent_transfers,
+            self.max_concurrent_transfers.saturating_mul(2).max(16),
+        )
+        .map_err(client_error)?;
+        let mut transfers = JoinSet::new();
+        loop {
+            let Some(accepted) = lane.accept_transfer(self.session_idle_timeout).await else {
+                while transfers.join_next().await.is_some() {}
+                debug!(lane_id, "urma READ lane closed or idle");
+                return Ok(());
+            };
+            let handler = self.clone();
+            transfers.spawn(async move {
+                if let Err(error) = handler
+                    .serve_read_transfer(lane_id, effective_max_read_size, accepted)
+                    .await
+                {
+                    debug!(%error, "urma READ transfer ended with a Piece-local error");
+                }
+            });
+            while let Some(completed) = transfers.try_join_next() {
+                match completed {
+                    Ok(()) => {}
+                    Err(error) => warn!(%error, "urma READ transfer task failed"),
+                }
+            }
+        }
+    }
+
+    /// Publishes one Piece as a registered READ source and waits at the
+    /// provider-revocation gate. The shim copies the source bytes into its
+    /// page-aligned registration, so Storage mmap/reader stays authoritative.
+    async fn serve_read_transfer(
+        self: Arc<Self>,
+        lane_id: u16,
+        effective_max_read_size: u32,
+        accepted: AcceptedReadTransfer,
+    ) -> ClientResult<()> {
+        let accepted_length = match &accepted.buffer_ready {
+            crate::urma::read_protocol::ReadFrame::BufferReady {
+                accepted_length, ..
+            } => *accepted_length,
+            _ => {
+                return Err(ClientError::Unknown(
+                    "dispatcher admitted a non-BufferReady READ transfer".to_string(),
+                ))
+            }
+        };
+        let (session, locator) = ParentSourceSession::accept(
+            self.fabric.clone(),
+            lane_id,
+            accepted.control,
+            accepted.buffer_ready,
+            effective_max_read_size,
+        )
+        .map_err(client_error)?;
+        let piece_id = self
+            .storage
+            .piece_id(&locator.task_id, locator.piece_number);
+        info!(
+            task_id = %locator.task_id,
+            piece_id,
+            lane_id,
+            "start READ upload piece content"
+        );
+        let Some(piece) = self.piece_metadata(locator.kind, &piece_id)? else {
+            return Err(ClientError::Unknown(format!(
+                "READ piece {piece_id} is not available"
+            )));
+        };
+        if piece.length != accepted_length {
+            return Err(ClientError::Unknown(format!(
+                "READ piece {piece_id} length {} diverges from accepted length {accepted_length}",
+                piece.length
+            )));
+        }
+        let source_request = CommonPieceRequest {
+            kind: locator.kind,
+            task_id: locator.task_id.clone(),
+            piece_number: locator.piece_number,
+            chunk_size: piece.length,
+            max_inflight_chunks: 1,
+        };
+        let mut source = self.open_piece_source(&source_request, &piece_id).await?;
+        let mut bytes = Vec::with_capacity(usize::try_from(piece.length).unwrap_or(0));
+        match &mut source {
+            PieceSource::Mapped(mapped) => bytes.extend_from_slice(mapped.as_slice()),
+            PieceSource::Reader(reader) => {
+                reader.read_to_end(&mut bytes).await?;
+            }
+        }
+        if bytes.len() as u64 != accepted_length {
+            return Err(ClientError::Unknown(format!(
+                "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
+                bytes.len()
+            )));
+        }
+        let token = ReadToken::new(next_read_token());
+
+        // SAFETY: The version-5 handshake authenticated this lane and the
+        // accepted length was proven to match the immutable Storage Piece.
+        let (parent, pending) = match unsafe {
+            session.publish_and_wait_read_done(ReadSourceRequest {
+                peer_id: lane_id,
+                backing: ReadBacking::new(ReadSourceMemory::Bytes(bytes.into_boxed_slice()), ()),
+                token,
+            })
+        }
+        .await
+        {
+            Ok(published) => published,
+            Err(failure) => {
+                if failure.retained_source.is_some() {
+                    // Fail closed: the source stays registered and budgeted
+                    // until a later cleanup pass proves revocation.
+                    warn!(piece_id, "urma READ source owner retained for cleanup");
+                }
+                return Err(client_error(failure.error));
+            }
+        };
+        collect_upload_piece_traffic_metrics(pending.completed_length);
+        info!(piece_id, "urma READ source fully read; revoking export");
+
+        // SAFETY: The Child declared the full drain (ReadDone or CancelDrained)
+        // and the protocol forbids it from re-arming reads on this generation;
+        // the one-shot bearer token keeps late access off the wire.
+        unsafe { parent.revoke_and_finish(pending).await }.map_err(client_error)?;
+        collect_upload_piece_finished_metrics();
+        Ok(())
     }
 }
 

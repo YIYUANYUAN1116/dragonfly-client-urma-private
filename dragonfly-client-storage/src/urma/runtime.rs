@@ -893,13 +893,18 @@ mod native {
         /// Extracts the CPU span of the fully read registered destination buffer
         /// for Storage. The lease itself stays on the owner thread until recycle;
         /// the budget stays charged until the reap completes.
-        pub(crate) fn publish_read_child_lease(&mut self, id: ReadChildId) -> Result<ReadLeaseSpan> {
+        pub(crate) fn publish_read_child_lease(
+            &mut self,
+            id: ReadChildId,
+        ) -> Result<ReadLeaseSpan> {
             let RuntimeReadState::Active { owners, .. } = &mut self.read else {
                 return Err(Error::InvalidConfiguration(
                     "READ-only runtime is not enabled".into(),
                 ));
             };
-            let span = owners.publish_child_lease(id.0).map_err(read_dispatch_error)?;
+            let span = owners
+                .publish_child_lease(id.0)
+                .map_err(read_dispatch_error)?;
             Ok(ReadLeaseSpan {
                 data: span.data,
                 length: span.length,
@@ -915,12 +920,14 @@ mod native {
                     "READ-only runtime is not enabled".into(),
                 ));
             };
-            owners.recycle_child_lease(id.0).map_err(|error| match error {
-                super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
-                super::super::read_owner::ReapError::Cleanup(error) => {
-                    native_error("recycle_read_child_lease", error)
-                }
-            })
+            owners
+                .recycle_child_lease(id.0)
+                .map_err(|error| match error {
+                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
+                    super::super::read_owner::ReapError::Cleanup(error) => {
+                        native_error("recycle_read_child_lease", error)
+                    }
+                })
         }
 
         /// Registers one immutable Parent Piece and exports the descriptor on the

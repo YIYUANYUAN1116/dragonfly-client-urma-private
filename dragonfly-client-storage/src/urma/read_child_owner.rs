@@ -266,13 +266,11 @@ impl<K> ChildResources for NativeChild<K> {
                 "shared Jetty is busy",
             )));
         };
-        unsafe { jetty.post_read(&self.target, local, remote, request) }.map(
-            |post| match post {
-                ReadPost::Posted(wr) => ChildPost::Posted(wr),
-                ReadPost::Rejected(error) => ChildPost::Rejected(error),
-                ReadPost::Uncertain { wr, error } => ChildPost::Uncertain(wr, error),
-            },
-        )
+        unsafe { jetty.post_read(&self.target, local, remote, request) }.map(|post| match post {
+            ReadPost::Posted(wr) => ChildPost::Posted(wr),
+            ReadPost::Rejected(error) => ChildPost::Rejected(error),
+            ReadPost::Uncertain { wr, error } => ChildPost::Uncertain(wr, error),
+        })
     }
     unsafe fn complete(&mut self, wr: Self::Wr) {
         // SAFETY: Caller validates native retirement and exact identity.
@@ -536,7 +534,9 @@ impl<R: ChildResources> ChildOwner<R> {
             || self.closed
             || self.published.is_some()
         {
-            return Err(FfiError::Contract("READ destination lease is not extractable"));
+            return Err(FfiError::Contract(
+                "READ destination lease is not extractable",
+            ));
         }
         if !self.read_succeeded() {
             return Err(FfiError::Contract("READ did not fully succeed"));

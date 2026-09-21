@@ -353,10 +353,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .drain_for_lease()?;
         match decision {
             ReapDecision::Pending => Ok(()),
-            ReapDecision::Retired(_) => Err(FfiError::Contract(
-                "lease drain must retain the Child owner",
-            )
-            .into()),
+            ReapDecision::Retired(_) => {
+                Err(FfiError::Contract("lease drain must retain the Child owner").into())
+            }
         }
     }
 

@@ -17,8 +17,8 @@ use super::{
     ffi::read::{ReadDescriptor, ReadToken},
     read_control::ReadTransferControl,
     read_protocol::{
-        ChildAction, ChildReadState, ParentAction, ParentReadState, ReadFrame, ReadSegmentOffer,
-        ReadTransferIdentity,
+        ChildAction, ChildReadState, ParentAction, ParentReadState, ReadFrame, ReadPieceLocator,
+        ReadSegmentOffer, ReadTransferIdentity,
     },
     runtime::{
         ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadLeaseSpan,
@@ -134,6 +134,7 @@ pub(crate) struct ChildTransportSession {
     control: ReadTransferControl,
     state: ChildReadState,
     identity: ReadTransferIdentity,
+    request: ReadPieceLocator,
     piece_length: u64,
     allocation_bytes: u64,
     max_outstanding: usize,
@@ -148,6 +149,7 @@ impl ChildTransportSession {
         lane_id: u16,
         control: ReadTransferControl,
         identity: ReadTransferIdentity,
+        request: ReadPieceLocator,
         piece_length: u64,
         allocation_bytes: u64,
         max_read_size: u32,
@@ -163,12 +165,14 @@ impl ChildTransportSession {
         {
             return Err(protocol("invalid Child READ session configuration"));
         }
+        request.validate()?;
         Ok(Self {
             fabric,
             lane_id,
             control,
             state: ChildReadState::new(identity, piece_length, max_read_size)?,
             identity,
+            request,
             piece_length,
             allocation_bytes,
             max_outstanding,
@@ -232,6 +236,7 @@ impl ChildTransportSession {
             .send(ReadFrame::BufferReady {
                 identity: self.identity,
                 accepted_length: self.piece_length,
+                request: self.request.clone(),
             })
             .await
             .map_err(|error| (error, None))?;
@@ -324,14 +329,7 @@ impl ChildTransportSession {
         {
             return Err((protocol("Child expected Done after ReadDone"), None));
         }
-        Ok((
-            result,
-            action,
-            PublishedChildLease {
-                child_id,
-                span,
-            },
-        ))
+        Ok((result, action, PublishedChildLease { child_id, span }))
     }
 
     /// Cancel/cleanup path for a failed transport attempt. The wire exchange
@@ -480,6 +478,7 @@ pub(crate) struct ParentSourceSession {
     identity: ReadTransferIdentity,
     effective_max_read_size: u32,
     published_source: Option<(ReadSourceId, u64)>,
+    awaiting_buffer_ready: bool,
 }
 
 /// Terminal kind recorded while waiting for ReadDone. `Cancelled` means the
@@ -532,7 +531,57 @@ impl ParentSourceSession {
             identity,
             effective_max_read_size,
             published_source: None,
+            awaiting_buffer_ready: true,
         })
+    }
+
+    /// Builds the session from a dynamically admitted transfer: the
+    /// dispatcher hands over the initiating BufferReady, so the accepted
+    /// length defines the Piece length and the state machine starts past the
+    /// awaiting phase. Returns the Piece locator for caller-side resolution.
+    pub(crate) fn accept(
+        fabric: UrmaFabricHandle,
+        lane_id: u16,
+        control: ReadTransferControl,
+        buffer_ready: ReadFrame,
+        effective_max_read_size: u32,
+    ) -> Result<(Self, ReadPieceLocator)> {
+        if effective_max_read_size == 0 {
+            return Err(protocol("invalid Parent READ session configuration"));
+        }
+        let identity = control.identity();
+        let accepted_length = match &buffer_ready {
+            ReadFrame::BufferReady {
+                accepted_length,
+                request,
+                ..
+            } => {
+                request.validate()?;
+                *accepted_length
+            }
+            _ => return Err(protocol("Parent READ accept requires a BufferReady")),
+        };
+        let mut state = ParentReadState::new(identity, accepted_length)?;
+        if state.on_frame(&buffer_ready) != Ok(ParentAction::RegisterSource) {
+            return Err(protocol("Parent READ accept rejected the BufferReady"));
+        }
+        let request = match &buffer_ready {
+            ReadFrame::BufferReady { request, .. } => request.clone(),
+            _ => unreachable!("checked above"),
+        };
+        Ok((
+            Self {
+                fabric,
+                lane_id,
+                control,
+                state,
+                identity,
+                effective_max_read_size,
+                published_source: None,
+                awaiting_buffer_ready: false,
+            },
+            request,
+        ))
     }
 
     /// Registers and publishes a source, then waits until ReadDone or a full
@@ -559,12 +608,16 @@ impl ParentSourceSession {
                 None,
             ));
         }
-        let ready = match self.control.receive().await {
-            Ok(ready) => ready,
-            Err(error) => return Err(fail(error, None)),
-        };
-        if self.state.on_frame(&ready) != Ok(ParentAction::RegisterSource) {
-            return Err(fail(protocol("Parent expected BufferReady"), None));
+        // Statically registered routes still owe the initiating BufferReady;
+        // dynamically accepted transfers consumed theirs in `accept`.
+        if self.awaiting_buffer_ready {
+            let ready = match self.control.receive().await {
+                Ok(ready) => ready,
+                Err(error) => return Err(fail(error, None)),
+            };
+            if self.state.on_frame(&ready) != Ok(ParentAction::RegisterSource) {
+                return Err(fail(protocol("Parent expected BufferReady"), None));
+            }
         }
         // SAFETY: Supplied by the method contract and validated state identity.
         let admission = unsafe { self.fabric.register_read_source(request).await };

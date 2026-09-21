@@ -8,7 +8,7 @@ use super::{
     lane::TpType,
     read_protocol::{
         read_read_frame, write_read_frame, ReadCapability, ReadFrame, ReadTombstones,
-        ReadTransferIdentity, READ_DESCRIPTOR_VERSION, READ_DFUR_VERSION,
+        ReadTransferIdentity, READ_DFUR_VERSION,
     },
     rendezvous::MAGIC,
     Error, Result,
@@ -20,10 +20,11 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 
 const CONNECT: u8 = 1;
@@ -296,6 +297,16 @@ pub(crate) struct ReadLaneControl {
     tombstones: Arc<Mutex<ReadTombstones>>,
     admission: Arc<Semaphore>,
     shutdown: watch::Sender<bool>,
+    accepted: AsyncMutex<mpsc::Receiver<AcceptedReadTransfer>>,
+}
+
+/// A Child-initiated transfer that the dispatcher admitted dynamically on its
+/// first BufferReady frame. The initiating frame is delivered here instead of
+/// the route channel, so the Parent can resolve the Piece before publishing.
+pub(crate) struct AcceptedReadTransfer {
+    pub(crate) identity: ReadTransferIdentity,
+    pub(crate) control: ReadTransferControl,
+    pub(crate) buffer_ready: ReadFrame,
 }
 
 impl ReadLaneControl {
@@ -316,6 +327,8 @@ impl ReadLaneControl {
         let admission = Arc::new(Semaphore::new(max_concurrent_transfers));
         let (writer_tx, mut writer_rx) = mpsc::channel::<ReadFrame>(FRAME_QUEUE_CAPACITY);
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (accepted_tx, accepted_rx) =
+            mpsc::channel::<AcceptedReadTransfer>(max_concurrent_transfers);
         let (mut reader, mut writer) = tokio::io::split(stream);
 
         let writer_routes = routes.clone();
@@ -340,6 +353,8 @@ impl ReadLaneControl {
 
         let reader_routes = routes.clone();
         let reader_tombstones = tombstones.clone();
+        let reader_admission = admission.clone();
+        let reader_writer_tx = writer_tx.clone();
         let reader_shutdown = shutdown.clone();
         let mut reader_shutdown_rx = shutdown_rx;
         tokio::spawn(async move {
@@ -375,9 +390,69 @@ impl ReadLaneControl {
                     }) {
                         continue;
                     }
-                    close_all(&reader_routes, "READ frame for unknown transfer".into());
-                    let _ = reader_shutdown.send(true);
-                    return;
+                    // Dynamic admission: only the transfer-initiating
+                    // BufferReady may open a route. Every other unknown frame
+                    // stays fail-closed and kills the lane.
+                    let ReadFrame::BufferReady { identity, .. } = &frame else {
+                        close_all(&reader_routes, "READ frame for unknown transfer".into());
+                        let _ = reader_shutdown.send(true);
+                        return;
+                    };
+                    // A retired transfer identity may never reopen a route.
+                    if reader_tombstones
+                        .lock()
+                        .unwrap()
+                        .contains_transfer(*identity)
+                    {
+                        close_all(
+                            &reader_routes,
+                            "retired READ transfer replayed BufferReady".into(),
+                        );
+                        let _ = reader_shutdown.send(true);
+                        return;
+                    }
+                    // Lock order mirrors register(): tombstones, admission, routes.
+                    let permit = match reader_admission.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            close_all(
+                                &reader_routes,
+                                "READ lane transfer admission is full".into(),
+                            );
+                            let _ = reader_shutdown.send(true);
+                            return;
+                        }
+                    };
+                    let (sender, receiver) = mpsc::channel(FRAME_QUEUE_CAPACITY);
+                    match reader_routes.lock().unwrap().entry(identity.transfer_id) {
+                        Entry::Vacant(entry) => {
+                            entry.insert((*identity, sender));
+                        }
+                        Entry::Occupied(_) => {
+                            close_all(&reader_routes, "duplicate READ transfer id".into());
+                            let _ = reader_shutdown.send(true);
+                            return;
+                        }
+                    }
+                    let accepted = AcceptedReadTransfer {
+                        identity: *identity,
+                        control: ReadTransferControl {
+                            identity: *identity,
+                            writer: reader_writer_tx.clone(),
+                            receiver,
+                            routes: reader_routes.clone(),
+                            tombstones: reader_tombstones.clone(),
+                            completed: false,
+                            _permit: permit,
+                        },
+                        buffer_ready: frame,
+                    };
+                    if accepted_tx.send(accepted).await.is_err() {
+                        close_all(&reader_routes, "READ transfer acceptor is gone".into());
+                        let _ = reader_shutdown.send(true);
+                        return;
+                    }
+                    continue;
                 };
                 if expected != identity {
                     close_all(&reader_routes, "READ transfer identity mismatch".into());
@@ -397,6 +472,7 @@ impl ReadLaneControl {
             tombstones,
             admission,
             shutdown,
+            accepted: AsyncMutex::new(accepted_rx),
         })
     }
 
@@ -429,6 +505,16 @@ impl ReadLaneControl {
             completed: false,
             _permit: permit,
         })
+    }
+
+    /// Receives the next Child-initiated transfer admitted by the dispatcher,
+    /// bounded by `timeout`. The initiating BufferReady frame travels with the
+    /// route, so the caller resolves the Piece before publishing a source.
+    pub(crate) async fn accept_transfer(&self, timeout: Duration) -> Option<AcceptedReadTransfer> {
+        tokio::time::timeout(timeout, async { self.accepted.lock().await.recv().await })
+            .await
+            .ok()
+            .flatten()
     }
 
     pub(crate) fn abort(&self, message: impl Into<String>) {
@@ -470,6 +556,7 @@ fn close_all(routes: &RouteMap, message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::urma::read_protocol::READ_DESCRIPTOR_VERSION;
 
     fn capability() -> ReadLaneCapability {
         ReadLaneCapability {

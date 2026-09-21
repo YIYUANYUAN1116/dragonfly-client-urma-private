@@ -6,13 +6,13 @@
 
 use std::time::Duration;
 
-mod buffer;
+pub(crate) mod buffer;
 mod completion;
 pub(crate) mod control;
 mod credit;
 mod error;
 pub mod fabric;
-mod ffi;
+pub(crate) mod ffi;
 mod lane;
 // Offline READ foundation; not advertised or dispatched until provider gates pass.
 #[allow(dead_code)]
@@ -20,15 +20,15 @@ mod read;
 #[allow(dead_code)]
 mod read_child_owner;
 #[allow(dead_code)]
-mod read_control;
+pub(crate) mod read_control;
 #[allow(dead_code)]
-mod read_owner;
+pub(crate) mod read_owner;
 #[allow(dead_code)]
 mod read_owners;
 #[allow(dead_code)]
-mod read_protocol;
+pub(crate) mod read_protocol;
 #[allow(dead_code)]
-mod read_session;
+pub(crate) mod read_session;
 #[cfg(test)]
 mod read_session_harness;
 #[allow(dead_code)]

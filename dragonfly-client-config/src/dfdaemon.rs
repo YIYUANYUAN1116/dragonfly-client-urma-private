@@ -1099,6 +1099,142 @@ pub struct UrmaServer {
 
     #[serde(default)]
     pub mmap_content: bool,
+
+    /// READ-only data plane configuration. When present, the URMA fabric
+    /// reserves its full effective JFS depth for RM-READ and rejects legacy
+    /// SEND/RECV posts, turning the storage URMA server into a READ parent.
+    #[serde(default)]
+    pub read: Option<UrmaReadServer>,
+}
+
+/// Byte budgets for the READ-only data plane. Each capacity derives its entry
+/// count from the 64KiB registered slot size.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[validate(schema(function = "validate_urma_read_server", skip_on_field_errors = true))]
+#[serde(default, rename_all = "camelCase")]
+pub struct UrmaReadServer {
+    /// Total registered bytes reserved across sources, destinations, and
+    /// quarantine.
+    #[serde(with = "bytesize_serde", default = "default_urma_read_total_bytes")]
+    pub total_bytes: ByteSize,
+
+    #[serde(with = "bytesize_serde", default = "default_urma_read_source_bytes")]
+    pub source_bytes: ByteSize,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_urma_read_destination_bytes"
+    )]
+    pub destination_bytes: ByteSize,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_urma_read_per_peer_source_bytes"
+    )]
+    pub per_peer_source_bytes: ByteSize,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_urma_read_per_peer_destination_bytes"
+    )]
+    pub per_peer_destination_bytes: ByteSize,
+
+    #[serde(
+        with = "bytesize_serde",
+        default = "default_urma_read_quarantine_bytes"
+    )]
+    pub quarantine_bytes: ByteSize,
+
+    /// READ WRs one peer may keep outstanding on one Piece transfer.
+    #[serde(default = "default_urma_read_max_outstanding_per_peer")]
+    #[validate(range(min = 1, max = 1024))]
+    pub max_outstanding_per_peer: u32,
+
+    /// Largest single READ WR payload advertised to peers.
+    #[serde(with = "bytesize_serde", default = "default_urma_read_max_read_size")]
+    pub max_read_size: ByteSize,
+
+    #[serde(default = "default_urma_read_max_jfs_sge")]
+    #[validate(range(min = 1, max = 64))]
+    pub max_jfs_sge: u32,
+}
+
+impl Default for UrmaReadServer {
+    fn default() -> Self {
+        Self {
+            total_bytes: default_urma_read_total_bytes(),
+            source_bytes: default_urma_read_source_bytes(),
+            destination_bytes: default_urma_read_destination_bytes(),
+            per_peer_source_bytes: default_urma_read_per_peer_source_bytes(),
+            per_peer_destination_bytes: default_urma_read_per_peer_destination_bytes(),
+            quarantine_bytes: default_urma_read_quarantine_bytes(),
+            max_outstanding_per_peer: default_urma_read_max_outstanding_per_peer(),
+            max_read_size: default_urma_read_max_read_size(),
+            max_jfs_sge: default_urma_read_max_jfs_sge(),
+        }
+    }
+}
+
+fn default_urma_read_total_bytes() -> ByteSize {
+    ByteSize::mib(16)
+}
+
+fn default_urma_read_source_bytes() -> ByteSize {
+    ByteSize::mib(8)
+}
+
+fn default_urma_read_destination_bytes() -> ByteSize {
+    ByteSize::mib(8)
+}
+
+fn default_urma_read_per_peer_source_bytes() -> ByteSize {
+    ByteSize::mib(4)
+}
+
+fn default_urma_read_per_peer_destination_bytes() -> ByteSize {
+    ByteSize::mib(4)
+}
+
+fn default_urma_read_quarantine_bytes() -> ByteSize {
+    ByteSize::mib(2)
+}
+
+fn default_urma_read_max_outstanding_per_peer() -> u32 {
+    8
+}
+
+fn default_urma_read_max_read_size() -> ByteSize {
+    ByteSize::mib(1)
+}
+
+fn default_urma_read_max_jfs_sge() -> u32 {
+    4
+}
+
+fn validate_urma_read_server(read: &UrmaReadServer) -> std::result::Result<(), ValidationError> {
+    let total = read.total_bytes.as_u64();
+    let reserved = read
+        .source_bytes
+        .as_u64()
+        .saturating_add(read.destination_bytes.as_u64());
+    if reserved > total {
+        return Err(ValidationError::new(
+            "urma read sourceBytes + destinationBytes must not exceed totalBytes",
+        ));
+    }
+    if read.per_peer_source_bytes.as_u64() > read.source_bytes.as_u64()
+        || read.per_peer_destination_bytes.as_u64() > read.destination_bytes.as_u64()
+    {
+        return Err(ValidationError::new(
+            "urma read per-peer byte budgets must not exceed their pool budgets",
+        ));
+    }
+    if read.max_read_size.as_u64() == 0 {
+        return Err(ValidationError::new(
+            "urma read maxReadSize must be non-zero",
+        ));
+    }
+    Ok(())
 }
 
 const URMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1151,6 +1287,7 @@ impl Default for UrmaServer {
             peer_guaranteed_rx_credits: default_storage_server_urma_peer_guaranteed_rx_credits(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
             mmap_content: false,
+            read: None,
         }
     }
 }

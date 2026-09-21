@@ -1134,6 +1134,7 @@ impl CompletionRouter {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding_total
     }

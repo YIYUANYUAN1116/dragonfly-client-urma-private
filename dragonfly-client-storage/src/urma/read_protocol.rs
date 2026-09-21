@@ -213,11 +213,49 @@ impl ReadSegmentOffer {
     }
 }
 
+/// Production addressing carried by the transfer-initiating BufferReady frame.
+/// The READ wire has no separate transfer-admission channel, so the Child must
+/// state which Piece it wants with the first frame of the transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReadPieceLocator {
+    pub(crate) kind: crate::rendezvous::PieceKind,
+    pub(crate) task_id: String,
+    pub(crate) piece_number: u32,
+}
+
+impl ReadPieceLocator {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.task_id.is_empty() {
+            return Err(protocol("READ Piece locator has an empty task id"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self, payload: &mut Vec<u8>) {
+        payload.push(self.kind.into());
+        put_bytes(payload, self.task_id.as_bytes());
+        payload.extend_from_slice(&self.piece_number.to_be_bytes());
+    }
+
+    fn decode(reader: &mut WireReader<'_>) -> Result<Self> {
+        let kind = crate::rendezvous::PieceKind::try_from(reader.u8()?)
+            .map_err(|error| protocol(format!("invalid READ piece kind: {error}")))?;
+        let locator = Self {
+            kind,
+            task_id: reader.string(MAX_STRING_LENGTH)?,
+            piece_number: reader.u32()?,
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReadFrame {
     BufferReady {
         identity: ReadTransferIdentity,
         accepted_length: u64,
+        request: ReadPieceLocator,
     },
     SegmentOffer {
         identity: ReadTransferIdentity,
@@ -269,12 +307,16 @@ impl ReadFrame {
         self.identity().encode(&mut payload);
         let frame_type = match self {
             Self::BufferReady {
-                accepted_length, ..
+                accepted_length,
+                request,
+                ..
             } => {
                 if *accepted_length == 0 {
                     return Err(protocol("BufferReady has zero accepted_length"));
                 }
+                request.validate()?;
                 payload.extend_from_slice(&accepted_length.to_be_bytes());
+                request.encode(&mut payload);
                 10
             }
             Self::SegmentOffer { offer, .. } => {
@@ -349,6 +391,7 @@ impl ReadFrame {
             10 => Self::BufferReady {
                 identity,
                 accepted_length: reader.u64()?,
+                request: ReadPieceLocator::decode(&mut reader)?,
             },
             11 => Self::SegmentOffer {
                 identity,
@@ -891,12 +934,29 @@ mod tests {
         }
     }
 
+    fn buffer_ready() -> ReadFrame {
+        ReadFrame::BufferReady {
+            identity: ID,
+            accepted_length: 64 * 1024,
+            request: ReadPieceLocator {
+                kind: crate::rendezvous::PieceKind::Piece,
+                task_id: "task".into(),
+                piece_number: 3,
+            },
+        }
+    }
+
     #[test]
     fn read_frames_round_trip_without_exposing_token_in_debug() {
         let frames = [
             ReadFrame::BufferReady {
                 identity: ID,
                 accepted_length: 64 * 1024,
+                request: ReadPieceLocator {
+                    kind: crate::rendezvous::PieceKind::Piece,
+                    task_id: "task".into(),
+                    piece_number: 3,
+                },
             },
             segment_offer(11),
             ReadFrame::ReadDone {
@@ -937,12 +997,7 @@ mod tests {
         let mut parent = ParentReadState::new(ID, 64 * 1024).unwrap();
         let mut child = ChildReadState::new(ID, 64 * 1024, 4096).unwrap();
         assert_eq!(
-            parent
-                .on_frame(&ReadFrame::BufferReady {
-                    identity: ID,
-                    accepted_length: 64 * 1024,
-                })
-                .unwrap(),
+            parent.on_frame(&buffer_ready()).unwrap(),
             ParentAction::RegisterSource
         );
         parent.offer_published(11).unwrap();
@@ -1056,12 +1111,7 @@ mod tests {
     #[test]
     fn offered_phase_generation_less_cancel_waits_for_matched_drain() {
         let mut parent = ParentReadState::new(ID, 64 * 1024).unwrap();
-        parent
-            .on_frame(&ReadFrame::BufferReady {
-                identity: ID,
-                accepted_length: 64 * 1024,
-            })
-            .unwrap();
+        parent.on_frame(&buffer_ready()).unwrap();
         parent.offer_published(21).unwrap();
         // Child cancelled before consuming the Offer: no release yet.
         assert_eq!(
@@ -1124,14 +1174,14 @@ mod tests {
                     ..ID
                 },
                 accepted_length: 64 * 1024,
+                request: ReadPieceLocator {
+                    kind: crate::rendezvous::PieceKind::Piece,
+                    task_id: "task".into(),
+                    piece_number: 3,
+                },
             })
             .is_err());
-        parent
-            .on_frame(&ReadFrame::BufferReady {
-                identity: ID,
-                accepted_length: 64 * 1024,
-            })
-            .unwrap();
+        parent.on_frame(&buffer_ready()).unwrap();
         parent.offer_published(11).unwrap();
         assert!(parent
             .on_frame(&ReadFrame::ReadDone {
@@ -1160,12 +1210,7 @@ mod tests {
     #[test]
     fn offered_cancel_waits_for_matching_full_drain() {
         let mut parent = ParentReadState::new(ID, 64 * 1024).unwrap();
-        parent
-            .on_frame(&ReadFrame::BufferReady {
-                identity: ID,
-                accepted_length: 64 * 1024,
-            })
-            .unwrap();
+        parent.on_frame(&buffer_ready()).unwrap();
         parent.offer_published(21).unwrap();
         assert_eq!(
             parent
