@@ -256,10 +256,6 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
         .map_err(|error| Error::Protocol(format!("Parent Connect rejected: {error}")))?;
     let child_descriptor = child_descriptor.to_vec();
     let (lane_id, parent_descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
-    fabric
-        .connect_lane(lane_id, child_descriptor)
-        .await
-        .map_err(|error| Error::Protocol(format!("Parent lane connect failed: {error}")))?;
     write_handshake(
         &mut stream,
         &ReadHandshake::Connected {
@@ -270,6 +266,13 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
     )
     .await
     .map_err(|error| Error::Protocol(format!("Parent Connected write failed: {error}")))?;
+    // CTP TP-aware import needs both peers to know the opposite EID before
+    // either side activates its local TP handle. Publish our descriptor before
+    // importing the Child so both sides can enter connect concurrently.
+    fabric
+        .connect_lane(lane_id, child_descriptor)
+        .await
+        .map_err(|error| Error::Protocol(format!("Parent lane connect failed: {error}")))?;
 
     let lane = ReadLaneControl::spawn(stream, session_generation, 4, 16)?;
     let identity = ReadTransferIdentity {

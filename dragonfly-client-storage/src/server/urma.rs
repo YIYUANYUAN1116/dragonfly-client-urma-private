@@ -1354,17 +1354,14 @@ impl UrmaServerHandler {
             .validate_connect(&read.capability)
             .map_err(client_error)?;
 
-        // READ rides on the shared RM PeerTarget namespace: cross-import the
-        // Child descriptor on a fresh lane and answer with the local one.
+        // READ rides on the shared RM PeerTarget namespace. Exchange both
+        // descriptors before importing: CTP TP-aware import needs both peers
+        // to know the opposite EID before they activate local TP handles.
         let (lane_id, parent_descriptor) = self
             .fabric
             .create_lane(self.peer_config)
             .await
             .map_err(client_error)?;
-        if let Err(error) = self.fabric.connect_lane(lane_id, child_descriptor).await {
-            let _ = self.fabric.close_lane(lane_id).await;
-            return Err(client_error(error));
-        }
         if let Err(error) = write_handshake(
             &mut stream,
             &ReadHandshake::Connected {
@@ -1375,6 +1372,10 @@ impl UrmaServerHandler {
         )
         .await
         {
+            let _ = self.fabric.close_lane(lane_id).await;
+            return Err(client_error(error));
+        }
+        if let Err(error) = self.fabric.connect_lane(lane_id, child_descriptor).await {
             let _ = self.fabric.close_lane(lane_id).await;
             return Err(client_error(error));
         }

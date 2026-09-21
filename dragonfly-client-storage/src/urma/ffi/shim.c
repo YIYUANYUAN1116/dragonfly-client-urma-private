@@ -625,6 +625,11 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
     urma_rjetty_t *rjetty;
     dfurma_target_t *target;
     urma_token_t token_value = {0};
+    urma_get_tp_cfg_t tp_cfg = {0};
+    urma_tp_info_t tp_info = {0};
+    urma_import_jetty_ex_cfg_t active_cfg = {0};
+    urma_status_t status;
+    uint32_t tp_count;
 
     if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
         meta == NULL || opaque_data == NULL || opaque_len == 0 ||
@@ -661,8 +666,32 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
 
     token_value.token = token;
     errno = 0;
-    target->target = urma_import_jetty(jetty->runtime->context, rjetty,
-                                       &token_value);
+    if (jetty->tp_type == URMA_CTP) {
+        /* Match urma_perftest --tp_aware --ctp. CTP import on UB requires a
+         * control-plane TP selected for the local/peer EID pair and passed to
+         * the extended import operation. No peer TP-handle exchange is needed
+         * for CTP; each side activates its own local handle. */
+        tp_cfg.flag.bs.ctp = 1;
+        tp_cfg.trans_mode = URMA_TM_RM;
+        tp_cfg.local_eid = jetty->jetty->jetty_id.eid;
+        tp_cfg.peer_eid = rjetty->jetty_id.eid;
+        tp_count = 1;
+        status = urma_get_tp_list(jetty->runtime->context, &tp_cfg,
+                                  &tp_count, &tp_info);
+        if (status != URMA_SUCCESS || tp_count != 1) {
+            free(target);
+            free(rjetty);
+            return status != URMA_SUCCESS ? (int)status : -EPROTO;
+        }
+        active_cfg.tp_handle = tp_info.tp_handle;
+        active_cfg.tp_attr.tx_psn = (uint32_t)rand();
+        target->target = urma_import_jetty_ex(jetty->runtime->context,
+                                              rjetty, &token_value,
+                                              &active_cfg);
+    } else {
+        target->target = urma_import_jetty(jetty->runtime->context, rjetty,
+                                           &token_value);
+    }
     free(rjetty);
     if (target->target == NULL) {
         int status = dfurma_pointer_error(-EIO);
