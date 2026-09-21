@@ -63,6 +63,8 @@ fn wire_offer(
     offer: ReadSourceOffer,
     segment_generation: u64,
     effective_max_read_size: u32,
+    piece_offset: u64,
+    digest: String,
 ) -> Result<(ReadSourceId, ReadSegmentOffer)> {
     if segment_generation == 0 || effective_max_read_size == 0 {
         return Err(protocol("invalid READ source publication limits"));
@@ -82,6 +84,8 @@ fn wire_offer(
             token: offer.token.into_wire_value(),
             segment_generation,
             effective_max_read_size,
+            piece_offset,
+            digest,
         },
     ))
 }
@@ -102,10 +106,14 @@ pub(crate) struct PublishedChildLease {
 }
 
 /// Success outcome of the Child transport adapter including the published
-/// destination lease.
+/// destination lease. `piece_offset` echoes the Parent's Piece metadata so
+/// the caller can commit the download position without a metadata frame, and
+/// `digest` carries the Parent's Piece digest for the local integrity check.
 pub(crate) struct ChildTransportSuccess {
     pub(crate) completed_bytes: u64,
     pub(crate) read_wr_count: u64,
+    pub(crate) piece_offset: u64,
+    pub(crate) digest: String,
     pub(crate) lease: PublishedChildLease,
 }
 
@@ -204,7 +212,7 @@ impl ChildTransportSession {
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership.
         match self.run_inner().await {
-            Ok((result, segment_generation, lease)) => {
+            Ok((result, segment_generation, piece_offset, digest, lease)) => {
                 self.control
                     .finish(Some(segment_generation))
                     .map_err(|error| ChildTransportFailure {
@@ -214,6 +222,8 @@ impl ChildTransportSession {
                 Ok(ChildTransportSuccess {
                     completed_bytes: result.completed_bytes,
                     read_wr_count: result.read_wr_count,
+                    piece_offset,
+                    digest,
                     lease,
                 })
             }
@@ -224,12 +234,13 @@ impl ChildTransportSession {
     /// Normal path. Errors carry the still-existing native Child id so the
     /// cancel/cleanup path can address it; `None` means no owner exists or it
     /// was already fully closed. Success additionally returns the terminal
-    /// segment generation and the published destination lease so the owning
-    /// call can finish the control route and hand the lease to Storage.
+    /// segment generation, the Parent's Piece offset, and the published
+    /// destination lease so the owning call can finish the control route and
+    /// hand the lease to Storage.
     async fn run_inner(
         &mut self,
     ) -> std::result::Result<
-        (ReadTransportResult, u64, PublishedChildLease),
+        (ReadTransportResult, u64, u64, String, PublishedChildLease),
         (Error, Option<ReadChildId>),
     > {
         self.control
@@ -255,6 +266,8 @@ impl ChildTransportSession {
             return Err((protocol("Child expected SegmentOffer"), None));
         };
         let max_read_size = offer.effective_max_read_size;
+        let piece_offset = offer.piece_offset;
+        let digest = offer.digest;
         let (descriptor, token) = native_descriptor(&offer);
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership; the state machine validated Offer.
@@ -329,7 +342,13 @@ impl ChildTransportSession {
         {
             return Err((protocol("Child expected Done after ReadDone"), None));
         }
-        Ok((result, action, PublishedChildLease { child_id, span }))
+        Ok((
+            result,
+            action,
+            piece_offset,
+            digest,
+            PublishedChildLease { child_id, span },
+        ))
     }
 
     /// Cancel/cleanup path for a failed transport attempt. The wire exchange
@@ -476,6 +495,8 @@ pub(crate) struct ParentSourceSession {
     control: ReadTransferControl,
     state: ParentReadState,
     identity: ReadTransferIdentity,
+    piece_offset: u64,
+    digest: String,
     effective_max_read_size: u32,
     published_source: Option<(ReadSourceId, u64)>,
     awaiting_buffer_ready: bool,
@@ -518,6 +539,8 @@ impl ParentSourceSession {
         control: ReadTransferControl,
         identity: ReadTransferIdentity,
         piece_length: u64,
+        piece_offset: u64,
+        digest: String,
         effective_max_read_size: u32,
     ) -> Result<Self> {
         if control.identity() != identity || effective_max_read_size == 0 {
@@ -529,6 +552,8 @@ impl ParentSourceSession {
             control,
             state: ParentReadState::new(identity, piece_length)?,
             identity,
+            piece_offset,
+            digest,
             effective_max_read_size,
             published_source: None,
             awaiting_buffer_ready: true,
@@ -539,11 +564,15 @@ impl ParentSourceSession {
     /// dispatcher hands over the initiating BufferReady, so the accepted
     /// length defines the Piece length and the state machine starts past the
     /// awaiting phase. Returns the Piece locator for caller-side resolution.
+    /// `piece_offset` is the caller-resolved Piece position echoed in the
+    /// SegmentOffer, and `digest` is the caller-resolved Piece digest.
     pub(crate) fn accept(
         fabric: UrmaFabricHandle,
         lane_id: u16,
         control: ReadTransferControl,
         buffer_ready: ReadFrame,
+        piece_offset: u64,
+        digest: String,
         effective_max_read_size: u32,
     ) -> Result<(Self, ReadPieceLocator)> {
         if effective_max_read_size == 0 {
@@ -576,6 +605,8 @@ impl ParentSourceSession {
                 control,
                 state,
                 identity,
+                piece_offset,
+                digest,
                 effective_max_read_size,
                 published_source: None,
                 awaiting_buffer_ready: false,
@@ -646,8 +677,13 @@ impl ParentSourceSession {
             Ok(generation) => generation,
             Err(error) => return Err(unpublished(error)),
         };
-        let (source_id, offer) =
-            match wire_offer(offer, segment_generation, self.effective_max_read_size) {
+        let (source_id, offer) = match wire_offer(
+            offer,
+            segment_generation,
+            self.effective_max_read_size,
+            self.piece_offset,
+            self.digest.clone(),
+        ) {
                 Ok(offer) => offer,
                 Err(error) => return Err(unpublished(error)),
             };

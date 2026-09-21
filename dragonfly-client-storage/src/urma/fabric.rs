@@ -267,6 +267,27 @@ impl UrmaFabric {
         Self::get_or_start_config(config)
     }
 
+    /// Public READ-only startup entry shared by the storage server and the
+    /// downloader side. The READ budget is derived from the dfdaemon config.
+    pub fn get_or_start_with_read_config(
+        device_name: impl Into<String>,
+        eid_index: u32,
+        max_registered_bytes: u64,
+        tx_registered_bytes: u64,
+        tp_type: crate::urma::TpType,
+        read: &dragonfly_client_config::dfdaemon::UrmaReadServer,
+    ) -> Result<UrmaFabricHandle> {
+        let read = super::runtime::ReadRuntimeConfig::try_from_config(read)?;
+        Self::get_or_start_with_budget_tp_and_read(
+            device_name,
+            eid_index,
+            max_registered_bytes,
+            tx_registered_bytes,
+            tp_type,
+            read,
+        )
+    }
+
     fn get_or_start_config(config: RuntimeConfig) -> Result<UrmaFabricHandle> {
         let mut shared = SHARED_FABRIC
             .get_or_init(|| Mutex::new(Weak::new()))

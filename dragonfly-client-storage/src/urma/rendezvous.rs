@@ -95,6 +95,10 @@ impl UrmaCapability {
 pub struct UrmaAdvertisement {
     pub capability: UrmaCapability,
     pub port: u16,
+    /// Rendezvous port serving the RM-READ data plane (DFUR version 5). Zero
+    /// means the parent has no READ capability; READ and legacy lanes share
+    /// the same listener when both are served, so this usually equals `port`.
+    pub read_port: u16,
 }
 
 /// Publishes URMA readiness to the already-advertised TCP Piece endpoint. The registry contains
@@ -193,6 +197,7 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
         Frame::Capability(advertisement) => {
             advertisement.capability.encode(&mut payload);
             payload.extend_from_slice(&advertisement.port.to_be_bytes());
+            payload.extend_from_slice(&advertisement.read_port.to_be_bytes());
         }
         Frame::Connect(connect) => {
             connect.capability.encode(&mut payload);
@@ -278,6 +283,9 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<F
         9 => Frame::Capability(UrmaAdvertisement {
             capability: UrmaCapability::decode(&mut reader)?,
             port: reader.u16()?,
+            // Older parents end their payload after the legacy port; a short
+            // payload decodes as "no READ plane".
+            read_port: reader.u16().unwrap_or(0),
         }),
         _ => {
             return Err(Error::Unknown(format!(
@@ -317,6 +325,7 @@ mod tests {
         let advertisement = UrmaAdvertisement {
             capability: capability(),
             port: 4008,
+            read_port: 0,
         };
         registry.publish(advertisement.clone());
         assert_eq!(registry.get(), Some(advertisement));

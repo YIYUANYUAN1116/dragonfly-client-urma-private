@@ -69,8 +69,11 @@ pub trait Downloader: Send + Sync {
 pub mod urma {
     use super::*;
     use dragonfly_client_storage::client::urma::{discover, UrmaClient, UrmaStreamReader};
+    use dragonfly_client_storage::client::urma_read::{UrmaReadClient, UrmaReadPieceLease};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
-    use dragonfly_client_storage::urma::rendezvous::{UrmaAdvertisement, UrmaCapability};
+    use dragonfly_client_storage::urma::rendezvous::{
+        PieceKind, UrmaAdvertisement, UrmaCapability,
+    };
     use dragonfly_client_storage::urma::{TpType, TransportMode, PEER_SESSION_IDLE_TIMEOUT};
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -163,6 +166,13 @@ pub mod urma {
         client: UrmaClient,
     }
 
+    /// CachedReadClient keeps one persistent READ lane slot per parent. Any
+    /// transfer failure retires the cached lane; the next request rebuilds it.
+    struct CachedReadClient {
+        last_used: Instant,
+        client: UrmaReadClient,
+    }
+
     /// URMADownloader downloads pieces over UMDK/URMA with a shared fabric endpoint. The endpoint
     /// is opened lazily on the first download so a misconfigured or unsupported host degrades to
     /// TCP instead of failing at startup.
@@ -185,6 +195,10 @@ pub mod urma {
         /// serializes Piece transfers on its lane and reconnects after failure.
         clients: tokio::sync::Mutex<HashMap<String, CachedClient>>,
 
+        /// read_clients keeps one persistent READ lane slot per parent, used
+        /// only when the daemon configures the RM-READ data plane.
+        read_clients: tokio::sync::Mutex<HashMap<String, CachedReadClient>>,
+
         /// client_init_gates singleflight client creation per parent. Weak values avoid retaining
         /// an entry after no request is checking or constructing that parent's client, while
         /// separate parents never wait on each other's discovery or setup.
@@ -204,6 +218,7 @@ pub mod urma {
                 unhealthy_parents: std::sync::Mutex::new(HashMap::new()),
                 capable_parents: std::sync::Mutex::new(HashMap::new()),
                 clients: tokio::sync::Mutex::new(HashMap::new()),
+                read_clients: tokio::sync::Mutex::new(HashMap::new()),
                 client_init_gates: std::sync::Mutex::new(HashMap::new()),
                 next_client_generation: AtomicU64::new(1),
             }
@@ -253,14 +268,30 @@ pub mod urma {
             let eid_index = urma_config.eid_index;
             let max_registered_bytes = urma_config.max_registered_bytes.as_u64();
             let tx_registered_bytes = urma_config.tx_registered_bytes.as_u64();
+            // The same-process dfdaemon server starts the shared fabric with
+            // the READ-only data plane when configured, so the downloader must
+            // request the identical runtime configuration or the shared
+            // registry rejects it.
+            let read_config = urma_config.read.clone();
             let startup = tokio::task::spawn_blocking(move || {
-                UrmaFabric::get_or_start_with_budget_and_tp_type(
-                    device,
-                    eid_index,
-                    max_registered_bytes,
-                    tx_registered_bytes,
-                    tp_type,
-                )
+                if let Some(read) = &read_config {
+                    UrmaFabric::get_or_start_with_read_config(
+                        device,
+                        eid_index,
+                        max_registered_bytes,
+                        tx_registered_bytes,
+                        tp_type,
+                        read,
+                    )
+                } else {
+                    UrmaFabric::get_or_start_with_budget_and_tp_type(
+                        device,
+                        eid_index,
+                        max_registered_bytes,
+                        tx_registered_bytes,
+                        tp_type,
+                    )
+                }
             })
             .await;
             let startup = match startup {
@@ -328,6 +359,7 @@ pub mod urma {
             drop(state);
             if retired {
                 self.clients.lock().await.clear();
+                self.read_clients.lock().await.clear();
             }
         }
 
@@ -576,6 +608,106 @@ pub mod urma {
                 .download_persistent_cache_piece_stream(number, task_id)
                 .await;
             self.handle_stream_result(addr, handle, result).await
+        }
+
+        /// read_client returns the cached persistent READ lane client for one
+        /// parent, discovering the parent's READ rendezvous port on first use.
+        /// `Ok(None)` means the parent does not advertise the READ data plane:
+        /// no failure is recorded, so its legacy lane and TCP fallback stay
+        /// fully usable. Other errors follow the shared failure policy.
+        async fn read_client(&self, addr: &str) -> Result<Option<UrmaReadClient>> {
+            self.check_parent(addr)?;
+            let init_gate = self.client_init_gate(addr);
+            let _init = init_gate.lock().await;
+            // A concurrent request may have recorded a failure while this one
+            // waited for the parent gate. Re-check before reusing anything.
+            self.check_parent(addr)?;
+            {
+                let mut clients = self.read_clients.lock().await;
+                match clients.get_mut(addr) {
+                    Some(cached) if cached.last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT => {
+                        if cached.client.fabric_failed() {
+                            warn!(
+                                parent_addr = addr,
+                                "retiring cached urma READ client after fabric failure"
+                            );
+                            clients.remove(addr);
+                        } else {
+                            cached.last_used = Instant::now();
+                            return Ok(cached.client.clone());
+                        }
+                    }
+                    Some(_) => {
+                        debug!(parent_addr = addr, "retiring idle cached urma READ client");
+                        clients.remove(addr);
+                    }
+                    None => {}
+                }
+            }
+            let (fabric, capability) = self.fabric().await?;
+            // advertisement records its own failures and shares the discovery
+            // cache with the legacy lane.
+            let advertisement = self.advertisement(addr, &capability).await?;
+            if advertisement.read_port == 0 {
+                return Ok(None);
+            }
+            let mut read_addr: SocketAddr = addr.parse().map_err(|err| {
+                Error::Unsupported(format!("invalid parent piece address {addr}: {err}"))
+            })?;
+            read_addr.set_port(advertisement.read_port);
+            let client = UrmaReadClient::new(self.config.clone(), fabric, read_addr.to_string());
+            info!(
+                parent_addr = addr,
+                read_addr = %read_addr,
+                "created cached urma READ client"
+            );
+            self.read_clients.lock().await.insert(
+                addr.to_string(),
+                CachedReadClient {
+                    last_used: Instant::now(),
+                    client: client.clone(),
+                },
+            );
+            Ok(Some(client))
+        }
+
+        /// download_piece_lease reads one Piece into a published READ lease
+        /// plus the Parent's Piece metadata offset and digest. Errors follow
+        /// the shared failure policy: BUSY is transient (keep the cached lane
+        /// and parent reputation), anything else retires the READ lane and
+        /// penalizes the parent.
+        pub async fn download_piece_lease(
+            &self,
+            addr: &str,
+            kind: PieceKind,
+            number: u32,
+            task_id: &str,
+            piece_length: u64,
+        ) -> Result<(UrmaReadPieceLease, u64, String)> {
+            let Some(client) = self.read_client(addr).await? else {
+                return Err(Error::Unsupported(format!(
+                    "parent {addr} does not advertise the RM-READ data plane"
+                )));
+            };
+            match client
+                .download_piece(kind, number, task_id, piece_length)
+                .await
+            {
+                Ok(downloaded) => {
+                    self.record_success(addr);
+                    Ok(downloaded)
+                }
+                Err(err) if is_transient_busy(&err) => Err(err),
+                Err(err) => {
+                    let fabric_failed = client.fabric_failed();
+                    self.read_clients.lock().await.remove(addr);
+                    if fabric_failed {
+                        self.retire_failed_fabric().await;
+                    }
+                    self.record_failure(addr, classify_failure(&err));
+                    Err(err)
+                }
+            }
         }
 
         /// Applies the shared failure policy for non-stream downloads: BUSY is

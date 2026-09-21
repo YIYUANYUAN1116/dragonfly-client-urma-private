@@ -152,6 +152,13 @@ pub(crate) struct ReadSegmentOffer {
     pub(crate) token: u32,
     pub(crate) segment_generation: u64,
     pub(crate) effective_max_read_size: u32,
+    /// Piece metadata offset resolved by the Parent from its Storage. The
+    /// READ wire has no separate metadata frame, so the offer carries the
+    /// download position back to the Child alongside the descriptor.
+    pub(crate) piece_offset: u64,
+    /// Piece digest recorded by the Parent's Storage. Empty means the Parent
+    /// has no digest for this Piece and the Child skips the integrity check.
+    pub(crate) digest: String,
 }
 
 impl std::fmt::Debug for ReadSegmentOffer {
@@ -159,6 +166,8 @@ impl std::fmt::Debug for ReadSegmentOffer {
         f.debug_struct("ReadSegmentOffer")
             .field("descriptor_version", &self.descriptor_version)
             .field("length", &self.length)
+            .field("piece_offset", &self.piece_offset)
+            .field("digest", &self.digest)
             .field("segment_generation", &self.segment_generation)
             .field("effective_max_read_size", &self.effective_max_read_size)
             .finish_non_exhaustive()
@@ -189,6 +198,8 @@ impl ReadSegmentOffer {
         payload.extend_from_slice(&self.token.to_be_bytes());
         payload.extend_from_slice(&self.segment_generation.to_be_bytes());
         payload.extend_from_slice(&self.effective_max_read_size.to_be_bytes());
+        payload.extend_from_slice(&self.piece_offset.to_be_bytes());
+        put_bytes(payload, self.digest.as_bytes());
     }
 
     fn decode(reader: &mut WireReader<'_>) -> Result<Self> {
@@ -207,6 +218,8 @@ impl ReadSegmentOffer {
             token: reader.u32()?,
             segment_generation: reader.u64()?,
             effective_max_read_size: reader.u32()?,
+            piece_offset: reader.u64()?,
+            digest: reader.string(MAX_STRING_LENGTH)?,
         };
         offer.validate()?;
         Ok(offer)
@@ -924,6 +937,8 @@ mod tests {
             token: 0xfeed_beef,
             segment_generation: generation,
             effective_max_read_size: 4096,
+            piece_offset: 512,
+            digest: "crc32:42".into(),
         }
     }
 

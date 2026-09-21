@@ -47,6 +47,9 @@ pub use dragonfly_client_config::MIN_PIECE_LENGTH;
 pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "urma")]
+use dragonfly_client_storage::urma::rendezvous::PieceKind;
+
+#[cfg(feature = "urma")]
 #[derive(Clone, Copy, Debug)]
 enum UrmaPieceKind {
     Piece,
@@ -559,6 +562,56 @@ impl Piece {
         let Some(downloader) = self.urma_direct_downloader.as_ref() else {
             return Err(Error::Unknown("urma downloader is disabled".to_string()));
         };
+
+        // RM-READ first: when the daemon configures the READ data plane, one
+        // published lease per Piece replaces the window stream. The Parent's
+        // advertisement decides availability, so an Unsupported error here
+        // falls through to the legacy lane below without touching reputation.
+        if self.config.storage.server.urma.read.is_some() {
+            let read_kind = match kind {
+                UrmaPieceKind::Piece => PieceKind::Piece,
+                UrmaPieceKind::PersistentPiece => PieceKind::PersistentPiece,
+                UrmaPieceKind::PersistentCachePiece => PieceKind::PersistentCachePiece,
+            };
+            match downloader
+                .download_piece_lease(tcp_addr, read_kind, number, task_id, length)
+                .await
+            {
+                Ok((lease, piece_offset, digest)) => {
+                    let finished = self
+                        .storage
+                        .download_piece_from_parent_finished_urma_read_lease(
+                            piece_id,
+                            task_id,
+                            read_kind,
+                            piece_offset,
+                            length,
+                            digest.as_str(),
+                            parent_id,
+                            lease,
+                        )
+                        .await;
+                    debug!(
+                        piece_id,
+                        piece_kind = ?kind,
+                        length,
+                        success = finished.is_ok(),
+                        child_piece_e2e_ns =
+                            child_piece_e2e_start.elapsed().as_nanos() as u64,
+                        "finished dragonfly urma READ piece attempt"
+                    );
+                    return finished;
+                }
+                Err(error) => {
+                    // The READ-enabled fabric reserves its depth for READ and
+                    // rejects legacy SEND/RECV posts, so a READ failure cannot
+                    // be retried on the legacy lane. The caller's TCP fallback
+                    // rewrites the whole piece range at `offset`.
+                    warn!(%error, "urma READ download failed; falling back to tcp downloader");
+                    return Err(error);
+                }
+            }
+        }
 
         let (mut reader, offset, digest) = match kind {
             UrmaPieceKind::Piece => {

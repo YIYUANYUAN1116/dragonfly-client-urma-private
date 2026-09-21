@@ -1122,6 +1122,72 @@ impl Storage {
         Ok(piece)
     }
 
+    /// Writes a Piece downloaded over the RM-READ data plane from its
+    /// published lease. The lease is always recycled after consumption, even
+    /// when the write fails, so the registered destination and the transfer
+    /// budget return to the pool; only the digest commit can then fail the
+    /// piece without leaking budget.
+    #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
+    pub async fn download_piece_from_parent_finished_urma_read_lease(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        kind: crate::rendezvous::PieceKind,
+        offset: u64,
+        length: u64,
+        expected_digest: &str,
+        parent_id: &str,
+        lease: crate::client::urma_read::UrmaReadPieceLease,
+    ) -> Result<metadata::Piece> {
+        let finish_total_start = Instant::now();
+        let write_start = Instant::now();
+        let write_result = match kind {
+            crate::rendezvous::PieceKind::Piece => {
+                self.content
+                    .write_piece_from_read_lease(piece_id, task_id, offset, length, &lease)
+                    .await
+            }
+            crate::rendezvous::PieceKind::PersistentPiece => {
+                self.content
+                    .write_persistent_piece_from_read_lease(
+                        piece_id, task_id, offset, length, &lease,
+                    )
+                    .await
+            }
+            crate::rendezvous::PieceKind::PersistentCachePiece => {
+                self.content
+                    .write_persistent_cache_piece_from_read_lease(
+                        piece_id, task_id, offset, length, &lease,
+                    )
+                    .await
+            }
+        };
+        let storage_write_ns = write_start.elapsed().as_nanos() as u64;
+
+        let recycle_start = Instant::now();
+        lease.recycle().await?;
+        let recycle_ns = recycle_start.elapsed().as_nanos() as u64;
+
+        let response = write_result?;
+        let commit_start = Instant::now();
+        let piece =
+            self.finish_parent_piece(piece_id, offset, expected_digest, parent_id, response)?;
+        self.piece_notifier.remove_and_notify(piece_id);
+        let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
+        debug!(
+            piece_id,
+            piece_kind = "read",
+            storage_write_ns,
+            recycle_ns,
+            metadata_commit_notify_ns,
+            finish_total_ns = finish_total_start.elapsed().as_nanos() as u64,
+            "finished committing urma READ piece to storage"
+        );
+        Ok(piece)
+    }
+
     fn finish_parent_piece(
         &self,
         piece_id: &str,

@@ -542,6 +542,135 @@ impl Content {
         .await
     }
 
+    /// Writes normal-task content from a fully read RM-READ lease. The lease
+    /// buffer is contiguous registered memory that was read to completion
+    /// before publication; the caller recycles the lease afterwards.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_piece_from_read_lease(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        lease: &crate::client::urma_read::UrmaReadPieceLease,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_read_lease_to_path(
+            piece_id,
+            self.get_task_path(task_id),
+            offset,
+            expected_length,
+            lease,
+        )
+        .await
+    }
+
+    /// Writes persistent-task content from a fully read RM-READ lease.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_persistent_piece_from_read_lease(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        lease: &crate::client::urma_read::UrmaReadPieceLease,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_read_lease_to_path(
+            piece_id,
+            self.get_persistent_task_path(task_id),
+            offset,
+            expected_length,
+            lease,
+        )
+        .await
+    }
+
+    /// Writes persistent-cache content from a fully read RM-READ lease.
+    #[cfg(feature = "urma")]
+    #[instrument(skip_all)]
+    pub async fn write_persistent_cache_piece_from_read_lease(
+        &self,
+        piece_id: &str,
+        task_id: &str,
+        offset: u64,
+        expected_length: u64,
+        lease: &crate::client::urma_read::UrmaReadPieceLease,
+    ) -> Result<super::io::WriteRangeResponse> {
+        self.write_read_lease_to_path(
+            piece_id,
+            self.get_persistent_cache_task_path(task_id),
+            offset,
+            expected_length,
+            lease,
+        )
+        .await
+    }
+
+    /// Consumes one published RM-READ lease with a single positional vectored
+    /// write plus the crc32 digest. The whole span is already final memory, so
+    /// the multi-window pipelining of the stream consumer is unnecessary.
+    #[cfg(feature = "urma")]
+    async fn write_read_lease_to_path(
+        &self,
+        piece_id: &str,
+        task_path: PathBuf,
+        offset: u64,
+        expected_length: u64,
+        lease: &crate::client::urma_read::UrmaReadPieceLease,
+    ) -> Result<super::io::WriteRangeResponse> {
+        let storage_total_start = Instant::now();
+        let data = lease.as_slice();
+        let length = u64::try_from(data.len())
+            .map_err(|_| Error::Unknown("RM-READ lease length exceeds u64".into()))?;
+        if length != expected_length {
+            return Err(Error::Unknown(format!(
+                "expected length {expected_length} but READ lease holds {length}"
+            )));
+        }
+
+        let file = self
+            .fd_cache
+            .open_write(&task_path)
+            .await
+            .inspect_err(|error| error!("open {:?} failed: {}", task_path, error))?;
+
+        // Digest and positional write share the immutable lease span on one
+        // blocking worker; the lease stays exclusively owned until recycle.
+        let (write_ns, pwrite_calls) = {
+            let file = file.clone();
+            tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let mut buffers = [IoSlice::new(data)];
+                write_all_vectored_at(&file, &mut buffers, offset)?;
+                Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, 1))
+            })
+            .await
+            .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
+            .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?
+        };
+
+        let digest_start = Instant::now();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(data);
+        let digest_ns = digest_start.elapsed().as_nanos() as u64;
+
+        debug!(
+            piece_id,
+            length,
+            write_ns,
+            pwrite_calls,
+            digest_ns,
+            storage_total_ns = storage_total_start.elapsed().as_nanos() as u64,
+            "finished writing piece from RM-READ lease"
+        );
+
+        Ok(super::io::WriteRangeResponse {
+            length,
+            hash: hasher.finalize().to_string(),
+        })
+    }
+
     /// Runs the B3 direct-RX consumer. Digest and positional write share an
     /// immutable lease on separate blocking workers while the Session receives
     /// into the other pipeline window. The lease is explicitly recycled only

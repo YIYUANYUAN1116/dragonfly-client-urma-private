@@ -453,6 +453,11 @@ impl UrmaServer {
             registry.publish(UrmaAdvertisement {
                 capability,
                 port: self.addr.port(),
+                read_port: if urma_config.read.is_some() {
+                    self.addr.port()
+                } else {
+                    0
+                },
             });
             PublishedCapability(registry.clone())
         });
@@ -566,36 +571,7 @@ struct ReadParentConfig {
 /// Converts the configured READ byte budgets into the runtime budget. Entry
 /// counts follow the registered slot size so one entry equals one slot.
 fn read_runtime_config(read: &UrmaReadServer) -> ClientResult<ReadRuntimeConfig> {
-    let slot_size = BufferPoolConfig::default().slot_size as u64;
-    if read.max_read_size.as_u64() > u64::from(u32::MAX) {
-        return Err(ClientError::Unsupported(
-            "storage.server.urma.read.maxReadSize must fit u32".to_string(),
-        ));
-    }
-    let capacity = |name: &str, bytes: u64| -> ClientResult<ReadCapacity> {
-        let entries = usize::try_from(bytes / slot_size).unwrap_or(0);
-        if entries == 0 {
-            return Err(ClientError::Unsupported(format!(
-                "storage.server.urma.read.{name} must reserve at least one {slot_size}-byte slot"
-            )));
-        }
-        Ok(ReadCapacity { bytes, entries })
-    };
-    Ok(ReadRuntimeConfig {
-        budget: ReadBudget {
-            total: capacity("totalBytes", read.total_bytes.as_u64())?,
-            source: capacity("sourceBytes", read.source_bytes.as_u64())?,
-            destination: capacity("destinationBytes", read.destination_bytes.as_u64())?,
-            per_peer_source: capacity("perPeerSourceBytes", read.per_peer_source_bytes.as_u64())?,
-            per_peer_destination: capacity(
-                "perPeerDestinationBytes",
-                read.per_peer_destination_bytes.as_u64(),
-            )?,
-            quarantine: capacity("quarantineBytes", read.quarantine_bytes.as_u64())?,
-        },
-        max_outstanding_per_peer: read.max_outstanding_per_peer as usize,
-        buffer_alignment: 4096,
-    })
+    ReadRuntimeConfig::try_from_config(read).map_err(client_error)
 }
 
 /// One-shot bearer token generator for READ source publications. Tokens are
@@ -1438,14 +1414,14 @@ impl UrmaServerHandler {
                 ))
             }
         };
-        let (session, locator) = ParentSourceSession::accept(
-            self.fabric.clone(),
-            lane_id,
-            accepted.control,
-            accepted.buffer_ready,
-            effective_max_read_size,
-        )
-        .map_err(client_error)?;
+        let locator = match &accepted.buffer_ready {
+            crate::urma::read_protocol::ReadFrame::BufferReady { request, .. } => request.clone(),
+            _ => {
+                return Err(ClientError::Unknown(
+                    "dispatcher admitted a non-BufferReady READ transfer".to_string(),
+                ))
+            }
+        };
         let piece_id = self
             .storage
             .piece_id(&locator.task_id, locator.piece_number);
@@ -1466,6 +1442,16 @@ impl UrmaServerHandler {
                 piece.length
             )));
         }
+        let (session, locator) = ParentSourceSession::accept(
+            self.fabric.clone(),
+            lane_id,
+            accepted.control,
+            accepted.buffer_ready,
+            piece.offset,
+            piece.digest.clone(),
+            effective_max_read_size,
+        )
+        .map_err(client_error)?;
         let source_request = CommonPieceRequest {
             kind: locator.kind,
             task_id: locator.task_id.clone(),

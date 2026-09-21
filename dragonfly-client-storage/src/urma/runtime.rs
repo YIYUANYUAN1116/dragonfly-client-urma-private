@@ -81,6 +81,53 @@ pub(crate) enum ReadSourceAdmission {
     Quarantined { id: ReadSourceId, error: Error },
 }
 
+impl ReadRuntimeConfig {
+    /// Derives the READ budget from the process configuration. Entry counts
+    /// follow the registered slot size so one entry equals one slot.
+    pub(crate) fn try_from_config(
+        read: &dragonfly_client_config::dfdaemon::UrmaReadServer,
+    ) -> Result<Self> {
+        let slot_size = super::buffer::BufferPoolConfig::default().slot_size as u64;
+        if read.max_read_size.as_u64() > u64::from(u32::MAX) {
+            return Err(Error::InvalidConfiguration(
+                "urma read maxReadSize must fit u32".into(),
+            ));
+        }
+        let capacity = |name: &str, bytes: u64| -> Result<ReadCapacity> {
+            let entries = usize::try_from(bytes / slot_size).unwrap_or(0);
+            if entries == 0 {
+                return Err(Error::InvalidConfiguration(format!(
+                    "urma read {name} must reserve at least one {slot_size}-byte slot"
+                )));
+            }
+            Ok(ReadCapacity { bytes, entries })
+        };
+        if read.max_outstanding_per_peer == 0 {
+            return Err(Error::InvalidConfiguration(
+                "urma read maxOutstandingPerPeer must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            budget: ReadBudget {
+                total: capacity("totalBytes", read.total_bytes.as_u64())?,
+                source: capacity("sourceBytes", read.source_bytes.as_u64())?,
+                destination: capacity("destinationBytes", read.destination_bytes.as_u64())?,
+                per_peer_source: capacity(
+                    "perPeerSourceBytes",
+                    read.per_peer_source_bytes.as_u64(),
+                )?,
+                per_peer_destination: capacity(
+                    "perPeerDestinationBytes",
+                    read.per_peer_destination_bytes.as_u64(),
+                )?,
+                quarantine: capacity("quarantineBytes", read.quarantine_bytes.as_u64())?,
+            },
+            max_outstanding_per_peer: read.max_outstanding_per_peer as usize,
+            buffer_alignment: 4096,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadRuntimeConfig {
     pub(crate) budget: ReadBudget,
