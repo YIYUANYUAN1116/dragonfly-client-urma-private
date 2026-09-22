@@ -47,11 +47,13 @@ use dragonfly_client_metric::{
 };
 use leaky_bucket::RateLimiter;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -584,20 +586,79 @@ fn read_runtime_config(read: &UrmaReadServer) -> ClientResult<ReadRuntimeConfig>
     ReadRuntimeConfig::try_from_config(read).map_err(client_error)
 }
 
-/// One-shot bearer token generator for READ source publications. Tokens are
-/// process-unique so a stale offer can never arm a new export.
-static NEXT_READ_TOKEN: AtomicU32 = AtomicU32::new(1);
-
-fn next_read_token() -> ClientResult<u32> {
-    allocate_read_token(&NEXT_READ_TOKEN)
+/// Bearer token space for READ source publications.
+///
+/// Tokens must be process-unique so a stale offer can never arm a new export, and
+/// they must not be derivable from tokens a reader has already been served: the
+/// token is the whole credential, so a sequential counter lets a peer that holds
+/// one Piece's descriptor guess the token of whichever Piece reuses that address.
+/// That extrapolation was measured on hardware: guessing "current + 1" served the
+/// bytes of a grant the reader was never authorized for.
+///
+/// A keyed permutation of the 32-bit token space provides both properties without
+/// any bookkeeping. Feistel rounds are a bijection for every key, so distinct
+/// indices can never collide and uniqueness costs no memory, while the round
+/// function is SipHash seeded from the OS, so values cannot be extrapolated from
+/// samples without the process key.
+struct ReadTokenSpace {
+    index: AtomicU32,
+    round_key: RandomState,
 }
 
-fn allocate_read_token(counter: &AtomicU32) -> ClientResult<u32> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| ClientError::Unknown("urma READ token space exhausted".to_string()))
+/// Four rounds with an independent keyed round function make the permutation a
+/// strong one-way map, not just an injective one.
+const READ_TOKEN_ROUNDS: u8 = 4;
+
+static READ_TOKEN_SPACE: OnceLock<ReadTokenSpace> = OnceLock::new();
+
+fn next_read_token() -> ClientResult<u32> {
+    allocate_read_token(READ_TOKEN_SPACE.get_or_init(ReadTokenSpace::new))
+}
+
+impl ReadTokenSpace {
+    fn new() -> Self {
+        Self {
+            index: AtomicU32::new(0),
+            round_key: RandomState::new(),
+        }
+    }
+
+    fn permute(&self, index: u32) -> u32 {
+        let mut left = (index >> 16) as u16;
+        let mut right = index as u16;
+        for round in 0..READ_TOKEN_ROUNDS {
+            let next_left = right;
+            let next_right = left ^ self.round(round, right);
+            left = next_left;
+            right = next_right;
+        }
+        (u32::from(left) << 16) | u32::from(right)
+    }
+
+    fn round(&self, round: u8, half: u16) -> u16 {
+        let mut hasher = self.round_key.build_hasher();
+        hasher.write_u8(round);
+        hasher.write_u16(half);
+        hasher.finish() as u16
+    }
+}
+
+fn allocate_read_token(space: &ReadTokenSpace) -> ClientResult<u32> {
+    loop {
+        let index = space
+            .index
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| ClientError::Unknown("urma READ token space exhausted".to_string()))?;
+
+        // Zero is the URMA_TOKEN_NONE policy value rather than a bearer token, so it
+        // is never issued. Exactly one index maps to it; skipping it costs one draw.
+        let token = space.permute(index);
+        if token != 0 {
+            return Ok(token);
+        }
+    }
 }
 
 /// Builds the READ lane capability advertised during the version-5 handshake.
@@ -1627,6 +1688,7 @@ impl UrmaServerHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tokio::io::AsyncWriteExt;
 
     fn request(chunk_size: u64, max_inflight_chunks: u32) -> CommonPieceRequest {
@@ -1686,10 +1748,45 @@ mod tests {
 
     #[test]
     fn read_token_allocator_never_wraps_or_reuses_zero() {
-        let counter = AtomicU32::new(u32::MAX - 1);
-        assert_eq!(allocate_read_token(&counter).unwrap(), u32::MAX - 1);
-        assert!(allocate_read_token(&counter).is_err());
-        assert_eq!(counter.load(Ordering::Acquire), u32::MAX);
+        let space = ReadTokenSpace::new();
+        space.index.store(u32::MAX - 1, Ordering::Release);
+        assert_ne!(allocate_read_token(&space).unwrap(), 0);
+        // The space is exhausted, not wrapped: the next draw fails closed instead of
+        // restarting the index sequence and reissuing tokens.
+        assert!(allocate_read_token(&space).is_err());
+        assert_eq!(space.index.load(Ordering::Acquire), u32::MAX);
+    }
+
+    #[test]
+    fn read_token_allocator_is_a_permutation_of_the_token_space() {
+        // Distinct indices must map to distinct tokens across the whole space: that is
+        // what lets a stale offer never arm a new export without tracking issued
+        // tokens. The Feistel structure guarantees it, so a sequential slice of the
+        // index space is enough to catch a broken implementation.
+        let space = ReadTokenSpace::new();
+        let mut issued = HashSet::new();
+        for _ in 0..(1 << 16) {
+            let token = allocate_read_token(&space).unwrap();
+            assert_ne!(token, 0, "zero is the URMA_TOKEN_NONE policy value");
+            assert!(issued.insert(token), "token {token} was issued twice");
+        }
+    }
+
+    #[test]
+    fn read_token_allocator_does_not_advance_by_a_predictable_step() {
+        // A reader holds every token it was served, so consecutive draws must not
+        // reveal the next one. This is exactly what the previous +1 counter broke.
+        let space = ReadTokenSpace::new();
+        let mut previous = allocate_read_token(&space).unwrap();
+        for _ in 0..64 {
+            let token = allocate_read_token(&space).unwrap();
+            assert_ne!(
+                token,
+                previous.wrapping_add(1),
+                "consecutive tokens are extrapolatable"
+            );
+            previous = token;
+        }
     }
 
     #[tokio::test]
