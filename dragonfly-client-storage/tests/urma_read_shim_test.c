@@ -515,6 +515,30 @@ static void test_allocated_read_buffer_full_lifecycle(void)
     assert(f.runtime.segment_count == 1 && f.target.read_segment_count == 0);
 }
 
+static void test_source_register_stage_timings(void)
+{
+    struct fixture f;
+    dfurma_read_source_t *exported = NULL;
+    dfurma_read_source_stages_t stages;
+    uint64_t before, after, total;
+    setup(&f);
+    assert(dfurma_read_source_register_stages(NULL, &stages) == -EINVAL);
+    before = dfurma_monotonic_ns();
+    assert(dfurma_read_source_register(&f.runtime, source, sizeof(source),
+                                       0x12345678, &exported) == 0);
+    after = dfurma_monotonic_ns();
+    assert(dfurma_read_source_register_stages(exported, NULL) == -EINVAL);
+    assert(dfurma_read_source_register_stages(exported, &stages) == 0);
+    /* Same monotonic clock as the shim: sub-phases cannot exceed their window. */
+    total = stages.alloc_ns + stages.copy_ns + stages.token_ns + stages.seg_ns;
+    assert(after >= before && total <= after - before);
+    assert(stages.alloc_ns > 0 || stages.copy_ns > 0);
+    /* Diagnostics never disturb the lifecycle staged below. */
+    assert(dfurma_read_source_unregister(exported) == 0);
+    assert(dfurma_read_source_release_after_revoke(exported) == 0);
+    assert(f.runtime.segment_count == 1 && token_frees == 1);
+}
+
 int main(void)
 {
     test_descriptor_validation();
@@ -527,6 +551,7 @@ int main(void)
     test_registration_failure_retains_uncertain_grants();
     test_read_buffer_failure_retains_memory_and_runtime();
     test_allocated_read_buffer_full_lifecycle();
-    puts("PASS: 10 groups covering source/import/READ, context validation, retirement and uncertain grants");
+    test_source_register_stage_timings();
+    puts("PASS: 11 groups covering source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
     return 0;
 }

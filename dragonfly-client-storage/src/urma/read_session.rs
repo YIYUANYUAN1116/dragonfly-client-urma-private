@@ -14,7 +14,7 @@
 
 use super::{
     fabric::UrmaFabricHandle,
-    ffi::read::{ReadDescriptor, ReadToken},
+    ffi::read::{source::ReadSourceStages, ReadDescriptor, ReadToken},
     read_control::ReadTransferControl,
     read_protocol::{
         ChildAction, ChildReadState, ParentAction, ParentReadState, ReadFrame, ReadPieceLocator,
@@ -554,6 +554,9 @@ pub(crate) struct PendingSourceRevoke {
     /// (aligned copy + token + provider MR registration) and the ReadDone wait.
     pub(crate) register_ns: u64,
     pub(crate) wait_read_done_ns: u64,
+    /// Diagnostic shim sub-phases of `register_ns`: alloc / copy#2 / token /
+    /// provider MR pin. Observation only; never a lifecycle input.
+    pub(crate) register_stages: ReadSourceStages,
 }
 
 /// A registered Parent source owner that the caller must keep for a later
@@ -704,6 +707,7 @@ impl ParentSourceSession {
             }
             Err(error) => return Err(fail(error, None)),
         };
+        let register_stages = offer.register_stages;
         let source_id = offer.id;
         let unpublished = |error: Error| ParentTransportFailure {
             error,
@@ -826,6 +830,7 @@ impl ParentSourceSession {
                 terminal,
                 register_ns,
                 wait_read_done_ns: wait_read_done_start.elapsed().as_nanos() as u64,
+                register_stages,
             },
         ))
     }

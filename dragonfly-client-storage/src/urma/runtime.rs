@@ -3,7 +3,10 @@ use super::{
         BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
         RxBufferStateCounts, TxWindowLease,
     },
-    ffi::read::{source::ReadBacking, ReadDescriptor, ReadToken},
+    ffi::read::{
+        source::{ReadBacking, ReadSourceStages},
+        ReadDescriptor, ReadToken,
+    },
     read_owner::{ReadBudget, ReadCapacity, ReadOwnerId},
     Error, Result,
 };
@@ -72,6 +75,8 @@ pub(crate) struct ReadSourceOffer {
     pub(crate) id: ReadSourceId,
     pub(crate) descriptor: ReadDescriptor,
     pub(crate) token: ReadToken,
+    /// Diagnostic sub-phase timings of the native registration behind this offer.
+    pub(crate) register_stages: ReadSourceStages,
 }
 
 #[derive(Debug)]
@@ -1026,6 +1031,9 @@ mod native {
                         id: ReadSourceId(id),
                         descriptor,
                         token,
+                        // Instrumentation only: a failed read must not fail the
+                        // transfer, so missing timings degrade to zero.
+                        register_stages: owners.source_register_stages(id).unwrap_or_default(),
                     })),
                     Err(error) => {
                         // No descriptor is returned. Retain the source and charge

@@ -1548,6 +1548,10 @@ impl UrmaServerHandler {
             source_open_ns,
             source_copy_ns,
             register_ns = pending.register_ns,
+            register_alloc_ns = pending.register_stages.alloc_ns,
+            register_copy_ns = pending.register_stages.copy_ns,
+            register_token_ns = pending.register_stages.token_ns,
+            register_seg_ns = pending.register_stages.seg_ns,
             wait_read_done_ns = pending.wait_read_done_ns,
             "urma READ source fully read; revoking export"
         );

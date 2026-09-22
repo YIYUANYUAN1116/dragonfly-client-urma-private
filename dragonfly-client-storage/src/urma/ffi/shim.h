@@ -109,6 +109,16 @@ typedef struct dfurma_read_descriptor {
     uint32_t token_policy;
 } dfurma_read_descriptor_t;
 
+/* Diagnostic sub-phase timings of one dfurma_read_source_register call, in
+ * nanoseconds. Observations only: they are not a provider contract and carry
+ * no lifecycle or admission meaning. */
+typedef struct dfurma_read_source_stages {
+    uint64_t alloc_ns;
+    uint64_t copy_ns;
+    uint64_t token_ns;
+    uint64_t seg_ns;
+} dfurma_read_source_stages_t;
+
 /* External immutable backing is caller-owned throughout registration, retirement
  * and revocation confirmation. No function below frees the backing allocation.
  * On a registration error with non-NULL *out, native grant cleanup is uncertain:
@@ -116,6 +126,10 @@ typedef struct dfurma_read_descriptor {
 int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
                                 uint64_t length, uint32_t token,
                                 dfurma_read_source_t **out);
+/* Reports the register sub-phase timings captured for this wrapper. Diagnostic
+ * only; never use these values to decide release or revocation. */
+int dfurma_read_source_register_stages(dfurma_read_source_t *source,
+                                       dfurma_read_source_stages_t *out);
 int dfurma_read_source_descriptor(dfurma_read_source_t *source,
                                   dfurma_read_descriptor_t *out);
 /* Stops descriptor export; success means native unregister only, not revocation.

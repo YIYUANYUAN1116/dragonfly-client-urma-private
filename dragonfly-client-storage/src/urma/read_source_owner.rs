@@ -4,7 +4,7 @@
 use super::{
     ffi::{
         read::{
-            source::{ReadBacking, ReadSource, SourceRegistration},
+            source::{ReadBacking, ReadSource, ReadSourceStages, SourceRegistration},
             ReadDescriptor, ReadToken,
         },
         FfiError, NativeRuntime,
@@ -88,6 +88,13 @@ impl<S: SourceResource> SourceCleanup<S> {
         Ok(ReapDecision::Retired(unsafe {
             VerifiedRetirement::new(id)
         }))
+    }
+}
+
+impl<K> SourceOwner<K> {
+    /// Diagnostic-only register sub-phase timings captured during admission.
+    pub(crate) fn register_stages(&self) -> Result<ReadSourceStages, FfiError> {
+        self.cleanup.source.register_stages()
     }
 }
 
@@ -189,6 +196,20 @@ impl<T: SourceSlot> ReadOwnerRegistry<T> {
             .cleanup
             .source
             .descriptor()
+            .map_err(SourceAdmissionError::Native)
+    }
+
+    /// Diagnostic-only counterpart of `source_descriptor`. Callers must treat a
+    /// failure as missing instrumentation, never as a transfer or cleanup error.
+    pub(crate) fn source_register_stages(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<ReadSourceStages, SourceAdmissionError> {
+        self.active_owner(id)
+            .map_err(SourceAdmissionError::Budget)?
+            .source_mut()
+            .map_err(SourceAdmissionError::Native)?
+            .register_stages()
             .map_err(SourceAdmissionError::Native)
     }
 

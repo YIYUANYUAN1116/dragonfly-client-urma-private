@@ -59,6 +59,17 @@ pub(crate) enum SourceRegistration<K> {
     },
 }
 
+/// Diagnostic sub-phase timings of one native source registration, in
+/// nanoseconds. These never participate in lifecycle, admission or safety
+/// decisions; they exist to attribute the register cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReadSourceStages {
+    pub(crate) alloc_ns: u64,
+    pub(crate) copy_ns: u64,
+    pub(crate) token_ns: u64,
+    pub(crate) seg_ns: u64,
+}
+
 pub(crate) struct ReadSource<K> {
     raw: Option<NonNull<sys::dfurma_read_source_t>>,
     keepalive: Option<K>,
@@ -131,6 +142,28 @@ impl<K> ReadSource<K> {
                 source,
             }
         }
+    }
+
+    /// Reads the shim's diagnostic register sub-phase timings. Purely
+    /// observational: a failure here must never fail the transfer.
+    pub(crate) fn register_stages(&self) -> Result<ReadSourceStages, FfiError> {
+        let raw = self
+            .raw
+            .ok_or(FfiError::Contract("READ source is closed"))?;
+        let mut stages = std::mem::MaybeUninit::<sys::dfurma_read_source_stages_t>::uninit();
+        // SAFETY: Source owns its native registration; a successful shim call
+        // initialized every timing field.
+        status_result(unsafe {
+            sys::dfurma_read_source_register_stages(raw.as_ptr(), stages.as_mut_ptr())
+        })?;
+        // SAFETY: A successful shim call initialized every field.
+        let stages = unsafe { stages.assume_init() };
+        Ok(ReadSourceStages {
+            alloc_ns: stages.alloc_ns,
+            copy_ns: stages.copy_ns,
+            token_ns: stages.token_ns,
+            seg_ns: stages.seg_ns,
+        })
     }
 
     /// Reads provider context through the C shim. Unsupported attributes or opaque

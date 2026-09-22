@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <urma_api.h>
 
@@ -102,6 +103,11 @@ struct dfurma_read_source {
     uint64_t length;
     int closing;
     int registration_uncertain;
+    /* Diagnostic sub-phase timings of this registration, in nanoseconds. */
+    uint64_t register_alloc_ns;
+    uint64_t register_copy_ns;
+    uint64_t register_token_ns;
+    uint64_t register_seg_ns;
 };
 
 struct dfurma_wr {
@@ -120,6 +126,17 @@ struct dfurma_wr {
 static int dfurma_pointer_error(int fallback)
 {
     return errno > 0 ? -errno : fallback;
+}
+
+/* Monotonic nanosecond clock for diagnostic stage timings only. */
+static uint64_t dfurma_monotonic_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
 }
 
 /*
@@ -902,6 +919,7 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     urma_seg_cfg_t cfg = {0};
     int alloc_status;
     uint64_t va;
+    uint64_t stage_start;
     int error;
 
     if (out == NULL) {
@@ -922,12 +940,16 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     /* The provider rejects registration of non-page-aligned VAs. Register a
      * private page-aligned copy of the caller bytes instead, exactly like the
      * transport lab probe shim does. */
+    stage_start = dfurma_monotonic_ns();
     alloc_status = posix_memalign(&source->memory, 4096, (size_t)length);
+    source->register_alloc_ns = dfurma_monotonic_ns() - stage_start;
     if (alloc_status != 0) {
         free(source);
         return -alloc_status;
     }
+    stage_start = dfurma_monotonic_ns();
     memcpy(source->memory, data, (size_t)length);
+    source->register_copy_ns = dfurma_monotonic_ns() - stage_start;
     va = (uint64_t)(uintptr_t)source->memory;
     if (length > UINT64_MAX - va) {
         free(source->memory);
@@ -937,7 +959,9 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     /* Own the token ID explicitly. The current core unregister path may attempt
      * to free automatically allocated IDs even on unregister failure. */
     errno = 0;
+    stage_start = dfurma_monotonic_ns();
     source->token_id = urma_alloc_token_id(runtime->context);
+    source->register_token_ns = dfurma_monotonic_ns() - stage_start;
     if (source->token_id == NULL) {
         error = dfurma_pointer_error(-EIO);
         free(source->memory);
@@ -958,7 +982,9 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
     /* non_pin remains zero: external pages must be pinned. */
     errno = 0;
+    stage_start = dfurma_monotonic_ns();
     source->segment = urma_register_seg(runtime->context, &cfg);
+    source->register_seg_ns = dfurma_monotonic_ns() - stage_start;
     error = source->segment == NULL ? dfurma_pointer_error(-EIO) : 0;
     cfg.token_value.token = 0;
     *out = source;
@@ -969,6 +995,19 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
         source->closing = 1;
     }
     return error;
+}
+
+int dfurma_read_source_register_stages(dfurma_read_source_t *source,
+                                       dfurma_read_source_stages_t *out)
+{
+    if (source == NULL || out == NULL) {
+        return -EINVAL;
+    }
+    out->alloc_ns = source->register_alloc_ns;
+    out->copy_ns = source->register_copy_ns;
+    out->token_ns = source->register_token_ns;
+    out->seg_ns = source->register_seg_ns;
+    return 0;
 }
 
 int dfurma_read_source_descriptor(dfurma_read_source_t *source,

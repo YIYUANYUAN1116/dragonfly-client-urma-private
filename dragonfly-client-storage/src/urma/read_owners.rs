@@ -2,7 +2,10 @@
 //! Production command and Storage wiring remain gated.
 use super::{
     ffi::{
-        read::{source::ReadBacking, ReadDescriptor, ReadToken},
+        read::{
+            source::{ReadBacking, ReadSourceStages},
+            ReadDescriptor, ReadToken,
+        },
         FfiError, NativeRuntime,
     },
     read_child_owner::{
@@ -144,6 +147,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         id: ReadOwnerId,
     ) -> Result<ReadDescriptor, SourceAdmissionError> {
         self.registry.source_descriptor(id)
+    }
+    /// Diagnostic-only register sub-phase timings for one admitted source.
+    pub(crate) fn source_register_stages(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<ReadSourceStages, SourceAdmissionError> {
+        self.registry.source_register_stages(id)
     }
     pub(crate) fn reap_source(
         &mut self,
