@@ -8,14 +8,16 @@ use std::{marker::PhantomData, ptr::NonNull, rc::Rc};
 
 pub(crate) enum ReadSourceMemory {
     Bytes(Box<[u8]>),
-    Mapped(memmap2::Mmap),
+    /// Piece-exact Storage mmap. Only read synchronously during register; the
+    /// shim owns the page-aligned registered copy afterwards.
+    Mapped(crate::content::MappedPiece),
 }
 
 impl ReadSourceMemory {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Bytes(bytes) => bytes,
-            Self::Mapped(mapped) => mapped,
+            Self::Mapped(mapped) => mapped.as_slice(),
         }
     }
 }

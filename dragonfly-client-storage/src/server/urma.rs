@@ -1483,20 +1483,35 @@ impl UrmaServerHandler {
             chunk_size: piece.length,
             max_inflight_chunks: 1,
         };
-        let mut source = self.open_piece_source(&source_request, &piece_id).await?;
-        let mut bytes = Vec::with_capacity(usize::try_from(piece.length).unwrap_or(0));
-        match &mut source {
-            PieceSource::Mapped(mapped) => bytes.extend_from_slice(mapped.as_slice()),
-            PieceSource::Reader(reader) => {
-                reader.read_to_end(&mut bytes).await?;
+        let source_open_start = Instant::now();
+        let source = self.open_piece_source(&source_request, &piece_id).await?;
+        let source_open_ns = source_open_start.elapsed().as_nanos() as u64;
+        let source_copy_start = Instant::now();
+        let memory = match source {
+            PieceSource::Mapped(mapped) => {
+                // The shim copies synchronously during register, so the mapped
+                // region only needs to outlive that call. Skip the 16MiB copy.
+                if mapped.as_slice().len() as u64 != accepted_length {
+                    return Err(ClientError::Unknown(format!(
+                        "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
+                        mapped.as_slice().len()
+                    )));
+                }
+                ReadSourceMemory::Mapped(mapped)
             }
-        }
-        if bytes.len() as u64 != accepted_length {
-            return Err(ClientError::Unknown(format!(
-                "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
-                bytes.len()
-            )));
-        }
+            PieceSource::Reader(mut reader) => {
+                let mut bytes = Vec::with_capacity(usize::try_from(piece.length).unwrap_or(0));
+                reader.read_to_end(&mut bytes).await?;
+                if bytes.len() as u64 != accepted_length {
+                    return Err(ClientError::Unknown(format!(
+                        "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
+                        bytes.len()
+                    )));
+                }
+                ReadSourceMemory::Bytes(bytes.into_boxed_slice())
+            }
+        };
+        let source_copy_ns = source_copy_start.elapsed().as_nanos() as u64;
         let token = ReadToken::new(next_read_token()?);
 
         // SAFETY: The version-5 handshake authenticated this lane and the
@@ -1504,7 +1519,7 @@ impl UrmaServerHandler {
         let (parent, pending) = match unsafe {
             session.publish_and_wait_read_done(ReadSourceRequest {
                 peer_id: lane_id,
-                backing: ReadBacking::new(ReadSourceMemory::Bytes(bytes.into_boxed_slice()), ()),
+                backing: ReadBacking::new(memory, ()),
                 token,
             })
         }
@@ -1530,6 +1545,10 @@ impl UrmaServerHandler {
         info!(
             piece_id,
             source_e2e_ns = source_e2e_start.elapsed().as_nanos() as u64,
+            source_open_ns,
+            source_copy_ns,
+            register_ns = pending.register_ns,
+            wait_read_done_ns = pending.wait_read_done_ns,
             "urma READ source fully read; revoking export"
         );
 
@@ -1538,7 +1557,13 @@ impl UrmaServerHandler {
         // the cooperative Child drain, while the validated provider contract
         // supplies the independent guarantee that successful unregister makes
         // this descriptor/token generation unable to resume remote access.
+        let revoke_start = Instant::now();
         unsafe { parent.revoke_and_finish(pending).await }.map_err(client_error)?;
+        info!(
+            piece_id,
+            revoke_ns = revoke_start.elapsed().as_nanos() as u64,
+            "urma READ source revoke finished"
+        );
         collect_upload_piece_finished_metrics();
         Ok(())
     }

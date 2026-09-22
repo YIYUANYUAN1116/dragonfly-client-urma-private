@@ -550,6 +550,10 @@ pub(crate) struct PendingSourceRevoke {
     pub(crate) completed_length: u64,
     pub(crate) read_wr_count: u64,
     pub(crate) terminal: ParentTerminal,
+    /// Stage timings for the monitoring checklist: native source register
+    /// (aligned copy + token + provider MR registration) and the ReadDone wait.
+    pub(crate) register_ns: u64,
+    pub(crate) wait_read_done_ns: u64,
 }
 
 /// A registered Parent source owner that the caller must keep for a later
@@ -684,7 +688,9 @@ impl ParentSourceSession {
             }
         }
         // SAFETY: Supplied by the method contract and validated state identity.
+        let register_start = std::time::Instant::now();
         let admission = unsafe { self.fabric.register_read_source(request).await };
+        let register_ns = register_start.elapsed().as_nanos() as u64;
         let offer = match admission {
             Ok(ReadSourceAdmission::Ready(offer)) => offer,
             Ok(ReadSourceAdmission::Quarantined { id, error }) => {
@@ -755,6 +761,7 @@ impl ParentSourceSession {
         };
         // Only ReadDone and a matching-generation CancelDrained reach the
         // release stage; Cancel frames only switch the wait target.
+        let wait_read_done_start = std::time::Instant::now();
         let (terminal, completed_length, read_wr_count) = loop {
             let frame = match self.control.receive().await {
                 Ok(frame) => frame,
@@ -817,6 +824,8 @@ impl ParentSourceSession {
                 completed_length,
                 read_wr_count,
                 terminal,
+                register_ns,
+                wait_read_done_ns: wait_read_done_start.elapsed().as_nanos() as u64,
             },
         ))
     }
