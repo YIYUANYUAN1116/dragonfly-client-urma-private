@@ -45,6 +45,19 @@ struct dfurma_runtime {
     uint32_t segment_count;
     uint32_t jetty_count;
     uint32_t outstanding_wr_count;
+    /* Context-scoped token id shared by every READ source Segment.
+     *
+     * It is deliberately not owned by a source or a jetty: a refused READ
+     * permanently disables the jetty that carried it, so lanes are retired and
+     * rebuilt while their sources stay registered. It is also deliberately not
+     * a pool sized to the transfer concurrency -- one token id carries every
+     * Segment the device accepts at once (probe: 512 simultaneously live 1MiB
+     * Segments), and that number is far above the number of Pieces this process
+     * serves at once, so the pool degenerates to this single element. */
+    urma_token_id_t *read_token_id;
+    /* READ sources holding `read_token_id`, including a source whose
+     * registration result is uncertain and can never be released. */
+    uint32_t read_token_id_refs;
 };
 
 struct dfurma_jfc {
@@ -94,6 +107,7 @@ struct dfurma_read_segment {
 struct dfurma_read_source {
     dfurma_runtime_t *runtime;
     urma_target_seg_t *segment;
+    /* Borrowed from `runtime->read_token_id`; the runtime owns and frees it. */
     urma_token_id_t *token_id;
     /* Page-aligned private copy of the caller bytes. The provider rejects
      * register requests whose VA is not page aligned, so the shim never
@@ -911,6 +925,30 @@ static void dfurma_wr_posted(dfurma_wr_t *wr)
     }
 }
 
+/*
+ * Hands out the runtime's shared READ source token id, allocating it on first
+ * use. `urma_alloc_token_id` maps to MAPT_MODE_TABLE, whose provider contract is
+ * one token id carrying many Segments, and it is explicitly owned here because
+ * the core unregister path may free automatically allocated ids on failure.
+ *
+ * Allocation is the dominant cost of the register stage (~9ms/piece, serialized
+ * in the provider's control path), so paying it once per runtime instead of once
+ * per Piece removes it from the data path.
+ */
+static int dfurma_read_token_id_acquire(dfurma_runtime_t *runtime,
+                                        urma_token_id_t **out)
+{
+    if (runtime->read_token_id == NULL) {
+        runtime->read_token_id = urma_alloc_token_id(runtime->context);
+        if (runtime->read_token_id == NULL) {
+            return dfurma_pointer_error(-EIO);
+        }
+    }
+    runtime->read_token_id_refs++;
+    *out = runtime->read_token_id;
+    return 0;
+}
+
 int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
                                 uint64_t length, uint32_t token,
                                 dfurma_read_source_t **out)
@@ -956,14 +994,14 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
         free(source);
         return -EINVAL;
     }
-    /* Own the token ID explicitly. The current core unregister path may attempt
-     * to free automatically allocated IDs even on unregister failure. */
+    /* Take the runtime's shared token id. It stays valid across lane retirement
+     * and across every Segment registered on this context, including a Segment
+     * whose registration below fails or whose unregister later fails. */
     errno = 0;
     stage_start = dfurma_monotonic_ns();
-    source->token_id = urma_alloc_token_id(runtime->context);
+    error = dfurma_read_token_id_acquire(runtime, &source->token_id);
     source->register_token_ns = dfurma_monotonic_ns() - stage_start;
-    if (source->token_id == NULL) {
-        error = dfurma_pointer_error(-EIO);
+    if (error != 0) {
         free(source->memory);
         free(source);
         return error;
@@ -1081,8 +1119,6 @@ int dfurma_read_source_unregister(dfurma_read_source_t *source)
 
 int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source)
 {
-    urma_status_t status;
-
     if (source == NULL || source->runtime == NULL || source->token_id == NULL) {
         return -EINVAL;
     }
@@ -1090,10 +1126,10 @@ int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source)
         return -EBUSY;
     }
     /* This is a caller-supplied proof boundary, NOT a probe of remote access. */
-    status = urma_free_token_id(source->token_id);
-    if (status != URMA_SUCCESS) {
-        return (int)status;
+    if (source->runtime->read_token_id_refs == 0) {
+        return -EUCLEAN;
     }
+    source->runtime->read_token_id_refs--;
     source->runtime->segment_count--;
     source->token_id = NULL;
     free(source->memory);
@@ -1588,8 +1624,17 @@ int dfurma_runtime_close(dfurma_runtime_t *runtime)
     }
     if (runtime->jetty_count != 0 || runtime->segment_count != 0 ||
         runtime->outstanding_wr_count != 0 ||
-        runtime->jfc_count != 0) {
+        runtime->jfc_count != 0 || runtime->read_token_id_refs != 0) {
         return -EBUSY;
+    }
+
+    if (runtime->read_token_id != NULL) {
+        status = urma_free_token_id(runtime->read_token_id);
+        if (status != URMA_SUCCESS) {
+            /* Retryable close: the token id belongs to the context below. */
+            return (int)status;
+        }
+        runtime->read_token_id = NULL;
     }
 
     if (runtime->context != NULL) {
