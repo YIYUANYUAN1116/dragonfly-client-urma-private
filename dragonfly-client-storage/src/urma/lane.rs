@@ -1085,6 +1085,29 @@ mod tests {
     }
 
     #[test]
+    fn moderated_send_completions_saturate_at_one_cqe_per_window() {
+        // A registered Window retires as a unit, so its last SEND is always
+        // signaled. Because the frontier counter is window-scoped, the CQE count
+        // per Window is `1 + floor((chunks - 1) / interval)`: once the interval
+        // reaches the chunk count, a larger interval cannot reduce the CQE rate
+        // below one per Window. Going lower requires a cross-Window frontier.
+        let per_window = |chunks: usize, interval: usize| {
+            let mut since = 0;
+            (0..chunks)
+                .filter(|index| select_send_completion(&mut since, interval, *index == chunks - 1))
+                .count()
+        };
+        assert_eq!(per_window(16, 1), 16);
+        assert_eq!(per_window(16, 4), 4);
+        assert_eq!(per_window(16, 8), 2);
+        assert_eq!(per_window(16, 16), 1);
+        assert_eq!(per_window(16, 32), 1);
+        assert_eq!(per_window(16, 64), 1);
+        // The window tail is signaled even when the interval never elapses.
+        assert_eq!(per_window(3, 64), 1);
+    }
+
+    #[test]
     fn draining_peer_rejects_new_credit_and_requires_send_drain_before_close() {
         let mut peer = PeerTarget::new(7, 2, capability(), 1, 1).unwrap();
         // Native import is independently covered at the FFI boundary. Set the

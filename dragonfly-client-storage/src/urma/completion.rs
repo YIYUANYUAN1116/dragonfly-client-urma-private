@@ -246,6 +246,7 @@ struct EndpointLifecycle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PeerSendCompletionStats {
     posted: u64,
+    signaled: u64,
     retired: u64,
     cqes: u64,
 }
@@ -471,6 +472,7 @@ impl CompletionRouter {
             tracing::info!(
                 peer_id,
                 send_posted = stats.posted,
+                send_signaled = stats.signaled,
                 send_retired = stats.retired,
                 send_cqe = stats.cqes,
                 sends_per_cqe,
@@ -702,6 +704,9 @@ impl CompletionRouter {
                 *self.outstanding_by_peer.entry(token.peer_id).or_default() += 1;
                 let stats = self.send_stats_by_peer.entry(token.peer_id).or_default();
                 stats.posted = stats.posted.saturating_add(1);
+                if entry.signaled {
+                    stats.signaled = stats.signaled.saturating_add(1);
+                }
                 self.stats.send_post += 1;
             }
             OperationType::Recv => {
@@ -2068,6 +2073,7 @@ mod tests {
             router.send_stats_by_peer.get(&1),
             Some(&PeerSendCompletionStats {
                 posted: 3,
+                signaled: 1,
                 retired: 3,
                 cqes: 1,
             })
