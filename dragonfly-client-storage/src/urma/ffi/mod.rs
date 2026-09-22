@@ -185,6 +185,10 @@ impl NativeRuntime {
         }
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.raw.is_none()
+    }
+
     pub(crate) fn query_device(&self) -> Result<DeviceCapability, FfiError> {
         let raw_runtime = self.raw.ok_or(FfiError::Contract("runtime is closed"))?;
         let mut raw = std::mem::MaybeUninit::<sys::dfurma_device_capability_t>::uninit();
@@ -321,6 +325,14 @@ pub(crate) struct SegmentHandle {
 }
 
 impl SegmentHandle {
+    #[cfg(test)]
+    pub(crate) fn without_native() -> Self {
+        Self {
+            raw: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
     pub(crate) fn create(
         runtime: &mut NativeRuntime,
         length: u64,

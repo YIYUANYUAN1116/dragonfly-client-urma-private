@@ -196,6 +196,7 @@ impl<K> NativeChild<K> {
         token: &ReadToken,
         max_read_size: u32,
         pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+        active_destination_bytes: u64,
         keepalive: K,
     ) -> super::read_owners::ChildCreation<Self> {
         use super::read_owners::ChildCreation;
@@ -219,7 +220,12 @@ impl<K> NativeChild<K> {
         }
         let creation = {
             let mut pool = pool.borrow_mut();
-            pool.take(runtime, spec.allocation_bytes, alignment)
+            pool.take(
+                runtime,
+                spec.allocation_bytes,
+                alignment,
+                active_destination_bytes,
+            )
         };
         let (local, allocation_error, buffer_uncertain) = match creation {
             ReadBufferCreation::Ready(local) => (local, None, false),

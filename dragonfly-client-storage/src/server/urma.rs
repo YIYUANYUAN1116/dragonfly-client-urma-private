@@ -45,11 +45,11 @@ use dragonfly_client_metric::{
     collect_upload_piece_started_metrics, collect_upload_piece_traffic_metrics,
     collect_urma_budget_pressure_metrics, collect_urma_registered_bytes_metrics,
 };
+use hmac::{Hmac, Mac};
 use leaky_bucket::RateLimiter;
+use sha2::Sha256;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -597,29 +597,48 @@ fn read_runtime_config(read: &UrmaReadServer) -> ClientResult<ReadRuntimeConfig>
 ///
 /// A keyed permutation of the 32-bit token space provides both properties without
 /// any bookkeeping. Feistel rounds are a bijection for every key, so distinct
-/// indices can never collide and uniqueness costs no memory, while the round
-/// function is SipHash seeded from the OS, so values cannot be extrapolated from
-/// samples without the process key.
+/// indices can never collide and uniqueness costs no memory. Independent HMAC-SHA256
+/// round keys come directly from the OS CSPRNG; token confidentiality is still
+/// bounded by the provider's 32-bit field and must be paired with admission limits.
 struct ReadTokenSpace {
     index: AtomicU32,
-    round_key: RandomState,
+    round_keys: [[u8; 32]; READ_TOKEN_ROUNDS],
 }
 
-/// Four rounds with an independent keyed round function make the permutation a
-/// strong one-way map, not just an injective one.
-const READ_TOKEN_ROUNDS: u8 = 4;
+const READ_TOKEN_ROUNDS: usize = 4;
+type ReadTokenMac = Hmac<Sha256>;
 
-static READ_TOKEN_SPACE: OnceLock<ReadTokenSpace> = OnceLock::new();
+static READ_TOKEN_SPACE: OnceLock<Result<ReadTokenSpace, getrandom::Error>> = OnceLock::new();
 
 fn next_read_token() -> ClientResult<u32> {
-    allocate_read_token(READ_TOKEN_SPACE.get_or_init(ReadTokenSpace::new))
+    let space = READ_TOKEN_SPACE
+        .get_or_init(ReadTokenSpace::new)
+        .as_ref()
+        .map_err(|error| {
+            ClientError::Unknown(format!(
+                "failed to initialize URMA READ token space: {error}"
+            ))
+        })?;
+    allocate_read_token(space)
 }
 
 impl ReadTokenSpace {
-    fn new() -> Self {
+    fn new() -> Result<Self, getrandom::Error> {
+        let mut round_keys = [[0u8; 32]; READ_TOKEN_ROUNDS];
+        for key in &mut round_keys {
+            getrandom::fill(key)?;
+        }
+        Ok(Self {
+            index: AtomicU32::new(0),
+            round_keys,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_test_keys(round_keys: [[u8; 32]; READ_TOKEN_ROUNDS]) -> Self {
         Self {
             index: AtomicU32::new(0),
-            round_key: RandomState::new(),
+            round_keys,
         }
     }
 
@@ -635,11 +654,12 @@ impl ReadTokenSpace {
         (u32::from(left) << 16) | u32::from(right)
     }
 
-    fn round(&self, round: u8, half: u16) -> u16 {
-        let mut hasher = self.round_key.build_hasher();
-        hasher.write_u8(round);
-        hasher.write_u16(half);
-        hasher.finish() as u16
+    fn round(&self, round: usize, half: u16) -> u16 {
+        let mut mac = ReadTokenMac::new_from_slice(&self.round_keys[round])
+            .expect("HMAC accepts every 32-byte key");
+        mac.update(&half.to_be_bytes());
+        let output = mac.finalize().into_bytes();
+        u16::from_be_bytes([output[0], output[1]])
     }
 }
 
@@ -652,8 +672,9 @@ fn allocate_read_token(space: &ReadTokenSpace) -> ClientResult<u32> {
             })
             .map_err(|_| ClientError::Unknown("urma READ token space exhausted".to_string()))?;
 
-        // Zero is the URMA_TOKEN_NONE policy value rather than a bearer token, so it
-        // is never issued. Exactly one index maps to it; skipping it costs one draw.
+        // Preserve the transport's historical reservation of bearer value zero.
+        // URMA_TOKEN_NONE is a separate policy field; zero is not a provider bypass.
+        // Exactly one index maps to zero, so skipping it costs one draw.
         let token = space.permute(index);
         if token != 0 {
             return Ok(token);
@@ -1748,7 +1769,7 @@ mod tests {
 
     #[test]
     fn read_token_allocator_never_wraps_or_reuses_zero() {
-        let space = ReadTokenSpace::new();
+        let space = test_read_token_space();
         space.index.store(u32::MAX - 1, Ordering::Release);
         assert_ne!(allocate_read_token(&space).unwrap(), 0);
         // The space is exhausted, not wrapped: the next draw fails closed instead of
@@ -1763,30 +1784,31 @@ mod tests {
         // what lets a stale offer never arm a new export without tracking issued
         // tokens. The Feistel structure guarantees it, so a sequential slice of the
         // index space is enough to catch a broken implementation.
-        let space = ReadTokenSpace::new();
+        let space = test_read_token_space();
         let mut issued = HashSet::new();
         for _ in 0..(1 << 16) {
             let token = allocate_read_token(&space).unwrap();
-            assert_ne!(token, 0, "zero is the URMA_TOKEN_NONE policy value");
+            assert_ne!(token, 0, "reserved bearer value zero was issued");
             assert!(issued.insert(token), "token {token} was issued twice");
         }
     }
 
     #[test]
-    fn read_token_allocator_does_not_advance_by_a_predictable_step() {
-        // A reader holds every token it was served, so consecutive draws must not
-        // reveal the next one. This is exactly what the previous +1 counter broke.
-        let space = ReadTokenSpace::new();
-        let mut previous = allocate_read_token(&space).unwrap();
-        for _ in 0..64 {
-            let token = allocate_read_token(&space).unwrap();
-            assert_ne!(
-                token,
-                previous.wrapping_add(1),
-                "consecutive tokens are extrapolatable"
-            );
-            previous = token;
+    fn read_token_permutation_has_stable_test_vector() {
+        let space = test_read_token_space();
+        assert_eq!(space.permute(0), 0xd367_1f1f);
+        assert_eq!(space.permute(1), 0x0f6c_f728);
+        assert_eq!(space.permute(u32::MAX), 0x3385_5c65);
+    }
+
+    fn test_read_token_space() -> ReadTokenSpace {
+        let mut keys = [[0u8; 32]; READ_TOKEN_ROUNDS];
+        for (round, key) in keys.iter_mut().enumerate() {
+            for (index, byte) in key.iter_mut().enumerate() {
+                *byte = (round * 32 + index) as u8;
+            }
         }
+        ReadTokenSpace::with_test_keys(keys)
     }
 
     #[tokio::test]

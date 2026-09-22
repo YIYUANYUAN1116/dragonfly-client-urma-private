@@ -743,6 +743,7 @@ impl<K, C>
         credits: std::rc::Rc<std::cell::RefCell<super::read_wr_credit::ReadWrCredits>>,
         pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
     ) -> ChildAdmission {
+        let active_destination_bytes = self.usage().destination_bytes;
         // SAFETY: create_child supplies byte admission before any native calls;
         // caller supplies provider/descriptor facts and shared credit identity.
         unsafe {
@@ -757,6 +758,7 @@ impl<K, C>
                     token,
                     max_read_size,
                     pool,
+                    active_destination_bytes,
                     keepalive,
                 );
                 let wrap =

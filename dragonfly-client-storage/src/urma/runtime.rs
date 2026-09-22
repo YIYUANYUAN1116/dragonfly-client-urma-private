@@ -395,10 +395,9 @@ mod native {
             credits: Rc<std::cell::RefCell<ReadWrCredits>>,
             max_outstanding_per_peer: usize,
             buffer_alignment: u64,
-            // Retains closed registered destination buffers for reuse. Capped
-            // at the destination budget, so worst-case pinned memory for the
-            // destination subsystem is the in-flight charge plus the pool;
-            // process-level totals must still add source and RM pools.
+            // Retains closed registered destination buffers for reuse. Pool
+            // eviction combines this charge with active owner bytes so their
+            // sum never exceeds the configured destination budget.
             destination_pool: Rc<std::cell::RefCell<ReadBufferPool>>,
         },
     }
@@ -697,9 +696,9 @@ mod native {
                         credits,
                         max_outstanding_per_peer: read.max_outstanding_per_peer,
                         buffer_alignment: read.buffer_alignment,
-                        destination_pool: Rc::new(std::cell::RefCell::new(
-                            ReadBufferPool::new(read.budget.destination.bytes),
-                        )),
+                        destination_pool: Rc::new(std::cell::RefCell::new(ReadBufferPool::new(
+                            read.budget.destination.bytes,
+                        ))),
                     }
                 }
                 None => RuntimeReadState::Disabled,
@@ -850,27 +849,27 @@ mod native {
                 .native
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
-            let (owners, credits, configured_max, alignment, destination_pool) = match &mut self.read
-            {
-                RuntimeReadState::Disabled => {
-                    return Err(Error::InvalidConfiguration(
-                        "READ-only runtime is not enabled".into(),
-                    ))
-                }
-                RuntimeReadState::Active {
-                    owners,
-                    credits,
-                    max_outstanding_per_peer,
-                    buffer_alignment,
-                    destination_pool,
-                } => (
-                    owners,
-                    credits.clone(),
-                    *max_outstanding_per_peer,
-                    *buffer_alignment,
-                    destination_pool.clone(),
-                ),
-            };
+            let (owners, credits, configured_max, alignment, destination_pool) =
+                match &mut self.read {
+                    RuntimeReadState::Disabled => {
+                        return Err(Error::InvalidConfiguration(
+                            "READ-only runtime is not enabled".into(),
+                        ))
+                    }
+                    RuntimeReadState::Active {
+                        owners,
+                        credits,
+                        max_outstanding_per_peer,
+                        buffer_alignment,
+                        destination_pool,
+                    } => (
+                        owners,
+                        credits.clone(),
+                        *max_outstanding_per_peer,
+                        *buffer_alignment,
+                        destination_pool.clone(),
+                    ),
+                };
             if request.max_outstanding > configured_max {
                 return Err(Error::InvalidConfiguration(format!(
                     "READ Child max_outstanding={} exceeds per-peer limit {configured_max}",
@@ -1403,7 +1402,16 @@ mod native {
         }
 
         pub(crate) fn shutdown(mut self) -> Result<()> {
-            self.shutdown_inner()
+            let result = self.shutdown_inner();
+            if result.is_err() {
+                // Shutdown consumes the owner-thread runtime, so no later caller can
+                // retry a provider failure. Keep every still-live native owner and
+                // its backing allocation reachable until process exit instead of
+                // dropping the last C handles and leaving registered DMA memory
+                // unowned. ACTIVE intentionally remains set as a fail-closed guard.
+                std::mem::forget(self);
+            }
+            result
         }
 
         fn shutdown_inner(&mut self) -> Result<()> {
@@ -1494,26 +1502,31 @@ mod native {
                         failures.push(error.to_string());
                     }
                 }
-                // Explicitly close pooled READ buffers before the runtime:
-                // SegmentHandle::drop must never fire after native.close().
+                // Explicitly close pooled READ buffers before the runtime.
+                // Failed handles stay in the pool and keep the runtime alive.
+                let mut read_pool_drained = true;
                 if let RuntimeReadState::Active {
                     destination_pool, ..
                 } = &mut self.read
                 {
-                    let classes = destination_pool.borrow_mut().drain();
-                    for (_, buffers) in classes {
-                        for mut buffer in buffers {
-                            if let Err(error) = buffer.close() {
-                                failures.push(
-                                    native_error("read_pool_close", error).to_string(),
-                                );
-                            }
+                    let mut destination_pool = destination_pool.borrow_mut();
+                    for error in destination_pool.close_all() {
+                        failures.push(native_error("read_pool_close", error).to_string());
+                    }
+                    read_pool_drained = destination_pool.is_empty();
+                }
+                if read_pool_drained {
+                    if let Some(native) = self.native.as_mut() {
+                        if let Err(error) = native.close() {
+                            failures.push(native_error("runtime_close", error).to_string());
                         }
                     }
-                }
-                if let Some(mut native) = self.native.take() {
-                    if let Err(error) = native.close() {
-                        failures.push(native_error("runtime_close", error).to_string());
+                    if self
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.is_closed())
+                    {
+                        self.native = None;
                     }
                 }
             }
