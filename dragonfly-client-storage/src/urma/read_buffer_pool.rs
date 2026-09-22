@@ -12,6 +12,7 @@
 
 use super::ffi::{read::ReadBufferCreation, NativeRuntime, SegmentHandle};
 use std::collections::BTreeMap;
+use tracing::debug;
 
 pub(crate) struct ReadBufferPool {
     max_retained_bytes: u64,
@@ -40,8 +41,18 @@ impl ReadBufferPool {
     ) -> ReadBufferCreation {
         if let Some(buffer) = self.classes.get_mut(&length).and_then(|class| class.pop()) {
             self.retained_bytes = self.retained_bytes.saturating_sub(length);
+            debug!(
+                length,
+                retained_bytes = self.retained_bytes,
+                "urma READ pool hit"
+            );
             return ReadBufferCreation::Ready(buffer);
         }
+        debug!(
+            length,
+            retained_bytes = self.retained_bytes,
+            "urma READ pool miss; registering destination"
+        );
         SegmentHandle::create_read_buffer(runtime, length, alignment)
     }
 
@@ -53,6 +64,11 @@ impl ReadBufferPool {
         }
         self.retained_bytes += length;
         self.classes.entry(length).or_default().push(buffer);
+        debug!(
+            length,
+            retained_bytes = self.retained_bytes,
+            "urma READ pool returned"
+        );
         Ok(())
     }
 

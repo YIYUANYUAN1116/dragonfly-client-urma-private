@@ -1448,6 +1448,7 @@ impl UrmaServerHandler {
         let piece_id = self
             .storage
             .piece_id(&locator.task_id, locator.piece_number);
+        let source_e2e_start = Instant::now();
         info!(
             task_id = %locator.task_id,
             piece_id,
@@ -1526,7 +1527,11 @@ impl UrmaServerHandler {
             }
         };
         collect_upload_piece_traffic_metrics(pending.completed_length);
-        info!(piece_id, "urma READ source fully read; revoking export");
+        info!(
+            piece_id,
+            source_e2e_ns = source_e2e_start.elapsed().as_nanos() as u64,
+            "urma READ source fully read; revoking export"
+        );
 
         // SAFETY: Construction of this handler required the deployment's
         // explicit provider-revocation gate. ReadDone/CancelDrained supplies

@@ -174,6 +174,10 @@ impl<K> NativeChild<K> {
                 Err(returned) => buffer = returned,
             }
         }
+        tracing::debug!(
+            length = self.allocation_bytes,
+            "urma READ pool bypass; unregistering destination"
+        );
         buffer.close()
     }
 }
