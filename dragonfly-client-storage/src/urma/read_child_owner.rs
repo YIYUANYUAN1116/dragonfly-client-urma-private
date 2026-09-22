@@ -129,6 +129,11 @@ pub(crate) struct NativeChild<K> {
     local: Option<SegmentHandle>,
     remote: Option<ImportedReadSegment>,
     import_uncertain: bool,
+    // Pool shared with the runtime READ state; reuse replaces per-Piece
+    // register/unregister. Buffers from an uncertain creation never re-enter.
+    pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+    allocation_bytes: u64,
+    buffer_uncertain: bool,
     _keepalive: K,
 }
 impl<K> NativeChild<K> {
@@ -142,6 +147,8 @@ impl<K> NativeChild<K> {
         target: std::rc::Rc<TargetHandle>,
         local: SegmentHandle,
         remote: ImportedReadSegment,
+        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+        allocation_bytes: u64,
         keepalive: K,
     ) -> Self {
         Self {
@@ -150,8 +157,24 @@ impl<K> NativeChild<K> {
             local: Some(local),
             remote: Some(remote),
             import_uncertain: false,
+            pool,
+            allocation_bytes,
+            buffer_uncertain: false,
             _keepalive: keepalive,
         }
+    }
+
+    /// Returns the registered destination buffer to the pool when it is healthy
+    /// and the pool still has retention capacity; closes it otherwise. The
+    /// buffer is consumed either way.
+    fn release_local(&mut self, mut buffer: SegmentHandle) -> Result<(), FfiError> {
+        if !self.buffer_uncertain {
+            match self.pool.borrow_mut().put(buffer, self.allocation_bytes) {
+                Ok(()) => return Ok(()),
+                Err(returned) => buffer = returned,
+            }
+        }
+        buffer.close()
     }
 }
 impl<K> NativeChild<K> {
@@ -168,6 +191,7 @@ impl<K> NativeChild<K> {
         descriptor: &ReadDescriptor,
         token: &ReadToken,
         max_read_size: u32,
+        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
         keepalive: K,
     ) -> super::read_owners::ChildCreation<Self> {
         use super::read_owners::ChildCreation;
@@ -189,24 +213,30 @@ impl<K> NativeChild<K> {
             }
             Err(error) => return ChildCreation::Rejected(error),
         }
-        let (local, allocation_error) =
-            match SegmentHandle::create_read_buffer(runtime, spec.allocation_bytes, alignment) {
-                ReadBufferCreation::Ready(local) => (local, None),
-                ReadBufferCreation::Uncertain { buffer, error } => (buffer, Some(error)),
-                ReadBufferCreation::Rejected(FfiError::NullHandle) => {
-                    // Broken shim contract: preserve guards and shared native
-                    // owners along with the manager's ownerless reservation.
-                    std::mem::forget((jetty, target, keepalive));
-                    return ChildCreation::Lost(FfiError::NullHandle);
-                }
-                ReadBufferCreation::Rejected(error) => return ChildCreation::Rejected(error),
-            };
+        let creation = {
+            let mut pool = pool.borrow_mut();
+            pool.take(runtime, spec.allocation_bytes, alignment)
+        };
+        let (local, allocation_error, buffer_uncertain) = match creation {
+            ReadBufferCreation::Ready(local) => (local, None, false),
+            ReadBufferCreation::Uncertain { buffer, error } => (buffer, Some(error), true),
+            ReadBufferCreation::Rejected(FfiError::NullHandle) => {
+                // Broken shim contract: preserve guards and shared native
+                // owners along with the manager's ownerless reservation.
+                std::mem::forget((jetty, target, pool, keepalive));
+                return ChildCreation::Lost(FfiError::NullHandle);
+            }
+            ReadBufferCreation::Rejected(error) => return ChildCreation::Rejected(error),
+        };
         let mut owner = Self {
             jetty,
             target,
             local: Some(local),
             remote: None,
             import_uncertain: false,
+            pool,
+            allocation_bytes: spec.allocation_bytes,
+            buffer_uncertain,
             _keepalive: keepalive,
         };
         if let Some(error) = allocation_error {
@@ -233,7 +263,10 @@ impl<K> NativeChild<K> {
                         error,
                     };
                 }
-                match owner.local.as_mut().expect("created local buffer").close() {
+                // The healthy local buffer returns to the pool; a real close
+                // failure still retains the resource as uncertain.
+                let local = owner.local.take().expect("created local buffer");
+                match owner.release_local(local) {
                     Ok(()) => ChildCreation::Rejected(error),
                     Err(cleanup_error) => ChildCreation::Uncertain {
                         resources: owner,
@@ -287,10 +320,10 @@ impl<K> ChildResources for NativeChild<K> {
         Ok(())
     }
     fn close_buffer(&mut self) -> Result<(), FfiError> {
-        if let Some(local) = &mut self.local {
-            return local.close();
+        match self.local.take() {
+            Some(local) => self.release_local(local),
+            None => Ok(()),
         }
-        Ok(())
     }
     fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError> {
         let local = self
@@ -306,8 +339,7 @@ impl<K> ChildResources for NativeChild<K> {
         Ok((local, span))
     }
     fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError> {
-        let mut lease = lease;
-        lease.close()
+        self.release_local(lease)
     }
 }
 
@@ -847,6 +879,47 @@ mod tests {
                 "buffer-close",
                 "drop"
             ]
+        );
+    }
+
+    /// Pool reuse eligibility rests on full retirement evidence, not creation
+    /// state alone: an uncertain post retains its WR in pending, so the buffer
+    /// cannot reach close_buffer (pool entry) until its CQE retires it.
+    #[test]
+    fn uncertain_post_blocks_pool_entry_until_cqe_retires_the_wr() {
+        let (mut registry, id, trace) = setup();
+        trace.borrow_mut().mode = 1;
+        let context = match registry.active_owner(id).unwrap().post_routed(4) {
+            ChildPostOutcome::Uncertain { context, .. } => context,
+            _ => panic!("expected uncertain post"),
+        };
+        registry.retire(id).unwrap();
+        assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(false));
+        assert!(!trace.borrow().events.contains(&"buffer-close"));
+        // The CQE provides the retirement evidence; only then may the buffer
+        // travel through close_buffer (its production pool entry point).
+        registry
+            .retained_owner(id)
+            .unwrap()
+            .complete(completion(id, context, true))
+            .unwrap();
+        assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(true));
+        assert!(trace.borrow().events.contains(&"buffer-close"));
+    }
+
+    /// A failed READ retires with CQE evidence (no in-flight DMA), so its
+    /// buffer is safe to reuse: close_buffer is the production pool path.
+    #[test]
+    fn failed_read_retires_into_the_pool_release_path() {
+        let (mut registry, id, trace) = setup();
+        let owner = registry.active_owner(id).unwrap();
+        let context = owner.post(4).unwrap();
+        owner.complete(completion(id, context, false)).unwrap();
+        registry.retire(id).unwrap();
+        assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(true));
+        assert_eq!(
+            trace.borrow().events,
+            ["post", "complete", "unimport", "buffer-close", "drop"]
         );
     }
 }

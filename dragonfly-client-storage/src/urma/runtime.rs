@@ -260,6 +260,7 @@ mod native {
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, PeerTarget, TransportMode, UrmaJetty},
         native_error,
+        read_buffer_pool::ReadBufferPool,
         read_child_owner::NativeChild,
         read_owner::ReadPeer,
         read_owners::ReadOwners,
@@ -389,6 +390,11 @@ mod native {
             credits: Rc<std::cell::RefCell<ReadWrCredits>>,
             max_outstanding_per_peer: usize,
             buffer_alignment: u64,
+            // Retains closed registered destination buffers for reuse. Capped
+            // at the destination budget, so worst-case pinned memory for the
+            // destination subsystem is the in-flight charge plus the pool;
+            // process-level totals must still add source and RM pools.
+            destination_pool: Rc<std::cell::RefCell<ReadBufferPool>>,
         },
     }
 
@@ -686,6 +692,9 @@ mod native {
                         credits,
                         max_outstanding_per_peer: read.max_outstanding_per_peer,
                         buffer_alignment: read.buffer_alignment,
+                        destination_pool: Rc::new(std::cell::RefCell::new(
+                            ReadBufferPool::new(read.budget.destination.bytes),
+                        )),
                     }
                 }
                 None => RuntimeReadState::Disabled,
@@ -836,7 +845,8 @@ mod native {
                 .native
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
-            let (owners, credits, configured_max, alignment) = match &mut self.read {
+            let (owners, credits, configured_max, alignment, destination_pool) = match &mut self.read
+            {
                 RuntimeReadState::Disabled => {
                     return Err(Error::InvalidConfiguration(
                         "READ-only runtime is not enabled".into(),
@@ -847,11 +857,13 @@ mod native {
                     credits,
                     max_outstanding_per_peer,
                     buffer_alignment,
+                    destination_pool,
                 } => (
                     owners,
                     credits.clone(),
                     *max_outstanding_per_peer,
                     *buffer_alignment,
+                    destination_pool.clone(),
                 ),
             };
             if request.max_outstanding > configured_max {
@@ -882,6 +894,7 @@ mod native {
                     self.capability.max_read_size,
                     (),
                     credits,
+                    destination_pool,
                 )
             } {
                 ChildAdmission::Ready(id) => Ok(ReadChildAdmission::Ready(ReadChildId(id))),
@@ -1471,6 +1484,23 @@ mod native {
                 if let Some(mut send_jfc) = self.send_jfc.take() {
                     if let Err(error) = send_jfc.close() {
                         failures.push(error.to_string());
+                    }
+                }
+                // Explicitly close pooled READ buffers before the runtime:
+                // SegmentHandle::drop must never fire after native.close().
+                if let RuntimeReadState::Active {
+                    destination_pool, ..
+                } = &mut self.read
+                {
+                    let classes = destination_pool.borrow_mut().drain();
+                    for (_, buffers) in classes {
+                        for mut buffer in buffers {
+                            if let Err(error) = buffer.close() {
+                                failures.push(
+                                    native_error("read_pool_close", error).to_string(),
+                                );
+                            }
+                        }
                     }
                 }
                 if let Some(mut native) = self.native.take() {

@@ -18,6 +18,7 @@ mod lane;
 #[allow(dead_code)]
 mod read;
 #[allow(dead_code)]
+mod read_buffer_pool;
 mod read_child_owner;
 #[allow(dead_code)]
 pub(crate) mod read_control;

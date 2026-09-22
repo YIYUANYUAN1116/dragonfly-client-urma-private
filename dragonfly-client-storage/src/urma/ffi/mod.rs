@@ -145,6 +145,15 @@ pub(crate) struct NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Test-only closed handle for ownership/lifecycle tests without a provider.
+    #[cfg(test)]
+    pub(crate) fn without_native() -> Self {
+        Self {
+            raw: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
     pub(crate) fn open(device_name: &CStr, eid_index: u32) -> Result<Self, FfiError> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `device_name` is NUL terminated and valid for the call; `raw`

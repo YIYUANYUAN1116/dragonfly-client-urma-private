@@ -717,6 +717,7 @@ impl<K, C>
     /// # Safety
     /// NativeChild::create's descriptor/provider requirements apply. credits must
     /// represent this Jetty's available JFS depth shared by every READ owner.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn create_native_child(
         &mut self,
         peer: ReadPeer,
@@ -730,6 +731,7 @@ impl<K, C>
         max_read_size: u32,
         keepalive: C,
         credits: std::rc::Rc<std::cell::RefCell<super::read_wr_credit::ReadWrCredits>>,
+        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
     ) -> ChildAdmission {
         // SAFETY: create_child supplies byte admission before any native calls;
         // caller supplies provider/descriptor facts and shared credit identity.
@@ -744,6 +746,7 @@ impl<K, C>
                     descriptor,
                     token,
                     max_read_size,
+                    pool,
                     keepalive,
                 );
                 let wrap =
