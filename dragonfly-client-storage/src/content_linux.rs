@@ -37,6 +37,8 @@ use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncRead;
 #[cfg(feature = "urma")]
+use tokio::sync::Semaphore;
+#[cfg(feature = "urma")]
 use tracing::debug;
 use tracing::{error, info, instrument, warn};
 use walkdir::WalkDir;
@@ -129,6 +131,11 @@ pub struct Content {
 
     /// Initiates writeback of written piece ranges per storage.writebackMode.
     writeback: super::content::Writeback,
+
+    /// Decouples READ queue depth from the storage device's useful pwrite
+    /// concurrency. Only the RM-READ lease consumer uses these permits.
+    #[cfg(feature = "urma")]
+    rm_read_pwrite_permits: Option<Arc<Semaphore>>,
 }
 
 /// Implements the content storage.
@@ -149,6 +156,15 @@ impl Content {
         fs::create_dir_all(&dir.join(super::content::DEFAULT_PERSISTENT_CACHE_TASK_DIR)).await?;
         info!("content initialized directory: {:?}", dir);
 
+        #[cfg(feature = "urma")]
+        let rm_read_pwrite_permits = config
+            .storage
+            .server
+            .urma
+            .read
+            .as_ref()
+            .map(|read| Arc::new(Semaphore::new(read.max_concurrent_storage_writes as usize)));
+
         Ok(Content {
             buffer_pool: BufferPool::new(
                 super::content::MAX_BUFFER_POOL_IDLE_BUFFERS
@@ -158,6 +174,8 @@ impl Content {
                     ),
             ),
             writeback: super::content::Writeback::new(config.storage.writeback_mode),
+            #[cfg(feature = "urma")]
+            rm_read_pwrite_permits,
             config,
             dir,
             fd_cache: FDCache::new(DEFAULT_FD_CACHE_CAPACITY),
@@ -682,11 +700,40 @@ impl Content {
         // this future is cancelled, dropping the armed lease deliberately keeps
         // the owner registered, so the worker cannot observe freed memory.
         let (data_addr, data_len) = (data.as_ptr() as usize, data.len());
+        let digest = tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(data);
+            (hasher, start.elapsed().as_nanos() as u64)
+        });
+
+        let pwrite_admission_start = Instant::now();
+        let pwrite_permit = self
+            .rm_read_pwrite_permits
+            .as_ref()
+            .ok_or_else(|| Error::Unknown("RM-READ pwrite limiter is not configured".into()))?
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Unknown("RM-READ pwrite limiter closed".into()))?;
+        let pwrite_admission_ns = pwrite_admission_start.elapsed().as_nanos() as u64;
+        let pwrite_limit = self
+            .config
+            .storage
+            .server
+            .urma
+            .read
+            .as_ref()
+            .map(|read| read.max_concurrent_storage_writes)
+            .unwrap_or_default();
+
         let write = {
             let file = file.clone();
             let task_id = task_id.to_string();
             let piece_id = piece_id.to_string();
             tokio::task::spawn_blocking(move || {
+                let _pwrite_permit = pwrite_permit;
                 let (activity, pwrite_active) = RmReadPwriteActivity::start();
                 let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
                 let mut buffers = [IoSlice::new(data)];
@@ -699,6 +746,7 @@ impl Content {
                     piece_id,
                     expected_length = data_len,
                     pwrite_ns,
+                    pwrite_limit,
                     pwrite_active_at_start = pwrite_active,
                     pwrite_active_after,
                     pwrite_succeeded = result.is_ok(),
@@ -708,13 +756,6 @@ impl Content {
                 Ok::<(u64, u64), std::io::Error>((pwrite_ns, 1))
             })
         };
-        let digest = tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-            let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(data);
-            (hasher, start.elapsed().as_nanos() as u64)
-        });
         let (write, digest) = tokio::join!(write, digest);
         let (pwrite_ns, pwrite_calls) = write
             .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
@@ -727,6 +768,8 @@ impl Content {
             piece_id,
             expected_length = length,
             file_open_ns,
+            pwrite_admission_ns,
+            pwrite_limit,
             pwrite_ns,
             pwrite_calls,
             digest_ns,
@@ -1489,6 +1532,30 @@ mod tests {
         assert_eq!(&contents[..4], &[0; 4]);
         assert_eq!(&contents[4..12], b"abcdefgh");
         assert_eq!(&contents[12..], &[0; 4]);
+    }
+
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn test_rm_read_pwrite_limit_comes_from_read_config() {
+        let temp_dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.server.urma.read = Some(dragonfly_client_config::dfdaemon::UrmaReadServer {
+            max_concurrent_storage_writes: 8,
+            ..Default::default()
+        });
+
+        let content = Content::new(Arc::new(config), temp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            content
+                .rm_read_pwrite_permits
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            8
+        );
     }
 
     #[tokio::test]

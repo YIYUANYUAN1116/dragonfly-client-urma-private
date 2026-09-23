@@ -1104,6 +1104,7 @@ pub struct UrmaServer {
     /// reserves its full effective JFS depth for RM-READ and rejects legacy
     /// SEND/RECV posts, turning the storage URMA server into a READ parent.
     #[serde(default)]
+    #[validate]
     pub read: Option<UrmaReadServer>,
 }
 
@@ -1161,6 +1162,13 @@ pub struct UrmaReadServer {
     #[serde(with = "bytesize_serde", default = "default_urma_read_max_read_size")]
     pub max_read_size: ByteSize,
 
+    /// Maximum RM-READ leases allowed to execute pwrite concurrently. READ and
+    /// CRC32 continue independently so transport depth is not coupled to the
+    /// storage device's useful write concurrency.
+    #[serde(default = "default_urma_read_max_concurrent_storage_writes")]
+    #[validate(range(min = 1, max = 1024))]
+    pub max_concurrent_storage_writes: u32,
+
     #[serde(default = "default_urma_read_max_jfs_sge")]
     #[validate(range(min = 1, max = 64))]
     pub max_jfs_sge: u32,
@@ -1178,6 +1186,7 @@ impl Default for UrmaReadServer {
             quarantine_bytes: default_urma_read_quarantine_bytes(),
             max_outstanding_per_peer: default_urma_read_max_outstanding_per_peer(),
             max_read_size: default_urma_read_max_read_size(),
+            max_concurrent_storage_writes: default_urma_read_max_concurrent_storage_writes(),
             max_jfs_sge: default_urma_read_max_jfs_sge(),
         }
     }
@@ -1213,6 +1222,12 @@ fn default_urma_read_max_outstanding_per_peer() -> u32 {
 
 fn default_urma_read_max_read_size() -> ByteSize {
     ByteSize::mib(1)
+}
+
+fn default_urma_read_max_concurrent_storage_writes() -> u32 {
+    // Preserve the pre-limit behavior unless an operator explicitly tunes the
+    // READ-only path. B7 performance cases set a lower value.
+    1024
 }
 
 fn default_urma_read_max_jfs_sge() -> u32 {
@@ -2837,7 +2852,9 @@ mod urma_config_tests {
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert_eq!(urma.peer_guaranteed_rx_credits, 0);
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
-        assert!(!UrmaReadServer::default().provider_revocation_validated);
+        let read = UrmaReadServer::default();
+        assert!(!read.provider_revocation_validated);
+        assert_eq!(read.max_concurrent_storage_writes, 1024);
     }
 
     #[test]
@@ -2848,6 +2865,20 @@ mod urma_config_tests {
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
         assert_eq!(urma.tp_type, UrmaTpType::Ctp);
         assert_eq!(urma.peer_guaranteed_rx_credits, 8);
+    }
+
+    #[test]
+    fn deserialize_urma_read_storage_write_limit() {
+        let read: UrmaReadServer = serde_yaml::from_str("maxConcurrentStorageWrites: 8").unwrap();
+        assert_eq!(read.max_concurrent_storage_writes, 8);
+        for max_concurrent_storage_writes in [0, 1025] {
+            assert!(UrmaReadServer {
+                max_concurrent_storage_writes,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
     }
 
     #[test]
