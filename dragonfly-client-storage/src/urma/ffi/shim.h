@@ -117,15 +117,22 @@ typedef struct dfurma_read_source_stages {
     uint64_t copy_ns;
     uint64_t token_ns;
     uint64_t seg_ns;
+    uint32_t direct;
 } dfurma_read_source_stages_t;
 
-/* External immutable backing is caller-owned throughout registration, retirement
- * and revocation confirmation. No function below frees the backing allocation.
- * On a registration error with non-NULL *out, native grant cleanup is uncertain:
- * retain the wrapper AND backing. NULL *out means registration was never called. */
+/* Copies caller bytes into private page-aligned memory before registration.
+ * On a registration error with non-NULL *out, native grant cleanup is uncertain
+ * and the wrapper retains that private copy. */
 int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
                                 uint64_t length, uint32_t token,
                                 dfurma_read_source_t **out);
+/* Registers caller-owned immutable page-aligned memory without a copy. The caller
+ * must retain the exact backing through unregister and independent revocation.
+ * A non-NULL *out on error also requires indefinite backing retention. */
+int dfurma_read_source_register_direct(dfurma_runtime_t *runtime,
+                                       const uint8_t *data, uint64_t length,
+                                       uint32_t token,
+                                       dfurma_read_source_t **out);
 /* Reports the register sub-phase timings captured for this wrapper. Diagnostic
  * only; never use these values to decide release or revocation. */
 int dfurma_read_source_register_stages(dfurma_read_source_t *source,

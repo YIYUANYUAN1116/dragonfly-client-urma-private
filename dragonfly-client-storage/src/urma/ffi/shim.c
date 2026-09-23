@@ -24,6 +24,8 @@
 #include <string.h>
 #include <time.h>
 
+#define DFURMA_PAGE_ALIGNMENT 4096U
+
 #include <urma_api.h>
 
 _Static_assert(URMA_CR_OPC_SEND == 0,
@@ -109,10 +111,11 @@ struct dfurma_read_source {
     urma_target_seg_t *segment;
     /* Borrowed from `runtime->read_token_id`; the runtime owns and frees it. */
     urma_token_id_t *token_id;
-    /* Page-aligned private copy of the caller bytes. The provider rejects
-     * register requests whose VA is not page aligned, so the shim never
-     * registers caller memory directly. */
+    /* Page-aligned registration VA. It is either a private copy or borrowed
+     * immutable mmap backing retained by Rust through verified revocation. */
     void *memory;
+    int owns_memory;
+    int direct;
     uint64_t va;
     uint64_t length;
     int closing;
@@ -949,9 +952,11 @@ static int dfurma_read_token_id_acquire(dfurma_runtime_t *runtime,
     return 0;
 }
 
-int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
-                                uint64_t length, uint32_t token,
-                                dfurma_read_source_t **out)
+static int dfurma_read_source_register_impl(dfurma_runtime_t *runtime,
+                                            const uint8_t *data,
+                                            uint64_t length, uint32_t token,
+                                            int direct,
+                                            dfurma_read_source_t **out)
 {
     dfurma_read_source_t *source;
     urma_seg_cfg_t cfg = {0};
@@ -968,6 +973,9 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
         length == 0 || length > PTRDIFF_MAX) {
         return -EINVAL;
     }
+    if (direct && ((uintptr_t)data % DFURMA_PAGE_ALIGNMENT) != 0) {
+        return -EINVAL;
+    }
     if (runtime->segment_count == UINT32_MAX) {
         return -EOVERFLOW;
     }
@@ -975,22 +983,30 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     if (source == NULL) {
         return -ENOMEM;
     }
-    /* The provider rejects registration of non-page-aligned VAs. Register a
-     * private page-aligned copy of the caller bytes instead, exactly like the
-     * transport lab probe shim does. */
-    stage_start = dfurma_monotonic_ns();
-    alloc_status = posix_memalign(&source->memory, 4096, (size_t)length);
-    source->register_alloc_ns = dfurma_monotonic_ns() - stage_start;
-    if (alloc_status != 0) {
-        free(source);
-        return -alloc_status;
+    if (direct) {
+        source->memory = (void *)(uintptr_t)data;
+        source->direct = 1;
+    } else {
+        /* The provider rejects non-page-aligned VAs. Reader/heap sources keep
+         * the transport-lab-compatible private aligned copy path. */
+        stage_start = dfurma_monotonic_ns();
+        alloc_status = posix_memalign(&source->memory, DFURMA_PAGE_ALIGNMENT,
+                                      (size_t)length);
+        source->register_alloc_ns = dfurma_monotonic_ns() - stage_start;
+        if (alloc_status != 0) {
+            free(source);
+            return -alloc_status;
+        }
+        source->owns_memory = 1;
+        stage_start = dfurma_monotonic_ns();
+        memcpy(source->memory, data, (size_t)length);
+        source->register_copy_ns = dfurma_monotonic_ns() - stage_start;
     }
-    stage_start = dfurma_monotonic_ns();
-    memcpy(source->memory, data, (size_t)length);
-    source->register_copy_ns = dfurma_monotonic_ns() - stage_start;
     va = (uint64_t)(uintptr_t)source->memory;
     if (length > UINT64_MAX - va) {
-        free(source->memory);
+        if (source->owns_memory) {
+            free(source->memory);
+        }
         free(source);
         return -EINVAL;
     }
@@ -1002,7 +1018,9 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     error = dfurma_read_token_id_acquire(runtime, &source->token_id);
     source->register_token_ns = dfurma_monotonic_ns() - stage_start;
     if (error != 0) {
-        free(source->memory);
+        if (source->owns_memory) {
+            free(source->memory);
+        }
         free(source);
         return error;
     }
@@ -1035,6 +1053,23 @@ int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
     return error;
 }
 
+int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
+                                uint64_t length, uint32_t token,
+                                dfurma_read_source_t **out)
+{
+    return dfurma_read_source_register_impl(runtime, data, length, token, 0,
+                                            out);
+}
+
+int dfurma_read_source_register_direct(dfurma_runtime_t *runtime,
+                                       const uint8_t *data, uint64_t length,
+                                       uint32_t token,
+                                       dfurma_read_source_t **out)
+{
+    return dfurma_read_source_register_impl(runtime, data, length, token, 1,
+                                            out);
+}
+
 int dfurma_read_source_register_stages(dfurma_read_source_t *source,
                                        dfurma_read_source_stages_t *out)
 {
@@ -1045,6 +1080,7 @@ int dfurma_read_source_register_stages(dfurma_read_source_t *source,
     out->copy_ns = source->register_copy_ns;
     out->token_ns = source->register_token_ns;
     out->seg_ns = source->register_seg_ns;
+    out->direct = (uint32_t)source->direct;
     return 0;
 }
 
@@ -1132,7 +1168,9 @@ int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source)
     source->runtime->read_token_id_refs--;
     source->runtime->segment_count--;
     source->token_id = NULL;
-    free(source->memory);
+    if (source->owns_memory) {
+        free(source->memory);
+    }
     source->memory = NULL;
     free(source);
     return 0;

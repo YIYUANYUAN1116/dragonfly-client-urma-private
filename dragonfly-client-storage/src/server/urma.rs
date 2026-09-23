@@ -1501,8 +1501,9 @@ impl UrmaServerHandler {
     }
 
     /// Publishes one Piece as a registered READ source and waits at the
-    /// provider-revocation gate. The shim copies the source bytes into its
-    /// page-aligned registration, so Storage mmap/reader stays authoritative.
+    /// provider-revocation gate. Page-aligned Storage mappings are registered
+    /// directly and retained through revocation; reader bytes use an aligned
+    /// shim-owned copy.
     async fn serve_read_transfer(
         self: Arc<Self>,
         lane_id: u16,
@@ -1571,8 +1572,8 @@ impl UrmaServerHandler {
         let source_copy_start = Instant::now();
         let memory = match source {
             PieceSource::Mapped(mapped) => {
-                // The shim copies synchronously during register, so the mapped
-                // region only needs to outlive that call. Skip the 16MiB copy.
+                // ReadSource retains this mapping through verified revocation.
+                // Its page-aligned VA can therefore be registered directly.
                 if mapped.as_slice().len() as u64 != accepted_length {
                     return Err(ClientError::Unknown(format!(
                         "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
@@ -1634,6 +1635,7 @@ impl UrmaServerHandler {
             register_copy_ns = pending.register_stages.copy_ns,
             register_token_ns = pending.register_stages.token_ns,
             register_seg_ns = pending.register_stages.seg_ns,
+            register_direct = pending.register_stages.direct,
             wait_read_done_ns = pending.wait_read_done_ns,
             "urma READ source fully read; revoking export"
         );

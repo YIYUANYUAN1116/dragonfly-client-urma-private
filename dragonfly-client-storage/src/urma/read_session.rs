@@ -127,6 +127,8 @@ pub(crate) struct ChildTransportTiming {
     pub(crate) destination_admission_ns: u64,
     pub(crate) read_completion_ns: u64,
     pub(crate) lease_publish_ns: u64,
+    pub(crate) read_done_send_ns: u64,
+    pub(crate) done_wait_ns: u64,
     pub(crate) done_round_trip_ns: u64,
 }
 
@@ -382,10 +384,13 @@ impl ChildTransportSession {
         {
             return Err((error, Some(RetainedChildOwner::PublishedLease(child_id))));
         }
+        timing.read_done_send_ns = stage_start.elapsed().as_nanos() as u64;
+        let done_wait_start = Instant::now();
         let terminal = match self.control.receive().await {
             Ok(terminal) => terminal,
             Err(error) => return Err((error, Some(RetainedChildOwner::PublishedLease(child_id)))),
         };
+        timing.done_wait_ns = done_wait_start.elapsed().as_nanos() as u64;
         if self
             .state
             .on_frame(&terminal)

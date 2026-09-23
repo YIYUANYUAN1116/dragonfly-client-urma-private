@@ -325,6 +325,8 @@ impl UrmaReadClient {
             destination_admission_ns = success.timing.destination_admission_ns,
             read_completion_ns = success.timing.read_completion_ns,
             lease_publish_ns = success.timing.lease_publish_ns,
+            read_done_send_ns = success.timing.read_done_send_ns,
+            done_wait_ns = success.timing.done_wait_ns,
             done_round_trip_ns = success.timing.done_round_trip_ns,
             session_run_ns,
             read_transfer_total_ns = transfer_total_start.elapsed().as_nanos() as u64,

@@ -1,15 +1,18 @@
 //! Parent-side source registration with explicit Storage keepalive retention.
-//! The shim owns the aligned registered copy; native unregister, remote
-//! revocation proof and keepalive release remain separate.
+//! An aligned mmap stays caller-owned; Reader bytes use a shim-owned aligned
+//! copy. Native unregister, remote revocation proof and backing release remain
+//! separate.
 
 use super::{sys, FfiError, ReadDescriptor, ReadToken};
 use crate::urma::ffi::{status_result, NativeRuntime};
 use std::{marker::PhantomData, ptr::NonNull, rc::Rc};
 
+const PROVIDER_PAGE_ALIGNMENT: usize = 4096;
+
 pub(crate) enum ReadSourceMemory {
     Bytes(Box<[u8]>),
-    /// Piece-exact Storage mmap. Only read synchronously during register; the
-    /// shim owns the page-aligned registered copy afterwards.
+    /// Piece-exact Storage mmap. Page-aligned mappings are registered directly
+    /// and retained through verified revocation.
     Mapped(crate::content::MappedPiece),
 }
 
@@ -19,6 +22,11 @@ impl ReadSourceMemory {
             Self::Bytes(bytes) => bytes,
             Self::Mapped(mapped) => mapped.as_slice(),
         }
+    }
+
+    fn can_register_directly(&self) -> bool {
+        matches!(self, Self::Mapped(_))
+            && (self.bytes().as_ptr() as usize) % PROVIDER_PAGE_ALIGNMENT == 0
     }
 }
 
@@ -68,10 +76,13 @@ pub(crate) struct ReadSourceStages {
     pub(crate) copy_ns: u64,
     pub(crate) token_ns: u64,
     pub(crate) seg_ns: u64,
+    pub(crate) direct: bool,
 }
 
 pub(crate) struct ReadSource<K> {
     raw: Option<NonNull<sys::dfurma_read_source_t>>,
+    /// Present only when native registration borrows caller memory directly.
+    memory: Option<ReadSourceMemory>,
     keepalive: Option<K>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
@@ -81,8 +92,8 @@ impl<K> ReadSource<K> {
     /// The caller must enforce source byte/Segment admission and immutable Storage
     /// lifetime (including no truncate/overwrite of mmap backing). The provider's
     /// registration/rollback contract must have passed the deployment gate. The
-    /// shim registers a private page-aligned copy of the caller bytes; caller
-    /// memory is only read synchronously during this call.
+    /// aligned mmap path stays retained in this owner through revoke; other
+    /// sources are copied into shim-owned aligned memory synchronously.
     pub(crate) unsafe fn register(
         runtime: &mut NativeRuntime,
         backing: ReadBacking<K>,
@@ -95,29 +106,42 @@ impl<K> ReadSource<K> {
             };
         };
         let bytes = backing.memory.bytes();
+        let direct = backing.memory.can_register_directly();
         let mut raw = std::ptr::null_mut();
-        // SAFETY: The caller provides immutability/admission. Memory is owned and
-        // stable for this synchronous copy; the shim validates length and copies
-        // the bytes into its own page-aligned registration before returning.
-        let status = unsafe {
-            sys::dfurma_read_source_register(
-                runtime.as_ptr(),
-                bytes.as_ptr(),
-                bytes.len() as u64,
-                token.0,
-                &mut raw,
-            )
+        // SAFETY: The caller provides immutability/admission. Direct mmap memory
+        // is stable until this owner releases after revoke; other memory is
+        // synchronously copied into shim-owned aligned backing.
+        let status = if direct {
+            unsafe {
+                sys::dfurma_read_source_register_direct(
+                    runtime.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    token.0,
+                    &mut raw,
+                )
+            }
+        } else {
+            unsafe {
+                sys::dfurma_read_source_register(
+                    runtime.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    token.0,
+                    &mut raw,
+                )
+            }
         };
         let Some(raw) = NonNull::new(raw) else {
             if status == 0 {
-                // Broken shim contract: retain the Storage guard even without
-                // a usable cleanup handle. The caller memory can be dropped
-                // because the shim contract copied it synchronously.
-                let (_, keepalive) = backing.into_parts();
+                // Broken shim contract: retain caller memory when direct and
+                // the Storage guard even without a usable cleanup handle.
+                let (memory, keepalive) = backing.into_parts();
                 return SourceRegistration::Uncertain {
                     error: FfiError::NullHandle,
                     source: Self {
                         raw: None,
+                        memory: direct.then_some(memory),
                         keepalive: Some(keepalive),
                         _not_send_sync: PhantomData,
                     },
@@ -128,9 +152,10 @@ impl<K> ReadSource<K> {
                 backing,
             };
         };
-        let (_, keepalive) = backing.into_parts();
+        let (memory, keepalive) = backing.into_parts();
         let source = Self {
             raw: Some(raw),
+            memory: direct.then_some(memory),
             keepalive: Some(keepalive),
             _not_send_sync: PhantomData,
         };
@@ -163,6 +188,7 @@ impl<K> ReadSource<K> {
             copy_ns: stages.copy_ns,
             token_ns: stages.token_ns,
             seg_ns: stages.seg_ns,
+            direct: stages.direct != 0,
         })
     }
 
@@ -221,6 +247,7 @@ impl<K> ReadSource<K> {
         // and retains the wrapper/token on token-release failure.
         status_result(unsafe { sys::dfurma_read_source_release_after_revoke(raw.as_ptr()) })?;
         self.raw = None;
+        drop(self.memory.take());
         Ok(self
             .keepalive
             .take()
@@ -235,6 +262,9 @@ impl<K> Drop for ReadSource<K> {
         // and retains its aligned registered memory until explicit release.
         if let Some(keepalive) = self.keepalive.take() {
             std::mem::forget(keepalive);
+        }
+        if let Some(memory) = self.memory.take() {
+            std::mem::forget(memory);
         }
     }
 }
@@ -259,6 +289,7 @@ mod tests {
         let source = ReadSource {
             // No native resource exists in this test; Drop must not call FFI.
             raw: Some(NonNull::dangling()),
+            memory: None,
             keepalive: Some(guard),
             _not_send_sync: PhantomData,
         };
