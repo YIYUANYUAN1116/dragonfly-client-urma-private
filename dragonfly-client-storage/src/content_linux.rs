@@ -29,6 +29,8 @@ use std::cmp::max;
 use std::io::{self, IoSlice};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "urma")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "urma")]
 use std::time::Instant;
@@ -38,6 +40,36 @@ use tokio::io::AsyncRead;
 use tracing::debug;
 use tracing::{error, info, instrument, warn};
 use walkdir::WalkDir;
+
+#[cfg(feature = "urma")]
+static RM_READ_PWRITE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "urma")]
+struct RmReadPwriteActivity {
+    active: bool,
+}
+
+#[cfg(feature = "urma")]
+impl RmReadPwriteActivity {
+    fn start() -> (Self, usize) {
+        let active = RM_READ_PWRITE_ACTIVE.fetch_add(1, Ordering::AcqRel) + 1;
+        (Self { active: true }, active)
+    }
+
+    fn finish(mut self) -> usize {
+        self.active = false;
+        RM_READ_PWRITE_ACTIVE.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+}
+
+#[cfg(feature = "urma")]
+impl Drop for RmReadPwriteActivity {
+    fn drop(&mut self) {
+        if self.active {
+            RM_READ_PWRITE_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Writes every registered RX span at one positional file offset. Linux may
 /// complete a pwritev only partially, including in the middle of an iovec, so
@@ -652,12 +684,28 @@ impl Content {
         let (data_addr, data_len) = (data.as_ptr() as usize, data.len());
         let write = {
             let file = file.clone();
+            let task_id = task_id.to_string();
+            let piece_id = piece_id.to_string();
             tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
+                let (activity, pwrite_active) = RmReadPwriteActivity::start();
                 let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
                 let mut buffers = [IoSlice::new(data)];
-                write_all_vectored_at(&file, &mut buffers, offset)?;
-                Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, 1))
+                let start = Instant::now();
+                let result = write_all_vectored_at(&file, &mut buffers, offset);
+                let pwrite_ns = start.elapsed().as_nanos() as u64;
+                let pwrite_active_after = activity.finish();
+                debug!(
+                    task_id,
+                    piece_id,
+                    expected_length = data_len,
+                    pwrite_ns,
+                    pwrite_active_at_start = pwrite_active,
+                    pwrite_active_after,
+                    pwrite_succeeded = result.is_ok(),
+                    "finished pwrite for RM-READ lease"
+                );
+                result?;
+                Ok::<(u64, u64), std::io::Error>((pwrite_ns, 1))
             })
         };
         let digest = tokio::task::spawn_blocking(move || {

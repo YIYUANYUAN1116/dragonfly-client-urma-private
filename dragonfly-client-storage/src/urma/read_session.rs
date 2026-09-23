@@ -28,6 +28,7 @@ use super::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{sleep, timeout, Duration, Instant};
+use tracing::debug;
 
 static NEXT_SEGMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -343,6 +344,15 @@ impl ChildTransportSession {
             Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
         timing.read_completion_ns = stage_start.elapsed().as_nanos() as u64;
+        debug!(
+            task_id = %self.request.task_id,
+            piece_number = self.request.piece_number,
+            transfer_id = self.identity.transfer_id,
+            completed_bytes = result.completed_bytes,
+            read_wr_count = result.read_wr_count,
+            read_completion_ns = timing.read_completion_ns,
+            "urma READ child completed data transfer"
+        );
         // Lease flow stage 1: stop posting and close the import while keeping
         // the registered destination buffer and the full budget charge.
         let stage_start = Instant::now();
