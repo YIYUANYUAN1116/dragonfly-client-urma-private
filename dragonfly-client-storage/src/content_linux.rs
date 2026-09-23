@@ -557,6 +557,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_read_lease_to_path(
             piece_id,
+            task_id,
             self.get_task_path(task_id),
             offset,
             expected_length,
@@ -578,6 +579,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_read_lease_to_path(
             piece_id,
+            task_id,
             self.get_persistent_task_path(task_id),
             offset,
             expected_length,
@@ -599,6 +601,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_read_lease_to_path(
             piece_id,
+            task_id,
             self.get_persistent_cache_task_path(task_id),
             offset,
             expected_length,
@@ -614,6 +617,7 @@ impl Content {
     async fn write_read_lease_to_path(
         &self,
         piece_id: &str,
+        task_id: &str,
         task_path: PathBuf,
         offset: u64,
         expected_length: u64,
@@ -629,23 +633,24 @@ impl Content {
             )));
         }
 
+        let file_open_start = Instant::now();
         let file = self
             .fd_cache
             .open_write(&task_path)
             .await
             .inspect_err(|error| error!("open {:?} failed: {}", task_path, error))?;
+        let file_open_ns = file_open_start.elapsed().as_nanos() as u64;
 
-        // Digest and positional write share the immutable lease span on one
-        // blocking worker. The span points into pinned registered memory and
-        // the caller keeps the lease alive across the join, so the closure
-        // reconstructs the slice from its fixed address without extending
-        // ownership of it.
+        // Positional write and CRC32 read the same immutable lease on separate
+        // blocking workers. The caller keeps the lease alive until both join,
+        // so each closure can reconstruct the slice from its fixed address
+        // without extending ownership of it.
         // Store the address as an integer because raw pointers are not Send.
         // The lease remains in this future until the blocking worker joins. If
         // this future is cancelled, dropping the armed lease deliberately keeps
         // the owner registered, so the worker cannot observe freed memory.
         let (data_addr, data_len) = (data.as_ptr() as usize, data.len());
-        let (write_ns, pwrite_calls) = {
+        let write = {
             let file = file.clone();
             tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
@@ -654,20 +659,27 @@ impl Content {
                 write_all_vectored_at(&file, &mut buffers, offset)?;
                 Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, 1))
             })
-            .await
-            .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
-            .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?
         };
-
-        let digest_start = Instant::now();
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(data);
-        let digest_ns = digest_start.elapsed().as_nanos() as u64;
+        let digest = tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(data);
+            (hasher, start.elapsed().as_nanos() as u64)
+        });
+        let (write, digest) = tokio::join!(write, digest);
+        let (pwrite_ns, pwrite_calls) = write
+            .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
+            .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
+        let (hasher, digest_ns) = digest
+            .map_err(|error| Error::Unknown(format!("digest READ lease panicked: {error}")))?;
 
         debug!(
+            task_id,
             piece_id,
-            length,
-            write_ns,
+            expected_length = length,
+            file_open_ns,
+            pwrite_ns,
             pwrite_calls,
             digest_ns,
             storage_total_ns = storage_total_start.elapsed().as_nanos() as u64,

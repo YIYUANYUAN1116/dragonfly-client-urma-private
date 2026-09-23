@@ -115,6 +115,19 @@ pub(crate) struct ChildTransportSuccess {
     pub(crate) piece_offset: u64,
     pub(crate) digest: String,
     pub(crate) lease: PublishedChildLease,
+    pub(crate) timing: ChildTransportTiming,
+}
+
+/// Child-side successful-path timing. These stages are observational and do
+/// not participate in protocol or owner-lifetime decisions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChildTransportTiming {
+    pub(crate) buffer_ready_send_ns: u64,
+    pub(crate) segment_offer_wait_ns: u64,
+    pub(crate) destination_admission_ns: u64,
+    pub(crate) read_completion_ns: u64,
+    pub(crate) lease_publish_ns: u64,
+    pub(crate) done_round_trip_ns: u64,
 }
 
 /// Failure outcome of the Child transport adapter. `retained_child` is set
@@ -229,7 +242,7 @@ impl ChildTransportSession {
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership.
         match self.run_inner().await {
-            Ok((result, segment_generation, piece_offset, digest, lease)) => {
+            Ok((result, segment_generation, piece_offset, digest, lease, timing)) => {
                 self.control
                     .finish(Some(segment_generation))
                     .map_err(|error| ChildTransportFailure {
@@ -242,6 +255,7 @@ impl ChildTransportSession {
                     piece_offset,
                     digest,
                     lease,
+                    timing,
                 })
             }
             Err((error, child_id)) => Err(self.cancel_after_failure(child_id, error).await),
@@ -257,9 +271,18 @@ impl ChildTransportSession {
     async fn run_inner(
         &mut self,
     ) -> std::result::Result<
-        (ReadTransportResult, u64, u64, String, PublishedChildLease),
+        (
+            ReadTransportResult,
+            u64,
+            u64,
+            String,
+            PublishedChildLease,
+            ChildTransportTiming,
+        ),
         (Error, Option<RetainedChildOwner>),
     > {
+        let mut timing = ChildTransportTiming::default();
+        let stage_start = Instant::now();
         self.control
             .send(ReadFrame::BufferReady {
                 identity: self.identity,
@@ -268,11 +291,14 @@ impl ChildTransportSession {
             })
             .await
             .map_err(|error| (error, None))?;
+        timing.buffer_ready_send_ns = stage_start.elapsed().as_nanos() as u64;
+        let stage_start = Instant::now();
         let frame = self
             .control
             .receive()
             .await
             .map_err(|error| (error, None))?;
+        timing.segment_offer_wait_ns = stage_start.elapsed().as_nanos() as u64;
         if self.state.on_frame(&frame).map_err(|error| (error, None))? != ChildAction::StartRead {
             return Err((
                 protocol("Child did not receive a usable SegmentOffer"),
@@ -288,6 +314,7 @@ impl ChildTransportSession {
         let (descriptor, token) = native_descriptor(&offer);
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership; the state machine validated Offer.
+        let stage_start = Instant::now();
         let admission = unsafe {
             self.fabric
                 .create_read_child(ReadChildRequest {
@@ -300,6 +327,7 @@ impl ChildTransportSession {
                 })
                 .await
         };
+        timing.destination_admission_ns = stage_start.elapsed().as_nanos() as u64;
         let child_id = match admission {
             Ok(ReadChildAdmission::Ready(id)) => id,
             Ok(ReadChildAdmission::Quarantined { id, error }) => {
@@ -307,12 +335,15 @@ impl ChildTransportSession {
             }
             Err(error) => return Err((error, None)),
         };
+        let stage_start = Instant::now();
         let result = match self.drive_reads(child_id, max_read_size).await {
             Ok(result) => result,
             Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
+        timing.read_completion_ns = stage_start.elapsed().as_nanos() as u64;
         // Lease flow stage 1: stop posting and close the import while keeping
         // the registered destination buffer and the full budget charge.
+        let stage_start = Instant::now();
         if let Err(error) = self.fabric.drain_read_child_for_lease(child_id).await {
             return Err((error, Some(RetainedChildOwner::Cleanup(child_id))));
         }
@@ -322,6 +353,7 @@ impl ChildTransportSession {
             Ok(span) => span,
             Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
+        timing.lease_publish_ns = stage_start.elapsed().as_nanos() as u64;
         // From here the destination lease is published; later failures keep
         // the owner retained (the content is final) and only abandon the
         // control exchange.
@@ -337,6 +369,7 @@ impl ChildTransportSession {
                 ))
             }
         };
+        let stage_start = Instant::now();
         if let Err(error) = self
             .control
             .send(ReadFrame::ReadDone {
@@ -364,12 +397,14 @@ impl ChildTransportSession {
                 Some(RetainedChildOwner::PublishedLease(child_id)),
             ));
         }
+        timing.done_round_trip_ns = stage_start.elapsed().as_nanos() as u64;
         Ok((
             result,
             action,
             piece_offset,
             digest,
             PublishedChildLease { child_id, span },
+            timing,
         ))
     }
 

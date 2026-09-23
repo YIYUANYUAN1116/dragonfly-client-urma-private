@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
-use tracing::{debug, error, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 /// The minimum piece length.
 pub use dragonfly_client_config::MIN_PIECE_LENGTH;
@@ -573,11 +573,22 @@ impl Piece {
                 UrmaPieceKind::PersistentPiece => PieceKind::PersistentPiece,
                 UrmaPieceKind::PersistentCachePiece => PieceKind::PersistentCachePiece,
             };
+            info!(
+                task_id,
+                piece_id,
+                piece_kind = ?kind,
+                piece_number = number,
+                length,
+                "starting dragonfly urma READ piece attempt"
+            );
+            let read_download_start = Instant::now();
             match downloader
                 .download_piece_lease(tcp_addr, read_kind, number, task_id, length)
                 .await
             {
                 Ok((lease, piece_offset, digest)) => {
+                    let read_download_ns = read_download_start.elapsed().as_nanos() as u64;
+                    let read_finish_start = Instant::now();
                     let finished = self
                         .storage
                         .download_piece_from_parent_finished_urma_read_lease(
@@ -591,11 +602,15 @@ impl Piece {
                             lease,
                         )
                         .await;
+                    let read_finish_ns = read_finish_start.elapsed().as_nanos() as u64;
                     debug!(
+                        task_id,
                         piece_id,
                         piece_kind = ?kind,
                         length,
                         success = finished.is_ok(),
+                        read_download_ns,
+                        read_finish_ns,
                         child_piece_e2e_ns =
                             child_piece_e2e_start.elapsed().as_nanos() as u64,
                         "finished dragonfly urma READ piece attempt"

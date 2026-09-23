@@ -40,7 +40,7 @@ use socket2::SockRef;
 use socket2::TcpKeepalive;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{debug, instrument, warn};
 
@@ -224,8 +224,13 @@ impl UrmaReadClient {
         task_id: &str,
         piece_length: u64,
     ) -> ClientResult<(UrmaReadPieceLease, u64, String)> {
+        let transfer_total_start = Instant::now();
+        let retained_cleanup_start = Instant::now();
         self.retry_retained_children().await;
+        let retained_cleanup_ns = retained_cleanup_start.elapsed().as_nanos() as u64;
+        let lane_acquire_start = Instant::now();
         let (lane, reused_session) = self.lane().await?;
+        let lane_acquire_ns = lane_acquire_start.elapsed().as_nanos() as u64;
         let transfer_id = self
             .next_transfer_id
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -282,6 +287,7 @@ impl UrmaReadClient {
             self.transfer_timeout,
         )
         .map_err(|error| ClientError::Unknown(error.to_string()))?;
+        let session_run_start = Instant::now();
         let success = match unsafe { session.run_transport_only().await } {
             Ok(success) => success,
             Err(ChildTransportFailure {
@@ -295,6 +301,7 @@ impl UrmaReadClient {
                 return Err(ClientError::Unknown(error.to_string()));
             }
         };
+        let session_run_ns = session_run_start.elapsed().as_nanos() as u64;
         let lease = UrmaReadPieceLease {
             fabric: self.fabric.clone(),
             child_id: success.lease.child_id,
@@ -307,6 +314,20 @@ impl UrmaReadClient {
             read_wr_count = success.read_wr_count,
             piece_offset = success.piece_offset,
             digest = %success.digest,
+            task_id,
+            piece_number = number,
+            transfer_id,
+            reused_session,
+            retained_cleanup_ns,
+            lane_acquire_ns,
+            buffer_ready_send_ns = success.timing.buffer_ready_send_ns,
+            segment_offer_wait_ns = success.timing.segment_offer_wait_ns,
+            destination_admission_ns = success.timing.destination_admission_ns,
+            read_completion_ns = success.timing.read_completion_ns,
+            lease_publish_ns = success.timing.lease_publish_ns,
+            done_round_trip_ns = success.timing.done_round_trip_ns,
+            session_run_ns,
+            read_transfer_total_ns = transfer_total_start.elapsed().as_nanos() as u64,
             "urma READ child finished transfer"
         );
         Ok((lease, success.piece_offset, success.digest))

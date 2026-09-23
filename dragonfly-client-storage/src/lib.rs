@@ -1177,6 +1177,7 @@ impl Storage {
         self.piece_notifier.remove_and_notify(piece_id);
         let metadata_commit_notify_ns = commit_start.elapsed().as_nanos() as u64;
         debug!(
+            task_id,
             piece_id,
             piece_kind = "read",
             storage_write_ns,
