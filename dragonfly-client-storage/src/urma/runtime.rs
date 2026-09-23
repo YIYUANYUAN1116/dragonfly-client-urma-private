@@ -910,14 +910,18 @@ mod native {
             }
         }
 
-        pub(crate) fn post_read_child(&mut self, id: ReadChildId, length: u32) -> Result<u64> {
+        pub(crate) fn post_read_child_batch(
+            &mut self,
+            id: ReadChildId,
+            lengths: &[u32],
+        ) -> Result<usize> {
             match &mut self.read {
                 RuntimeReadState::Disabled => Err(Error::InvalidConfiguration(
                     "READ-only runtime is not enabled".into(),
                 )),
-                RuntimeReadState::Active { owners, .. } => {
-                    owners.post(id.0, length).map_err(read_dispatch_error)
-                }
+                RuntimeReadState::Active { owners, .. } => owners
+                    .post_batch(id.0, lengths)
+                    .map_err(read_dispatch_error),
             }
         }
 

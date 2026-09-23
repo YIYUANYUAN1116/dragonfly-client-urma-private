@@ -95,6 +95,7 @@ fn wire_offer(
 pub(crate) struct ReadTransportResult {
     pub(crate) completed_bytes: u64,
     pub(crate) read_wr_count: u64,
+    pub(crate) read_post_batch_count: u64,
 }
 
 /// A published destination lease awaiting Storage consumption. The CPU span is
@@ -113,6 +114,7 @@ pub(crate) struct PublishedChildLease {
 pub(crate) struct ChildTransportSuccess {
     pub(crate) completed_bytes: u64,
     pub(crate) read_wr_count: u64,
+    pub(crate) read_post_batch_count: u64,
     pub(crate) piece_offset: u64,
     pub(crate) digest: String,
     pub(crate) lease: PublishedChildLease,
@@ -255,6 +257,7 @@ impl ChildTransportSession {
                 Ok(ChildTransportSuccess {
                     completed_bytes: result.completed_bytes,
                     read_wr_count: result.read_wr_count,
+                    read_post_batch_count: result.read_post_batch_count,
                     piece_offset,
                     digest,
                     lease,
@@ -350,6 +353,7 @@ impl ChildTransportSession {
             transfer_id = self.identity.transfer_id,
             completed_bytes = result.completed_bytes,
             read_wr_count = result.read_wr_count,
+            read_post_batch_count = result.read_post_batch_count,
             read_completion_ns = timing.read_completion_ns,
             "urma READ child completed data transfer"
         );
@@ -524,6 +528,7 @@ impl ChildTransportSession {
         max_read_size: u32,
     ) -> Result<ReadTransportResult> {
         let deadline = Instant::now() + self.completion_timeout;
+        let mut read_post_batch_count = 0u64;
         loop {
             if Instant::now() >= deadline {
                 return Err(protocol("Child READ completion deadline expired"));
@@ -537,19 +542,30 @@ impl ChildTransportSession {
                 return Ok(ReadTransportResult {
                     completed_bytes: progress.retired_bytes,
                     read_wr_count: progress.retired_wr_count,
+                    read_post_batch_count,
                 });
             }
             let available = self
                 .max_outstanding
                 .saturating_sub(progress.outstanding_wr_count);
             let mut remaining = self.piece_length - progress.accepted_bytes;
+            let remaining_wr_count = remaining.div_ceil(u64::from(max_read_size));
+            let mut lengths = Vec::with_capacity(
+                available.min(usize::try_from(remaining_wr_count).unwrap_or(usize::MAX)),
+            );
             for _ in 0..available {
                 if remaining == 0 {
                     break;
                 }
                 let length = remaining.min(u64::from(max_read_size)) as u32;
-                self.fabric.post_read_child(child_id, length).await?;
+                lengths.push(length);
                 remaining -= u64::from(length);
+            }
+            if !lengths.is_empty() {
+                let batch_length = lengths.len();
+                let posted = self.fabric.post_read_child_batch(child_id, lengths).await?;
+                debug_assert_eq!(posted, batch_length);
+                read_post_batch_count = read_post_batch_count.saturating_add(1);
             }
             sleep(self.poll_interval).await;
         }

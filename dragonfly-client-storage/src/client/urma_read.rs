@@ -312,6 +312,7 @@ impl UrmaReadClient {
             parent_addr = self.addr,
             completed_bytes = success.completed_bytes,
             read_wr_count = success.read_wr_count,
+            read_post_batch_count = success.read_post_batch_count,
             piece_offset = success.piece_offset,
             digest = %success.digest,
             task_id,

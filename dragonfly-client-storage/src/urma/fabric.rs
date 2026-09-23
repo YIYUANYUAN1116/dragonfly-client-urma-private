@@ -566,8 +566,12 @@ impl UrmaFabricHandle {
     }
 
     #[allow(dead_code)] // Used by the gated READ session state machine.
-    pub(crate) async fn post_read_child(&self, id: ReadChildId, length: u32) -> Result<u64> {
-        self.submit(|reply| FabricCommand::PostReadChild { id, length, reply })
+    pub(crate) async fn post_read_child_batch(
+        &self,
+        id: ReadChildId,
+        lengths: Vec<u32>,
+    ) -> Result<usize> {
+        self.submit(|reply| FabricCommand::PostReadChildBatch { id, lengths, reply })
             .await
     }
 
@@ -1027,10 +1031,10 @@ enum FabricCommand {
         reply: oneshot::Sender<Result<ReadChildAdmission>>,
     },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
-    PostReadChild {
+    PostReadChildBatch {
         id: ReadChildId,
-        length: u32,
-        reply: oneshot::Sender<Result<u64>>,
+        lengths: Vec<u32>,
+        reply: oneshot::Sender<Result<usize>>,
     },
     #[allow(dead_code)] // Gated until the READ session adapter is connected.
     ReadChildProgress {
@@ -1287,9 +1291,9 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
-        FabricCommand::PostReadChild { id, length, reply } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.post_read_child(id, length));
+        FabricCommand::PostReadChildBatch { id, lengths, reply } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.post_read_child_batch(id, &lengths));
             let _ = reply.send(result);
             OwnerControl::Continue
         }

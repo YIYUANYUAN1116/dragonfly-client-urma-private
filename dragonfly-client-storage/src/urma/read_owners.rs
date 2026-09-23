@@ -269,6 +269,25 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         Ok(context.expect("successful READ post has a context"))
     }
 
+    /// Posts one scheduling batch without returning to the async facade between
+    /// WRs. If a later post fails, earlier contexts remain routed and the owner
+    /// is quarantined by post(); the existing cleanup path drains them.
+    pub(crate) fn post_batch(
+        &mut self,
+        id: ReadOwnerId,
+        lengths: &[u32],
+    ) -> Result<usize, ReadDispatchError> {
+        if lengths.is_empty() {
+            return Err(FfiError::Contract("empty READ post batch").into());
+        }
+        let mut posted = 0usize;
+        for &length in lengths {
+            self.post(id, length)?;
+            posted += 1;
+        }
+        Ok(posted)
+    }
+
     pub(crate) fn outstanding_completions(&self) -> usize {
         self.routes.len()
     }
@@ -612,6 +631,34 @@ mod tests {
         assert_eq!(owners.reap_child(id), Ok(true));
         assert_eq!(closes.get(), 2);
     }
+    #[test]
+    fn batch_post_routes_every_wr_without_intermediate_progress() {
+        let mut owners = setup();
+        let id = create(&mut owners, Rc::new(Cell::new(0)));
+
+        let posted = owners.post_batch(id, &[2, 2]).unwrap();
+
+        assert_eq!(posted, 2);
+        let progress = owners.child_progress(id).unwrap();
+        assert_eq!(progress.accepted_bytes, 4);
+        assert_eq!(progress.accepted_wr_count, 2);
+        assert_eq!(progress.outstanding_wr_count, 2);
+        assert_eq!(owners.outstanding_completions(), 2);
+    }
+
+    #[test]
+    fn empty_batch_post_is_rejected_without_changing_child() {
+        let mut owners = setup();
+        let id = create(&mut owners, Rc::new(Cell::new(0)));
+
+        assert!(owners.post_batch(id, &[]).is_err());
+
+        let progress = owners.child_progress(id).unwrap();
+        assert_eq!(progress.accepted_bytes, 0);
+        assert_eq!(progress.accepted_wr_count, 0);
+        assert!(!progress.failed);
+    }
+
     #[test]
     fn read_cqe_wrong_queue_or_jetty_keeps_wr_routed_and_quarantines_owner() {
         let mut owners = setup();
