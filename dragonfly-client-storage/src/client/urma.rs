@@ -734,6 +734,7 @@ impl UrmaClient {
                 let mut rx_window_wait_ns = 0u64;
                 let mut window_publish_wait_ns = 0u64;
                 let mut done_wait_ns = 0u64;
+                let receive_envelope_start = Instant::now();
                 loop {
                     let rx_window_wait_start = Instant::now();
                     let window = transfer
@@ -767,6 +768,9 @@ impl UrmaClient {
                         )));
                     }
                     if transfer.piece_complete() {
+                        let receive_completion_ns =
+                            receive_envelope_start.elapsed().as_nanos() as u64;
+                        let receive_completion_to_event_start = Instant::now();
                         // Storage stops polling after it receives the expected
                         // byte count. Hold the final bytes until Done has been
                         // validated so a terminal protocol failure cannot be
@@ -786,6 +790,9 @@ impl UrmaClient {
                             session_queue_wait_ns,
                             request_ready_ns,
                             rx_window_wait_ns,
+                            receive_completion_ns,
+                            receive_completion_to_event_ns =
+                                receive_completion_to_event_start.elapsed().as_nanos() as u64,
                             done_wait_ns,
                             window_publish_wait_ns,
                             client_piece_total_ns = client_piece_total_start.elapsed().as_nanos() as u64,
