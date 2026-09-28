@@ -1,6 +1,6 @@
 use super::{
     buffer::{
-        BufferPoolConfig, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
+        BufferPoolConfig, LeaseKind, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease,
         TxWindowLease,
     },
     Error, Result,
@@ -391,7 +391,10 @@ mod native {
             self.completions.outstanding()
         }
 
-        pub(crate) fn recycle_dropped_lease(&mut self, recycle: LeaseRecycle) -> Result<usize> {
+        pub(crate) fn recycle_dropped_lease(
+            &mut self,
+            recycle: LeaseRecycle,
+        ) -> Result<(usize, LeaseKind)> {
             self.buffer_pool
                 .as_mut()
                 .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?

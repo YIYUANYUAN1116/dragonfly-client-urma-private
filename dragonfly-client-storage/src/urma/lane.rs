@@ -307,51 +307,13 @@ impl UrmaJetty {
         (self.local_jetty_id, self.local_jfr_id)
     }
 
-    fn post_send_imm(
-        &mut self,
-        segment: &ffi::SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-        imm_data: u64,
-    ) -> Result<ffi::WrHandle> {
-        self.handle
-            .post_send_imm(segment, offset, length, user_ctx, imm_data)
-            .map_err(|error| native_error("post_jetty_send_imm_wr", error))
-    }
-
-    fn post_recv(
-        &mut self,
-        segment: &ffi::SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-    ) -> Result<ffi::WrHandle> {
-        self.handle
-            .post_recv(segment, offset, length, user_ctx)
-            .map_err(|error| native_error("post_jetty_recv_wr", error))
-    }
-
     fn post_send_batch(
         &mut self,
         segment: &ffi::SegmentHandle,
         entries: &[ffi::PostEntry],
     ) -> Result<ffi::PostBatch> {
-        if let [entry] = entries {
-            let imm_data = entry.imm_data.ok_or_else(|| {
-                Error::InvalidConfiguration("registered TX entry lacks SEND_IMM identity".into())
-            })?;
-            return Ok(ffi::PostBatch {
-                handles: vec![self.post_send_imm(
-                    segment,
-                    entry.offset,
-                    entry.length,
-                    entry.user_ctx,
-                    imm_data,
-                )?],
-                error: None,
-            });
-        }
+        // Use one list path for every configured post-list size. This keeps the
+        // common post1 path allocation-free without changing RC CQ semantics.
         self.handle
             .post_send_imm_list(segment, entries)
             .map_err(|error| native_error("post_jetty_send_imm_wr_list", error))
@@ -362,17 +324,6 @@ impl UrmaJetty {
         segment: &ffi::SegmentHandle,
         entries: &[ffi::PostEntry],
     ) -> Result<ffi::PostBatch> {
-        if let [entry] = entries {
-            return Ok(ffi::PostBatch {
-                handles: vec![self.post_recv(
-                    segment,
-                    entry.offset,
-                    entry.length,
-                    entry.user_ctx,
-                )?],
-                error: None,
-            });
-        }
         self.handle
             .post_recv_list(segment, entries)
             .map_err(|error| native_error("post_jetty_recv_wr_list", error))
@@ -539,15 +490,18 @@ impl UrmaLane {
         let mut pending: Vec<_> = slots
             .into_iter()
             .zip(sequences)
-            .zip(completion_txs)
+            .zip(completion_txs.into_iter().map(Some))
             .map(|((slot, sequence), completion)| (slot, sequence, completion))
             .collect();
-        while !pending.is_empty() {
-            let batch_len = self.post_list_size.min(pending.len());
-            let batch: Vec<_> = pending.drain(..batch_len).collect();
-            let mut entries = Vec::with_capacity(batch_len);
+        let mut entries = Vec::with_capacity(self.post_list_size.min(pending.len()));
+        let mut batch_start = 0usize;
+        while batch_start < pending.len() {
+            let batch_end = batch_start
+                .saturating_add(self.post_list_size)
+                .min(pending.len());
+            entries.clear();
             let prepare = (|| {
-                for (slot, _, _) in &batch {
+                for (slot, _, _) in &pending[batch_start..batch_end] {
                     let (offset, length) = pool.recv_post_layout(*slot)?;
                     let user_ctx = self.token(OperationType::Recv, *slot).encode()?;
                     pool.mark_posted(*slot, SlotKind::Rx)?;
@@ -561,61 +515,66 @@ impl UrmaLane {
                 Ok(())
             })();
             if let Err(error) = prepare {
-                for (slot, _, _) in batch.iter().take(entries.len()) {
+                for (slot, _, _) in pending[batch_start..batch_end].iter().take(entries.len()) {
                     pool.rollback_post(*slot, SlotKind::Rx)?;
                 }
                 pool.release_unposted_rx_window(
-                    batch
-                        .into_iter()
-                        .map(|(slot, _, _)| slot)
-                        .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                    pending[batch_start..]
+                        .iter()
+                        .map(|(slot, _, _)| *slot)
                         .collect(),
                 )?;
                 return Err(error);
             }
-            let posted = match self.jetty.post_recv_batch(pool.segment_handle()?, &entries) {
+            let mut posted = match self.jetty.post_recv_batch(pool.segment_handle()?, &entries) {
                 Ok(posted) => posted,
                 Err(error) => {
-                    for (slot, _, _) in &batch {
+                    for (slot, _, _) in &pending[batch_start..batch_end] {
                         pool.rollback_post(*slot, SlotKind::Rx)?;
                     }
                     pool.release_unposted_rx_window(
-                        batch
-                            .into_iter()
-                            .map(|(slot, _, _)| slot)
-                            .chain(pending.into_iter().map(|(slot, _, _)| slot))
+                        pending[batch_start..]
+                            .iter()
+                            .map(|(slot, _, _)| *slot)
                             .collect(),
                     )?;
                     return Err(error);
                 }
             };
-            let posted_len = posted.handles.len();
-            let mut handles = posted.handles.into_iter();
+            let posted_len = posted.len();
             let mut first_error = posted
                 .error
+                .take()
                 .map(|error| native_error("post_jetty_recv_wr_list", error));
-            for (index, (slot, sequence, completion)) in batch.into_iter().enumerate() {
+            for index in 0..(batch_end - batch_start) {
+                let (slot, sequence, completion) = &mut pending[batch_start + index];
                 if index < posted_len {
-                    let wr = handles.next().expect("posted prefix handle count matches");
+                    let completion = completion
+                        .take()
+                        .expect("RX completion sender is consumed once");
                     if let Err(error) = completions.track_registered_rx(
                         entries[index].user_ctx,
-                        wr,
-                        Some(sequence),
+                        posted.take(index),
+                        Some(*sequence),
                         completion,
                     ) {
                         first_error.get_or_insert(error);
                     }
                 } else {
-                    pool.rollback_post(slot, SlotKind::Rx)?;
-                    pool.release(slot)?;
+                    pool.rollback_post(*slot, SlotKind::Rx)?;
+                    pool.release(*slot)?;
                 }
             }
             if let Some(error) = first_error {
                 pool.release_unposted_rx_window(
-                    pending.into_iter().map(|(slot, _, _)| slot).collect(),
+                    pending[batch_end..]
+                        .iter()
+                        .map(|(slot, _, _)| *slot)
+                        .collect(),
                 )?;
                 return Err(error);
             }
+            batch_start = batch_end;
         }
         Ok(())
     }
@@ -638,13 +597,17 @@ impl UrmaLane {
         let layouts = pool.tx_lease_layouts(&lease)?;
         let state = RegisteredTxWindowState::new(self.id, sequences.clone(), lease, completion);
 
-        let mut pending: Vec<_> = layouts.into_iter().zip(sequences).collect();
-        while !pending.is_empty() {
-            let batch_len = self.post_list_size.min(pending.len());
-            let batch: Vec<_> = pending.drain(..batch_len).collect();
-            let mut entries = Vec::with_capacity(batch_len);
+        let pending: Vec<_> = layouts.into_iter().zip(sequences).collect();
+        let mut entries = Vec::with_capacity(self.post_list_size.min(pending.len()));
+        let mut batch_start = 0usize;
+        while batch_start < pending.len() {
+            let batch_end = batch_start
+                .saturating_add(self.post_list_size)
+                .min(pending.len());
+            let batch = &pending[batch_start..batch_end];
+            entries.clear();
             let prepare: Result<()> = (|| {
-                for ((slot, offset, length), sequence) in &batch {
+                for ((slot, offset, length), sequence) in batch {
                     let user_ctx = self.token(OperationType::Send, *slot).encode()?;
                     pool.mark_tx_lease_posted(*slot)?;
                     entries.push(ffi::PostEntry {
@@ -663,41 +626,41 @@ impl UrmaLane {
                 state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
-            let posted = match self.jetty.post_send_batch(pool.segment_handle()?, &entries) {
+            let mut posted = match self.jetty.post_send_batch(pool.segment_handle()?, &entries) {
                 Ok(posted) => posted,
                 Err(error) => {
-                    for ((slot, _, _), _) in &batch {
+                    for ((slot, _, _), _) in batch {
                         pool.rollback_tx_lease_post(*slot)?;
                     }
                     state.finish_posting(Some(error.clone()));
                     return Err(error);
                 }
             };
-            let posted_len = posted.handles.len();
+            let posted_len = posted.len();
             self.credits.consume_remote_receives(posted_len);
-            let mut handles = posted.handles.into_iter();
             let mut first_error = posted
                 .error
+                .take()
                 .map(|error| native_error("post_jetty_send_wr_list", error));
-            for (index, ((slot, _, _), sequence)) in batch.into_iter().enumerate() {
+            for (index, ((slot, _, _), sequence)) in batch.iter().enumerate() {
                 if index < posted_len {
-                    let wr = handles.next().expect("posted prefix handle count matches");
                     if let Err(error) = completions.track_registered_tx(
                         entries[index].user_ctx,
-                        wr,
-                        sequence,
+                        posted.take(index),
+                        *sequence,
                         state.clone(),
                     ) {
                         first_error.get_or_insert(error);
                     }
                 } else {
-                    pool.rollback_tx_lease_post(slot)?;
+                    pool.rollback_tx_lease_post(*slot)?;
                 }
             }
             if let Some(error) = first_error {
                 state.finish_posting(Some(error.clone()));
                 return Err(error);
             }
+            batch_start = batch_end;
         }
         state.finish_posting(None);
         Ok(())

@@ -7,7 +7,9 @@
 //! UMDK handle.
 
 use super::{
-    buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
+    buffer::{
+        LeaseKind, LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease,
+    },
     completion::{
         RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
         RegisteredTxCompletionTx,
@@ -20,11 +22,14 @@ use std::thread::{self, JoinHandle};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc as std_mpsc, Arc, Mutex, OnceLock, Weak,
+        mpsc::{self as std_mpsc, RecvTimeoutError},
+        Arc, Mutex, OnceLock, Weak,
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, TryAcquireError,
+};
 
 /// Default number of commands that may wait for the owner thread.
 const DEFAULT_COMMAND_CAPACITY: usize = 16;
@@ -35,6 +40,10 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 /// Pure polling is required because Phase A deliberately has no JFCE. Keep the
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
+
+/// Native discovery should normally finish immediately. Bound the synchronous
+/// hand-off so a wedged provider cannot pin startup forever.
+const FABRIC_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 struct RequiredRxWaiters(Arc<AtomicUsize>);
@@ -203,9 +212,11 @@ impl UrmaFabric {
         let command_slots = Arc::new(Semaphore::new(command_capacity));
         let (readiness_tx, readiness_rx) = watch::channel(FabricReadiness::Starting);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
+        let tx_slot_admission = Arc::new(Semaphore::new(config.buffer_pool.tx_slot_count));
 
         let runtime_config = config.clone();
         let recycle_command_tx = command_tx.clone();
+        let owner_tx_slot_admission = Arc::clone(&tx_slot_admission);
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
             .spawn(move || {
@@ -213,6 +224,7 @@ impl UrmaFabric {
                     config,
                     command_rx,
                     recycle_command_tx,
+                    owner_tx_slot_admission,
                     readiness_tx,
                     startup_tx,
                 )
@@ -221,7 +233,7 @@ impl UrmaFabric {
                 Error::InvalidConfiguration(format!("failed to spawn URMA owner thread: {error}"))
             })?;
 
-        match startup_rx.recv() {
+        match startup_rx.recv_timeout(FABRIC_STARTUP_TIMEOUT) {
             Ok(Ok((transport_type, max_message_size, max_jfr_depth, max_jfs_depth))) => {
                 Ok(UrmaFabricHandle {
                     inner: Arc::new(FabricInner {
@@ -234,6 +246,7 @@ impl UrmaFabric {
                         max_jfr_depth,
                         max_jfs_depth,
                         required_rx_waiters: RequiredRxWaiters::default(),
+                        tx_slot_admission,
                         shutdown: AsyncMutex::new(()),
                         join: Mutex::new(Some(join)),
                     }),
@@ -243,10 +256,18 @@ impl UrmaFabric {
                 let _ = join.join();
                 Err(error)
             }
-            Err(error) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = join.join();
+                Err(Error::InvalidConfiguration(
+                    "URMA owner thread exited during startup".into(),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Detach the owner. If native startup later returns, the
+                // disconnected reply makes it shut itself down and roll back.
+                drop(join);
                 Err(Error::InvalidConfiguration(format!(
-                    "URMA owner thread exited during startup: {error}"
+                    "URMA owner thread startup exceeded {FABRIC_STARTUP_TIMEOUT:?}"
                 )))
             }
         }
@@ -473,19 +494,60 @@ impl UrmaFabricHandle {
 
     #[allow(dead_code)] // B1 ownership API, consumed by B4.
     pub(crate) async fn acquire_tx_window(&self, length: usize) -> Result<TxWindowLease> {
-        self.submit(|reply| FabricCommand::AcquireTxWindow { length, reply })
-            .await
+        let permit = self.acquire_tx_slot_permit(1).await?;
+        self.submit(|reply| FabricCommand::AcquireTxWindow {
+            length,
+            tx_slots: permit,
+            reply,
+        })
+        .await
     }
 
     pub(crate) async fn acquire_tx_window_chunks(
         &self,
         chunk_lengths: Vec<usize>,
     ) -> Result<TxWindowLease> {
+        let permit = self.acquire_tx_slot_permit(chunk_lengths.len()).await?;
         self.submit(|reply| FabricCommand::AcquireTxWindowChunks {
             chunk_lengths,
+            tx_slots: permit,
             reply,
         })
         .await
+    }
+
+    async fn acquire_tx_slot_permit(&self, count: usize) -> Result<OwnedSemaphorePermit> {
+        let count = u32::try_from(count)
+            .map_err(|_| Error::InvalidConfiguration("TX slot count exceeds u32".into()))?;
+        if count == 0 {
+            return Err(Error::InvalidConfiguration(
+                "TX slot admission count must be non-zero".into(),
+            ));
+        }
+        let mut readiness = self.inner.readiness.clone();
+        match readiness.borrow_and_update().clone() {
+            FabricReadiness::Ready => {}
+            FabricReadiness::Failed(error) => {
+                return Err(Error::Protocol(format!("URMA Fabric failed: {error}")))
+            }
+            FabricReadiness::Starting | FabricReadiness::Stopped => return Err(fabric_stopped()),
+        }
+        tokio::select! {
+            permit = self.inner.tx_slot_admission.clone().acquire_many_owned(count) => {
+                permit.map_err(|_| fabric_stopped())
+            }
+            changed = readiness.changed() => {
+                changed.map_err(|_| fabric_stopped())?;
+                match readiness.borrow().clone() {
+                    FabricReadiness::Failed(error) => {
+                        Err(Error::Protocol(format!("URMA Fabric failed: {error}")))
+                    }
+                    FabricReadiness::Starting | FabricReadiness::Ready | FabricReadiness::Stopped => {
+                        Err(fabric_stopped())
+                    }
+                }
+            }
+        }
     }
 
     #[allow(dead_code)] // B1 ownership API, consumed by B4.
@@ -501,8 +563,33 @@ impl UrmaFabricHandle {
         &self,
         chunk_lengths: Vec<usize>,
     ) -> Result<TxWindowLease> {
+        let requested = chunk_lengths.len();
+        let requested_u32 = u32::try_from(requested)
+            .map_err(|_| Error::InvalidConfiguration("TX slot count exceeds u32".into()))?;
+        if requested_u32 == 0 {
+            return Err(Error::InvalidConfiguration(
+                "TX slot admission count must be non-zero".into(),
+            ));
+        }
+        let permit = match self
+            .inner
+            .tx_slot_admission
+            .clone()
+            .try_acquire_many_owned(requested_u32)
+        {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                return Err(Error::BufferUnavailable {
+                    kind: "TX",
+                    requested,
+                    available: self.inner.tx_slot_admission.available_permits(),
+                })
+            }
+            Err(TryAcquireError::Closed) => return Err(fabric_stopped()),
+        };
         self.try_submit(|reply| FabricCommand::AcquireTxWindowChunks {
             chunk_lengths,
+            tx_slots: permit,
             reply,
         })
         .await
@@ -669,6 +756,7 @@ struct FabricInner {
     max_jfr_depth: u32,
     max_jfs_depth: u32,
     required_rx_waiters: RequiredRxWaiters,
+    tx_slot_admission: Arc<Semaphore>,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -711,10 +799,12 @@ enum FabricCommand {
     #[allow(dead_code)] // B1 foundation, selected by B4.
     AcquireTxWindow {
         length: usize,
+        tx_slots: OwnedSemaphorePermit,
         reply: oneshot::Sender<Result<TxWindowLease>>,
     },
     AcquireTxWindowChunks {
         chunk_lengths: Vec<usize>,
+        tx_slots: OwnedSemaphorePermit,
         reply: oneshot::Sender<Result<TxWindowLease>>,
     },
     #[allow(dead_code)] // B1 foundation, selected by B4.
@@ -775,6 +865,7 @@ fn run_owner(
     config: RuntimeConfig,
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
     recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
+    tx_slot_admission: Arc<Semaphore>,
     readiness_tx: watch::Sender<FabricReadiness>,
     startup_tx: std_mpsc::SyncSender<Result<(u32, u64, u32, u32)>>,
 ) {
@@ -810,9 +901,12 @@ fn run_owner(
         if runtime.outstanding() == 0 {
             match command_rx.blocking_recv() {
                 Some(envelope) => {
-                    if let OwnerControl::Shutdown(reply) =
-                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
-                    {
+                    if let OwnerControl::Shutdown(reply) = handle_command(
+                        envelope.command,
+                        &mut runtime,
+                        poisoned.as_deref(),
+                        &tx_slot_admission,
+                    ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
                     }
@@ -828,9 +922,12 @@ fn run_owner(
         for _ in 0..MAX_COMMANDS_PER_TICK {
             match command_rx.try_recv() {
                 Ok(envelope) => {
-                    if let OwnerControl::Shutdown(reply) =
-                        handle_command(envelope.command, &mut runtime, poisoned.as_deref())
-                    {
+                    if let OwnerControl::Shutdown(reply) = handle_command(
+                        envelope.command,
+                        &mut runtime,
+                        poisoned.as_deref(),
+                        &tx_slot_admission,
+                    ) {
                         finish_owner(runtime, &readiness_tx, reply);
                         return;
                     }
@@ -869,6 +966,7 @@ fn handle_command(
     command: FabricCommand,
     runtime: &mut UrmaRuntime,
     poisoned: Option<&str>,
+    tx_slot_admission: &Semaphore,
 ) -> OwnerControl {
     match command {
         FabricCommand::CreateLane { config, reply } => {
@@ -919,23 +1017,38 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
-        FabricCommand::AcquireTxWindow { length, reply } => {
+        FabricCommand::AcquireTxWindow {
+            length,
+            tx_slots,
+            reply,
+        } => {
             let result =
                 reject_if_poisoned(poisoned).and_then(|()| runtime.acquire_tx_window(length));
+            if result.is_ok() {
+                commit_tx_slot_permit(tx_slots);
+            }
             let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::AcquireTxWindowChunks {
             chunk_lengths,
+            tx_slots,
             reply,
         } => {
             let result = reject_if_poisoned(poisoned)
                 .and_then(|()| runtime.acquire_tx_window_chunks(&chunk_lengths));
+            if result.is_ok() {
+                commit_tx_slot_permit(tx_slots);
+            }
             let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::RecycleTxWindow { lease, reply } => {
-            let _ = reply.send(runtime.recycle_tx_window(lease));
+            let result = runtime.recycle_tx_window(lease);
+            if let Ok(count) = &result {
+                release_tx_slot_permits(tx_slot_admission, *count);
+            }
+            let _ = reply.send(result);
             OwnerControl::Continue
         }
         FabricCommand::RecycleRxWindow { lease, reply } => {
@@ -964,13 +1077,28 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::RecycleLease { recycle } => {
-            if let Err(error) = runtime.recycle_dropped_lease(recycle) {
-                tracing::error!(%error, "failed to recycle dropped URMA registered lease");
+            match runtime.recycle_dropped_lease(recycle) {
+                Ok((count, kind)) => {
+                    if kind == LeaseKind::Tx {
+                        release_tx_slot_permits(tx_slot_admission, count);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to recycle dropped URMA registered lease");
+                }
             }
             OwnerControl::Continue
         }
         FabricCommand::Shutdown { reply } => OwnerControl::Shutdown(reply),
     }
+}
+
+fn commit_tx_slot_permit(permit: OwnedSemaphorePermit) {
+    permit.forget();
+}
+
+fn release_tx_slot_permits(admission: &Semaphore, count: usize) {
+    admission.add_permits(count);
 }
 
 fn poison_once(
@@ -1053,6 +1181,31 @@ fn join_owner(join: &Mutex<Option<JoinHandle<()>>>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::urma::buffer::{LeaseBook, LeaseKind, SlotId};
+
+    #[tokio::test]
+    async fn tx_slot_admission_waits_without_retry_and_releases_exact_capacity() {
+        let admission = Arc::new(Semaphore::new(4));
+        let initial = admission.clone().acquire_many_owned(4).await.unwrap();
+        commit_tx_slot_permit(initial);
+        assert_eq!(admission.available_permits(), 0);
+        assert!(matches!(
+            admission.clone().try_acquire_many_owned(1),
+            Err(TryAcquireError::NoPermits)
+        ));
+
+        let waiter = tokio::spawn({
+            let admission = Arc::clone(&admission);
+            async move { admission.acquire_many_owned(4).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        release_tx_slot_permits(&admission, 4);
+        let permit = waiter.await.unwrap();
+        assert_eq!(permit.num_permits(), 4);
+        drop(permit);
+        assert_eq!(admission.available_permits(), 4);
+    }
 
     #[test]
     fn zero_command_capacity_is_rejected_before_spawning() {
