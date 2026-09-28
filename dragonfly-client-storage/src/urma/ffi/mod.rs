@@ -61,9 +61,33 @@ pub(crate) struct PostEntry {
     pub(crate) complete_enable: bool,
 }
 
+fn raw_post_entry(entry: &PostEntry) -> sys::dfurma_post_entry_t {
+    sys::dfurma_post_entry_t {
+        offset: entry.offset,
+        length: entry.length,
+        user_ctx: entry.user_ctx,
+        imm_data: entry.imm_data.unwrap_or_default(),
+        complete_enable: u8::from(entry.complete_enable),
+    }
+}
+
 pub(crate) struct PostBatch {
-    pub(crate) handles: Vec<WrHandle>,
+    handles: [Option<WrHandle>; sys::DFURMA_MAX_POST_LIST as usize],
+    len: usize,
     pub(crate) error: Option<FfiError>,
+}
+
+impl PostBatch {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn take(&mut self, index: usize) -> WrHandle {
+        assert!(index < self.len, "posted WR handle index is in range");
+        self.handles[index]
+            .take()
+            .expect("posted WR handle is consumed once")
+    }
 }
 
 pub(crate) struct JettyDescriptorData {
@@ -467,36 +491,6 @@ impl JettyHandle {
         self.post(Some(target), segment, offset, length, user_ctx, true, None)
     }
 
-    pub(crate) fn post_send_imm(
-        &mut self,
-        target: &TargetHandle,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-        imm_data: u64,
-    ) -> Result<WrHandle, FfiError> {
-        self.post(
-            Some(target),
-            segment,
-            offset,
-            length,
-            user_ctx,
-            true,
-            Some(imm_data),
-        )
-    }
-
-    pub(crate) fn post_recv(
-        &mut self,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-    ) -> Result<WrHandle, FfiError> {
-        self.post(None, segment, offset, length, user_ctx, false, None)
-    }
-
     pub(crate) fn local_ids(&self) -> Result<(u32, u32), FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let mut jetty_id = 0;
@@ -554,20 +548,17 @@ impl JettyHandle {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let target = target.and_then(|target| target.raw);
         let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
-        let raw_entries: Vec<sys::dfurma_post_entry_t> = entries
-            .iter()
-            .map(|entry| sys::dfurma_post_entry_t {
-                offset: entry.offset,
-                length: entry.length,
-                user_ctx: entry.user_ctx,
-                imm_data: entry.imm_data.unwrap_or_default(),
-                complete_enable: u8::from(entry.complete_enable),
-            })
-            .collect();
-        let mut raw_handles = vec![std::ptr::null_mut(); entries.len()];
+        let mut raw_entries: [std::mem::MaybeUninit<sys::dfurma_post_entry_t>;
+            sys::DFURMA_MAX_POST_LIST as usize] =
+            std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+        for (raw, entry) in raw_entries.iter_mut().zip(entries) {
+            raw.write(raw_post_entry(entry));
+        }
+        let mut raw_handles = [std::ptr::null_mut(); sys::DFURMA_MAX_POST_LIST as usize];
         let mut posted = 0u32;
-        // SAFETY: All input/output slices remain live for the synchronous shim
-        // call. The shim validates every segment range before posting the list.
+        // SAFETY: The first `entries.len()` raw entries are initialized, all
+        // output slots are writable, and the live handles are used only for
+        // this synchronous shim call.
         let status = unsafe {
             if with_imm {
                 sys::dfurma_post_send_imm_list(
@@ -576,8 +567,8 @@ impl JettyHandle {
                         .ok_or(FfiError::Contract("SEND requires a target"))?
                         .as_ptr(),
                     segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
+                    raw_entries.as_ptr().cast(),
+                    entries.len() as u32,
                     raw_handles.as_mut_ptr(),
                     &mut posted,
                 )
@@ -588,8 +579,8 @@ impl JettyHandle {
                         .ok_or(FfiError::Contract("SEND requires a target"))?
                         .as_ptr(),
                     segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
+                    raw_entries.as_ptr().cast(),
+                    entries.len() as u32,
                     raw_handles.as_mut_ptr(),
                     &mut posted,
                 )
@@ -597,8 +588,8 @@ impl JettyHandle {
                 sys::dfurma_post_recv_list(
                     jetty.as_ptr(),
                     segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
+                    raw_entries.as_ptr().cast(),
+                    entries.len() as u32,
                     raw_handles.as_mut_ptr(),
                     &mut posted,
                 )
@@ -609,15 +600,16 @@ impl JettyHandle {
         if posted > entries.len() || (status == 0 && posted != entries.len()) {
             return Err(FfiError::Contract("invalid posted WR prefix from shim"));
         }
-        let mut handles = Vec::with_capacity(posted);
-        for raw in raw_handles.into_iter().take(posted) {
-            handles.push(WrHandle {
+        let mut handles = std::array::from_fn(|_| None);
+        for (index, raw) in raw_handles.into_iter().take(posted).enumerate() {
+            handles[index] = Some(WrHandle {
                 raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
                 _not_send_sync: PhantomData,
             });
         }
         Ok(PostBatch {
             handles,
+            len: posted,
             error: (status != 0).then_some(FfiError::Status(status)),
         })
     }
@@ -801,5 +793,47 @@ fn status_result(status: c_int) -> Result<(), FfiError> {
         Ok(())
     } else {
         Err(FfiError::Status(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_post_entry_preserves_completion_selection() {
+        let mut entry = PostEntry {
+            offset: 64,
+            length: 128,
+            user_ctx: 256,
+            imm_data: Some(512),
+            complete_enable: false,
+        };
+
+        let raw = raw_post_entry(&entry);
+        assert_eq!(raw.offset, entry.offset);
+        assert_eq!(raw.length, entry.length);
+        assert_eq!(raw.user_ctx, entry.user_ctx);
+        assert_eq!(raw.imm_data, entry.imm_data.unwrap());
+        assert_eq!(raw.complete_enable, 0);
+
+        entry.complete_enable = true;
+        assert_eq!(raw_post_entry(&entry).complete_enable, 1);
+    }
+
+    #[test]
+    fn fixed_post_batch_handles_are_taken_once() {
+        let mut handles = std::array::from_fn(|_| None);
+        handles[0] = Some(WrHandle::without_native());
+        handles[1] = Some(WrHandle::without_native());
+        let mut batch = PostBatch {
+            handles,
+            len: 2,
+            error: None,
+        };
+
+        assert_eq!(batch.len(), 2);
+        batch.take(0).complete();
+        batch.take(1).complete();
     }
 }
