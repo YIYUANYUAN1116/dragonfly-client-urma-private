@@ -732,14 +732,18 @@ impl Content {
             let file = file.clone();
             let task_id = task_id.to_string();
             let piece_id = piece_id.to_string();
+            let storage_clock = storage_total_start;
             tokio::task::spawn_blocking(move || {
                 let _pwrite_permit = pwrite_permit;
                 let (activity, pwrite_active) = RmReadPwriteActivity::start();
                 let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
                 let mut buffers = [IoSlice::new(data)];
                 let start = Instant::now();
+                let pwrite_start_ns = start.duration_since(storage_clock).as_nanos() as u64;
                 let result = write_all_vectored_at(&file, &mut buffers, offset);
-                let pwrite_ns = start.elapsed().as_nanos() as u64;
+                let end = Instant::now();
+                let pwrite_ns = end.duration_since(start).as_nanos() as u64;
+                let pwrite_end_ns = end.duration_since(storage_clock).as_nanos() as u64;
                 let pwrite_active_after = activity.finish();
                 debug!(
                     task_id,
@@ -753,16 +757,24 @@ impl Content {
                     "finished pwrite for RM-READ lease"
                 );
                 result?;
-                Ok::<(u64, u64), std::io::Error>((pwrite_ns, 1))
+                Ok::<(u64, u64, u64, u64), std::io::Error>((
+                    pwrite_ns,
+                    1,
+                    pwrite_start_ns,
+                    pwrite_end_ns,
+                ))
             })
         };
         let (write, digest) = tokio::join!(write, digest);
-        let (pwrite_ns, pwrite_calls) = write
+        let (pwrite_ns, pwrite_calls, pwrite_start_ns, pwrite_end_ns) = write
             .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
             .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
         let (hasher, digest_ns) = digest
             .map_err(|error| Error::Unknown(format!("digest READ lease panicked: {error}")))?;
         let writeback_start = Instant::now();
+        let writeback_start_ns = writeback_start
+            .duration_since(storage_total_start)
+            .as_nanos() as u64;
         self.writeback.trigger(&file, offset, length).await;
         let writeback_ns = writeback_start.elapsed().as_nanos() as u64;
 
@@ -775,7 +787,10 @@ impl Content {
             pwrite_limit,
             pwrite_ns,
             pwrite_calls,
+            pwrite_start_ns,
+            pwrite_end_ns,
             digest_ns,
+            writeback_start_ns,
             writeback_ns,
             storage_total_ns = storage_total_start.elapsed().as_nanos() as u64,
             "finished writing piece from RM-READ lease"

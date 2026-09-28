@@ -96,6 +96,10 @@ pub(crate) struct ReadTransportResult {
     pub(crate) completed_bytes: u64,
     pub(crate) read_wr_count: u64,
     pub(crate) read_post_batch_count: u64,
+    pub(crate) progress_query_count: u64,
+    pub(crate) progress_query_ns: u64,
+    pub(crate) post_command_ns: u64,
+    pub(crate) poll_sleep_ns: u64,
 }
 
 /// A published destination lease awaiting Storage consumption. The CPU span is
@@ -129,6 +133,10 @@ pub(crate) struct ChildTransportTiming {
     pub(crate) segment_offer_wait_ns: u64,
     pub(crate) destination_admission_ns: u64,
     pub(crate) read_completion_ns: u64,
+    pub(crate) progress_query_count: u64,
+    pub(crate) progress_query_ns: u64,
+    pub(crate) post_command_ns: u64,
+    pub(crate) poll_sleep_ns: u64,
     pub(crate) lease_publish_ns: u64,
     pub(crate) read_done_send_ns: u64,
     pub(crate) done_wait_ns: u64,
@@ -347,6 +355,10 @@ impl ChildTransportSession {
             Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
         timing.read_completion_ns = stage_start.elapsed().as_nanos() as u64;
+        timing.progress_query_count = result.progress_query_count;
+        timing.progress_query_ns = result.progress_query_ns;
+        timing.post_command_ns = result.post_command_ns;
+        timing.poll_sleep_ns = result.poll_sleep_ns;
         debug!(
             task_id = %self.request.task_id,
             piece_number = self.request.piece_number,
@@ -355,6 +367,10 @@ impl ChildTransportSession {
             read_wr_count = result.read_wr_count,
             read_post_batch_count = result.read_post_batch_count,
             read_completion_ns = timing.read_completion_ns,
+            progress_query_count = timing.progress_query_count,
+            progress_query_ns = timing.progress_query_ns,
+            post_command_ns = timing.post_command_ns,
+            poll_sleep_ns = timing.poll_sleep_ns,
             "urma READ child completed data transfer"
         );
         // Lease flow stage 1: stop posting and close the import while keeping
@@ -529,11 +545,19 @@ impl ChildTransportSession {
     ) -> Result<ReadTransportResult> {
         let deadline = Instant::now() + self.completion_timeout;
         let mut read_post_batch_count = 0u64;
+        let mut progress_query_count = 0u64;
+        let mut progress_query_ns = 0u64;
+        let mut post_command_ns = 0u64;
+        let mut poll_sleep_ns = 0u64;
         loop {
             if Instant::now() >= deadline {
                 return Err(protocol("Child READ completion deadline expired"));
             }
+            let query_start = Instant::now();
             let progress = self.fabric.read_child_progress(child_id).await?;
+            progress_query_ns =
+                progress_query_ns.saturating_add(query_start.elapsed().as_nanos() as u64);
+            progress_query_count = progress_query_count.saturating_add(1);
             validate_progress(progress, self.piece_length)?;
             if progress.failed {
                 return Err(protocol("native Child READ failed"));
@@ -543,6 +567,10 @@ impl ChildTransportSession {
                     completed_bytes: progress.retired_bytes,
                     read_wr_count: progress.retired_wr_count,
                     read_post_batch_count,
+                    progress_query_count,
+                    progress_query_ns,
+                    post_command_ns,
+                    poll_sleep_ns,
                 });
             }
             let available = self
@@ -563,11 +591,16 @@ impl ChildTransportSession {
             }
             if !lengths.is_empty() {
                 let batch_length = lengths.len();
+                let post_start = Instant::now();
                 let posted = self.fabric.post_read_child_batch(child_id, lengths).await?;
+                post_command_ns =
+                    post_command_ns.saturating_add(post_start.elapsed().as_nanos() as u64);
                 debug_assert_eq!(posted, batch_length);
                 read_post_batch_count = read_post_batch_count.saturating_add(1);
             }
+            let sleep_start = Instant::now();
             sleep(self.poll_interval).await;
+            poll_sleep_ns = poll_sleep_ns.saturating_add(sleep_start.elapsed().as_nanos() as u64);
         }
     }
 }
