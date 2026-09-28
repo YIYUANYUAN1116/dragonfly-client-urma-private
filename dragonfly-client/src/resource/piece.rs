@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
-use tracing::{debug, error, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 /// The minimum piece length.
 pub use dragonfly_client_config::MIN_PIECE_LENGTH;
@@ -559,7 +559,16 @@ impl Piece {
         let Some(downloader) = self.urma_direct_downloader.as_ref() else {
             return Err(Error::Unknown("urma downloader is disabled".to_string()));
         };
+        info!(
+            task_id,
+            piece_id,
+            piece_kind = ?kind,
+            piece_number = number,
+            length,
+            "starting dragonfly urma SEND-RECV piece attempt"
+        );
 
+        let transport_download_start = Instant::now();
         let (mut reader, offset, digest) = match kind {
             UrmaPieceKind::Piece => {
                 downloader
@@ -577,7 +586,9 @@ impl Piece {
                     .await?
             }
         };
+        let transport_download_ns = transport_download_start.elapsed().as_nanos() as u64;
 
+        let storage_finish_start = Instant::now();
         let finished = match kind {
             UrmaPieceKind::Piece => {
                 self.storage
@@ -631,12 +642,17 @@ impl Piece {
         // the piece notifier claim and let a concurrent requester steal the
         // ownership before the TCP fallback starts. If the TCP fallback also
         // fails, the caller's scopeguard runs the final download_*_failed().
+        let storage_finish_ns = storage_finish_start.elapsed().as_nanos() as u64;
         let result = finished;
         debug!(
+            task_id,
             piece_id,
             piece_kind = ?kind,
+            piece_number = number,
             length,
             success = result.is_ok(),
+            transport_download_ns,
+            storage_finish_ns,
             child_piece_e2e_ns = child_piece_e2e_start.elapsed().as_nanos() as u64,
             "finished dragonfly urma piece attempt"
         );

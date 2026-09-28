@@ -487,6 +487,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_urma_stream_to_path(
             piece_id,
+            task_id,
             self.get_task_path(task_id),
             offset,
             expected_length,
@@ -510,6 +511,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_urma_stream_to_path(
             piece_id,
+            task_id,
             self.get_persistent_task_path(task_id),
             offset,
             expected_length,
@@ -533,6 +535,7 @@ impl Content {
     ) -> Result<super::io::WriteRangeResponse> {
         self.write_urma_stream_to_path(
             piece_id,
+            task_id,
             self.get_persistent_cache_task_path(task_id),
             offset,
             expected_length,
@@ -547,9 +550,11 @@ impl Content {
     /// into the other pipeline window. The lease is explicitly recycled only
     /// after both workers have joined, including their error paths.
     #[cfg(feature = "urma")]
+    #[allow(clippy::too_many_arguments)]
     async fn write_urma_stream_to_path(
         &self,
         piece_id: &str,
+        task_id: &str,
         task_path: PathBuf,
         offset: u64,
         expected_length: u64,
@@ -571,8 +576,12 @@ impl Content {
         let mut rx_windows = 0u64;
         let mut rx_window_wait_ns = 0u64;
         let mut digest_ns = 0u64;
+        let mut digest_start_ns = None;
+        let mut digest_end_ns = 0u64;
         let mut pwrite_ns = 0u64;
         let mut pwrite_calls = 0u64;
+        let mut pwrite_start_ns = None;
+        let mut pwrite_end_ns = 0u64;
         let mut recycle_ns = 0u64;
 
         loop {
@@ -605,22 +614,38 @@ impl Content {
             let window = Arc::new(window);
             let digest = {
                 let window = window.clone();
+                let storage_clock = storage_total_start;
                 tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
+                    let start_ns = start.duration_since(storage_clock).as_nanos() as u64;
                     for part in window.parts() {
                         hasher.update(part);
                     }
-                    (hasher, start.elapsed().as_nanos() as u64)
+                    let end = Instant::now();
+                    (
+                        hasher,
+                        end.duration_since(start).as_nanos() as u64,
+                        start_ns,
+                        end.duration_since(storage_clock).as_nanos() as u64,
+                    )
                 })
             };
             let write = {
                 let window = window.clone();
                 let file = file.clone();
+                let storage_clock = storage_total_start;
                 tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
+                    let start_ns = start.duration_since(storage_clock).as_nanos() as u64;
                     let mut buffers = window.parts().map(IoSlice::new).collect::<Vec<_>>();
                     let calls = write_all_vectored_at(&file, &mut buffers, position)?;
-                    Ok::<(u64, u64), std::io::Error>((start.elapsed().as_nanos() as u64, calls))
+                    let end = Instant::now();
+                    Ok::<(u64, u64, u64, u64), std::io::Error>((
+                        end.duration_since(start).as_nanos() as u64,
+                        calls,
+                        start_ns,
+                        end.duration_since(storage_clock).as_nanos() as u64,
+                    ))
                 })
             };
 
@@ -631,15 +656,24 @@ impl Content {
             let recycle = window.recycle().await;
             recycle_ns += recycle_start.elapsed().as_nanos() as u64;
 
-            let (next_hasher, window_digest_ns) =
+            let (next_hasher, window_digest_ns, window_digest_start_ns, window_digest_end_ns) =
                 digest.map_err(|error| Error::Unknown(format!("digest panicked: {error}")))?;
             hasher = next_hasher;
             digest_ns += window_digest_ns;
-            let (window_pwrite_ns, window_pwrite_calls) = write
+            digest_start_ns.get_or_insert(window_digest_start_ns);
+            digest_end_ns = digest_end_ns.max(window_digest_end_ns);
+            let (
+                window_pwrite_ns,
+                window_pwrite_calls,
+                window_pwrite_start_ns,
+                window_pwrite_end_ns,
+            ) = write
                 .map_err(|error| Error::Unknown(format!("write piece panicked: {error}")))?
                 .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
             pwrite_ns += window_pwrite_ns;
             pwrite_calls += window_pwrite_calls;
+            pwrite_start_ns.get_or_insert(window_pwrite_start_ns);
+            pwrite_end_ns = pwrite_end_ns.max(window_pwrite_end_ns);
             recycle?;
             length += window_length;
         }
@@ -651,15 +685,30 @@ impl Content {
         }
 
         let storage_total_ns = storage_total_start.elapsed().as_nanos() as u64;
+        let digest_start_ns = digest_start_ns.unwrap_or_default();
+        let pwrite_start_ns = pwrite_start_ns.unwrap_or_default();
+        let digest_envelope_ns = digest_end_ns.saturating_sub(digest_start_ns);
+        let pwrite_envelope_ns = pwrite_end_ns.saturating_sub(pwrite_start_ns);
+        let crc_pwrite_overlap_ns = digest_end_ns
+            .min(pwrite_end_ns)
+            .saturating_sub(digest_start_ns.max(pwrite_start_ns));
         debug!(
+            task_id,
             piece_id,
             expected_length,
             rx_windows,
             file_open_ns,
             rx_window_wait_ns,
             digest_ns,
+            digest_start_ns,
+            digest_end_ns,
+            digest_envelope_ns,
             pwrite_ns,
             pwrite_calls,
+            pwrite_start_ns,
+            pwrite_end_ns,
+            pwrite_envelope_ns,
+            crc_pwrite_overlap_ns,
             recycle_ns,
             storage_total_ns,
             "finished writing urma piece from registered receive windows"
