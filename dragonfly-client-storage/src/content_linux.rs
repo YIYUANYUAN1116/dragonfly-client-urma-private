@@ -762,6 +762,9 @@ impl Content {
             .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
         let (hasher, digest_ns) = digest
             .map_err(|error| Error::Unknown(format!("digest READ lease panicked: {error}")))?;
+        let writeback_start = Instant::now();
+        self.writeback.trigger(&file, offset, length).await;
+        let writeback_ns = writeback_start.elapsed().as_nanos() as u64;
 
         debug!(
             task_id,
@@ -773,6 +776,7 @@ impl Content {
             pwrite_ns,
             pwrite_calls,
             digest_ns,
+            writeback_ns,
             storage_total_ns = storage_total_start.elapsed().as_nanos() as u64,
             "finished writing piece from RM-READ lease"
         );

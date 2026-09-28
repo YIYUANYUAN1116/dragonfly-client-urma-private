@@ -1463,7 +1463,7 @@ impl UrmaServerHandler {
             self.max_concurrent_transfers,
             self.max_concurrent_transfers.saturating_mul(2).max(16),
         ) {
-            Ok(lane) => lane,
+            Ok(lane) => Arc::new(lane),
             Err(error) => {
                 let _ = self.fabric.close_lane(lane_id).await;
                 return Err(client_error(error));
@@ -1477,9 +1477,10 @@ impl UrmaServerHandler {
                 break;
             };
             let handler = self.clone();
+            let transfer_lane = lane.clone();
             transfers.spawn(async move {
                 if let Err(error) = handler
-                    .serve_read_transfer(lane_id, effective_max_read_size, accepted)
+                    .serve_read_transfer(lane_id, effective_max_read_size, accepted, transfer_lane)
                     .await
                 {
                     debug!(%error, "urma READ transfer ended with a Piece-local error");
@@ -1509,6 +1510,7 @@ impl UrmaServerHandler {
         lane_id: u16,
         effective_max_read_size: u32,
         accepted: AcceptedReadTransfer,
+        lane: Arc<ReadLaneControl>,
     ) -> ClientResult<()> {
         let accepted_length = match &accepted.buffer_ready {
             crate::urma::read_protocol::ReadFrame::BufferReady {
@@ -1600,11 +1602,14 @@ impl UrmaServerHandler {
         // SAFETY: The version-5 handshake authenticated this lane and the
         // accepted length was proven to match the immutable Storage Piece.
         let (parent, pending) = match unsafe {
-            session.publish_and_wait_read_done(ReadSourceRequest {
-                peer_id: lane_id,
-                backing: ReadBacking::new(memory, ()),
-                token,
-            })
+            session.publish_and_wait_read_done(
+                ReadSourceRequest {
+                    peer_id: lane_id,
+                    backing: ReadBacking::new(memory, ()),
+                    token,
+                },
+                self.transfer_timeout,
+            )
         }
         .await
         {
@@ -1619,6 +1624,7 @@ impl UrmaServerHandler {
                         .entry(lane_id)
                         .or_default()
                         .push(retained.source_id);
+                    lane.abort("READ source retained after transfer failure");
                     warn!(piece_id, "urma READ source owner retained for cleanup");
                 }
                 return Err(client_error(failure.error));

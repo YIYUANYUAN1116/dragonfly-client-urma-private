@@ -295,14 +295,17 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
     )?;
     let (parent, pending) = unsafe {
         session
-            .publish_and_wait_read_done(super::runtime::ReadSourceRequest {
-                peer_id: lane_id,
-                backing: ReadBacking::new(
-                    ReadSourceMemory::Bytes(source_bytes().into_boxed_slice()),
-                    (),
-                ),
-                token: ReadToken::new(0x1234_5678),
-            })
+            .publish_and_wait_read_done(
+                super::runtime::ReadSourceRequest {
+                    peer_id: lane_id,
+                    backing: ReadBacking::new(
+                        ReadSourceMemory::Bytes(source_bytes().into_boxed_slice()),
+                        (),
+                    ),
+                    token: ReadToken::new(0x1234_5678),
+                },
+                COMPLETION_TIMEOUT,
+            )
             .await
     }
     .map_err(|failure| failure.error)?;

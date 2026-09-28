@@ -733,6 +733,7 @@ impl ParentSourceSession {
     pub(crate) async unsafe fn publish_and_wait_read_done(
         mut self,
         request: ReadSourceRequest,
+        completion_timeout: Duration,
     ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
         let fail =
             |error: Error, retained_source: Option<RetainedSourceOwner>| ParentTransportFailure {
@@ -742,6 +743,12 @@ impl ParentSourceSession {
         if request.peer_id != self.lane_id {
             return Err(fail(
                 protocol("Parent source request uses the wrong lane"),
+                None,
+            ));
+        }
+        if completion_timeout.is_zero() {
+            return Err(fail(
+                protocol("invalid Parent READ completion timeout"),
                 None,
             ));
         }
@@ -796,14 +803,21 @@ impl ParentSourceSession {
             Ok(offer) => offer,
             Err(error) => return Err(unpublished(error)),
         };
-        if let Err(error) = self
-            .control
-            .send(ReadFrame::SegmentOffer {
+        let deadline = Instant::now() + completion_timeout;
+        let send_result = tokio::time::timeout_at(
+            deadline,
+            self.control.send(ReadFrame::SegmentOffer {
                 identity: self.identity,
                 offer,
-            })
-            .await
-        {
+            }),
+        )
+        .await;
+        let send_error = match send_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(protocol("Parent READ SegmentOffer deadline expired")),
+        };
+        if let Some(error) = send_error {
             return Err(ParentTransportFailure {
                 error,
                 retained_source: Some(RetainedSourceOwner {
@@ -833,9 +847,17 @@ impl ParentSourceSession {
         // release stage; Cancel frames only switch the wait target.
         let wait_read_done_start = std::time::Instant::now();
         let (terminal, completed_length, read_wr_count) = loop {
-            let frame = match self.control.receive().await {
-                Ok(frame) => frame,
-                Err(error) => return Err(published(error)),
+            // Timeout only stops this control wait. The exported source remains
+            // owned and charged until lane closure plus provider revocation
+            // proof; the caller receives its id in the failure below.
+            let frame = match tokio::time::timeout_at(deadline, self.control.receive()).await {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(error)) => return Err(published(error)),
+                Err(_) => {
+                    return Err(published(protocol(
+                        "Parent READ completion deadline expired",
+                    )))
+                }
             };
             let terminal = match &frame {
                 ReadFrame::ReadDone { .. } => ParentTerminal::Success,
