@@ -26,6 +26,12 @@ pub(crate) struct ReadOwnerId {
     peer: ReadPeer,
 }
 
+impl ReadOwnerId {
+    pub(crate) fn peer(self) -> ReadPeer {
+        self.peer
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadDirection {
     Destination,

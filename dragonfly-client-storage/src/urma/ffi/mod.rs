@@ -92,6 +92,9 @@ pub(crate) struct RemoteJettyId {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CompletionRecord {
+    /// Host observation time immediately after the native JFC poll returns.
+    /// This is not a hardware completion timestamp.
+    pub observed_at: Option<std::time::Instant>,
     pub status: i32,
     pub opcode: u32,
     pub user_ctx: u64,
@@ -274,6 +277,7 @@ impl JfcHandle {
         let count = unsafe {
             sys::dfurma_jfc_poll(raw.as_ptr(), out.len() as u32, records.as_mut_ptr().cast())
         };
+        let observed_at = std::time::Instant::now();
         if count < 0 {
             return Err(FfiError::Status(count));
         }
@@ -286,6 +290,7 @@ impl JfcHandle {
             // SAFETY: the shim initializes exactly the first `count` entries.
             let record = unsafe { record.assume_init() };
             *destination = CompletionRecord {
+                observed_at: Some(observed_at),
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,

@@ -3,8 +3,8 @@
 use super::{
     ffi::{
         read::{
-            ImportedReadSegment, ReadBufferCreation, ReadDescriptor, ReadPost, ReadRequest,
-            ReadToken, ReadWrHandle,
+            ImportedReadSegment, ReadBufferCreation, ReadDescriptor, ReadPost, ReadPostTiming,
+            ReadRequest, ReadToken, ReadWrHandle,
         },
         FfiError, JettyHandle, NativeRuntime, SegmentHandle, TargetHandle,
     },
@@ -14,6 +14,7 @@ use std::{
     collections::BTreeMap,
     mem::ManuallyDrop,
     sync::atomic::{AtomicU32, Ordering},
+    time::Instant,
 };
 
 // Existing SEND/RECV WrToken values always carry operation 1 or 2 in bits
@@ -35,6 +36,7 @@ pub(crate) struct ReadRetired {
     context: u64,
     length: u32,
     success: bool,
+    observed_at: Option<Instant>,
 }
 impl ReadRetired {
     /// # Safety
@@ -55,11 +57,17 @@ impl ReadRetired {
             context,
             length,
             success,
+            observed_at: None,
         }
     }
 
     pub(crate) fn context(&self) -> u64 {
         self.context
+    }
+
+    pub(crate) fn observed_at(mut self, at: Option<Instant>) -> Self {
+        self.observed_at = at;
+        self
     }
 }
 
@@ -93,6 +101,38 @@ pub(crate) struct ChildProgress {
     pub(crate) read_succeeded: bool,
 }
 
+/// All intervals use the same process monotonic clock. Per-WR sums may overlap
+/// and must not be interpreted as a Piece wall-clock duration or wire time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReadCompletionTiming {
+    pub(crate) native_timed_wr_count: u64,
+    pub(crate) native_post_call_ns: u64,
+    pub(crate) native_post_to_cqe_sum_ns: u64,
+    pub(crate) native_post_to_cqe_max_ns: u64,
+    pub(crate) first_native_post_at: Option<Instant>,
+    pub(crate) last_cqe_at: Option<Instant>,
+    pub(crate) post_admission_wait_ns: u64,
+    pub(crate) post_queue_wait_ns: u64,
+}
+
+impl ReadCompletionTiming {
+    pub(crate) fn envelope_ns(&self) -> u64 {
+        match (self.first_native_post_at, self.last_cqe_at) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start).as_nanos() as u64,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadChildUpdate {
+    pub(crate) progress: ChildProgress,
+    pub(crate) timing: ReadCompletionTiming,
+    pub(crate) notified_at: Instant,
+    /// Stop the waiter without claiming that DMA or backing has retired.
+    pub(crate) interrupted: bool,
+}
+
 /// Implementations must retain destination/import/native dependencies until close.
 /// Kept private to this transport module; no CPU buffer access is exposed.
 pub(crate) trait ChildResources {
@@ -101,6 +141,9 @@ pub(crate) trait ChildResources {
     /// between publish and recycle.
     type Lease;
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError>;
+    fn post_timing(_wr: &Self::Wr) -> Option<ReadPostTiming> {
+        None
+    }
     /// # Safety
     /// The WR has independently verified retirement, checked by ChildOwner.
     unsafe fn complete(&mut self, wr: Self::Wr);
@@ -291,6 +334,9 @@ impl<K> NativeChild<K> {
 impl<K> ChildResources for NativeChild<K> {
     type Wr = ReadWrHandle;
     type Lease = SegmentHandle;
+    fn post_timing(wr: &Self::Wr) -> Option<ReadPostTiming> {
+        Some(wr.timing())
+    }
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
         let Some(remote) = self.remote.as_ref() else {
             return Ok(ChildPost::Rejected(FfiError::Contract(
@@ -356,6 +402,7 @@ impl<K> ChildResources for NativeChild<K> {
 struct Pending<W> {
     length: u32,
     wr: W,
+    timing: Option<ReadPostTiming>,
 }
 pub(crate) struct ChildOwner<R: ChildResources> {
     id: ReadOwnerId,
@@ -377,6 +424,7 @@ pub(crate) struct ChildOwner<R: ChildResources> {
     published: Option<R::Lease>,
     pending: BTreeMap<u64, Pending<R::Wr>>,
     resources: ManuallyDrop<R>,
+    timing: ReadCompletionTiming,
 }
 impl<R: ChildResources> ChildOwner<R> {
     /// # Safety
@@ -409,10 +457,21 @@ impl<R: ChildResources> ChildOwner<R> {
             published: None,
             pending: BTreeMap::new(),
             resources: ManuallyDrop::new(resources),
+            timing: ReadCompletionTiming::default(),
         }
     }
     pub(crate) fn stop(&mut self) {
         self.stopped = true;
+    }
+    pub(crate) fn timing(&self) -> ReadCompletionTiming {
+        self.timing
+    }
+    pub(crate) fn record_post_command_wait(&mut self, admission_ns: u64, queue_ns: u64) {
+        self.timing.post_admission_wait_ns = self
+            .timing
+            .post_admission_wait_ns
+            .saturating_add(admission_ns);
+        self.timing.post_queue_wait_ns = self.timing.post_queue_wait_ns.saturating_add(queue_ns);
     }
     pub(crate) fn outstanding(&self) -> usize {
         self.pending.len()
@@ -490,7 +549,19 @@ impl<R: ChildResources> ChildOwner<R> {
                 return ChildPostOutcome::Rejected(error);
             }
         };
-        self.pending.insert(context, Pending { length, wr });
+        let timing = R::post_timing(&wr);
+        if let Some(timing) = timing {
+            self.timing
+                .first_native_post_at
+                .get_or_insert(timing.started_at);
+            self.timing.native_post_call_ns = self.timing.native_post_call_ns.saturating_add(
+                timing
+                    .returned_at
+                    .saturating_duration_since(timing.started_at)
+                    .as_nanos() as u64,
+            );
+        }
+        self.pending.insert(context, Pending { length, wr, timing });
         self.posted_bytes += u64::from(length);
         self.accepted_wr_count += 1;
         if let Some(error) = error {
@@ -516,6 +587,19 @@ impl<R: ChildResources> ChildOwner<R> {
             .pending
             .remove(&record.context)
             .expect("matched pending WR");
+        if let (Some(post), Some(cqe)) = (pending.timing, record.observed_at) {
+            let duration_ns = cqe.saturating_duration_since(post.started_at).as_nanos() as u64;
+            self.timing.native_timed_wr_count += 1;
+            self.timing.native_post_to_cqe_sum_ns = self
+                .timing
+                .native_post_to_cqe_sum_ns
+                .saturating_add(duration_ns);
+            self.timing.native_post_to_cqe_max_ns =
+                self.timing.native_post_to_cqe_max_ns.max(duration_ns);
+        }
+        if let Some(at) = record.observed_at {
+            self.timing.last_cqe_at = Some(at);
+        }
         // SAFETY: ReadRetired requires provider evidence; all identity fields match.
         unsafe { self.resources.complete(pending.wr) };
         self.retired_bytes += u64::from(pending.length);
@@ -614,24 +698,29 @@ mod tests {
         mode: u8,
         fail_close: bool,
         fail_import: bool,
+        post_timing: Option<ReadPostTiming>,
     }
     struct Mock(Rc<RefCell<Trace>>);
     impl ChildResources for Mock {
-        type Wr = u64;
+        type Wr = (u64, Option<ReadPostTiming>);
         type Lease = ();
-        fn post(&mut self, r: &ReadRequest) -> Result<ChildPost<u64>, FfiError> {
+        fn post_timing(wr: &Self::Wr) -> Option<ReadPostTiming> {
+            wr.1
+        }
+        fn post(&mut self, r: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
             let mut t = self.0.borrow_mut();
             t.contexts.push(r.user_ctx);
             t.events.push("post");
             assert_eq!(r.local_offset, r.remote_offset);
+            let wr = (r.user_ctx, t.post_timing);
             Ok(match t.mode {
-                1 => ChildPost::Uncertain(r.user_ctx, FfiError::Status(-1)),
+                1 => ChildPost::Uncertain(wr, FfiError::Status(-1)),
                 2 => ChildPost::Rejected(FfiError::Status(-2)),
                 3 => return Err(FfiError::NullHandle),
-                _ => ChildPost::Posted(r.user_ctx),
+                _ => ChildPost::Posted(wr),
             })
         }
-        unsafe fn complete(&mut self, _: u64) {
+        unsafe fn complete(&mut self, _: Self::Wr) {
             self.0.borrow_mut().events.push("complete");
         }
         fn unimport(&mut self) -> Result<(), FfiError> {
@@ -703,6 +792,51 @@ mod tests {
     fn completion(id: ReadOwnerId, context: u64, success: bool) -> ReadRetired {
         // SAFETY: Mock WRs have no DMA and are immediately retired.
         unsafe { ReadRetired::new(id, 42, context, 4, success) }
+    }
+    #[test]
+    fn read_timing_uses_host_poll_observation_and_separates_sum_from_envelope() {
+        let (mut registry, id, trace) = setup();
+        let owner = registry.active_owner(id).unwrap();
+        let base = Instant::now();
+        trace.borrow_mut().post_timing = Some(ReadPostTiming {
+            started_at: base,
+            returned_at: base + std::time::Duration::from_micros(10),
+        });
+        let first = owner.post(4).unwrap();
+        trace.borrow_mut().post_timing = Some(ReadPostTiming {
+            started_at: base + std::time::Duration::from_micros(20),
+            returned_at: base + std::time::Duration::from_micros(30),
+        });
+        let second = owner.post(4).unwrap();
+        owner.record_post_command_wait(11, 22);
+        owner
+            .complete(
+                completion(id, second, true)
+                    .observed_at(Some(base + std::time::Duration::from_micros(100))),
+            )
+            .unwrap();
+        owner
+            .complete(
+                completion(id, first, true)
+                    .observed_at(Some(base + std::time::Duration::from_micros(120))),
+            )
+            .unwrap();
+        let timing = owner.timing();
+        assert_eq!(timing.native_timed_wr_count, 2);
+        assert_eq!(timing.native_post_call_ns, 20_000);
+        assert_eq!(timing.native_post_to_cqe_sum_ns, 200_000);
+        assert_eq!(timing.native_post_to_cqe_max_ns, 120_000);
+        assert_eq!(timing.envelope_ns(), 120_000);
+        assert_eq!(timing.post_admission_wait_ns, 11);
+        assert_eq!(timing.post_queue_wait_ns, 22);
+        // A duplicate has no retirement evidence and cannot alter timing.
+        assert!(owner
+            .complete(
+                completion(id, first, true)
+                    .observed_at(Some(base + std::time::Duration::from_secs(1),))
+            )
+            .is_err());
+        assert_eq!(owner.timing(), timing);
     }
     #[test]
     fn out_of_order_completions_hold_buffer_and_budget_until_cleanup() {

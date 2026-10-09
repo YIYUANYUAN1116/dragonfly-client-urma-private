@@ -12,6 +12,7 @@
 //! released inside the attempt. Wire cancel exchanges are best-effort and
 //! never substitute for provider-side revocation evidence.
 
+use super::read_child_owner::{ReadChildUpdate, ReadCompletionTiming};
 use super::{
     fabric::UrmaFabricHandle,
     ffi::read::{source::ReadSourceStages, ReadDescriptor, ReadToken},
@@ -27,7 +28,7 @@ use super::{
     Error, Result,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 use tracing::debug;
 
 static NEXT_SEGMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -100,6 +101,12 @@ pub(crate) struct ReadTransportResult {
     pub(crate) progress_query_ns: u64,
     pub(crate) post_command_ns: u64,
     pub(crate) poll_sleep_ns: u64,
+    pub(crate) progress_subscribe_ns: u64,
+    pub(crate) progress_notification_count: u64,
+    pub(crate) progress_wait_ns: u64,
+    pub(crate) completion_notification_delay_ns: u64,
+    pub(crate) cqe_to_observed_ns: u64,
+    pub(crate) native: ReadCompletionTiming,
 }
 
 /// A published destination lease awaiting Storage consumption. The CPU span is
@@ -127,6 +134,20 @@ pub(crate) struct ChildTransportSuccess {
 
 /// Child-side successful-path timing. These stages are observational and do
 /// not participate in protocol or owner-lifetime decisions.
+///
+/// native_read_envelope_ns (logged from native.envelope_ns()) brackets the
+/// first native shim post call and the JFC poll returning the last matched CQE.
+/// It includes native setup, DMA/network work, owner scheduling and polling;
+/// it is not wire time. native_post_to_cqe_sum_ns sums per-WR intervals, which
+/// may overlap. cqe_to_observed_ns covers the last poll return through routing,
+/// notification and the async driver's observation of success.
+///
+/// post_admission_wait_ns covers acquiring a Fabric command slot;
+/// post_queue_wait_ns covers enqueue to owner dispatch. post_command_ns also
+/// includes execution and async reply scheduling, so these fields overlap.
+/// progress_wait_ns measures awaiting changes (including DMA time), not CPU
+/// overhead. Legacy progress_query_* and poll_sleep_ns remain zero on this
+/// path; progress_subscribe_ns measures its one initial subscription command.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChildTransportTiming {
     pub(crate) buffer_ready_send_ns: u64,
@@ -137,6 +158,12 @@ pub(crate) struct ChildTransportTiming {
     pub(crate) progress_query_ns: u64,
     pub(crate) post_command_ns: u64,
     pub(crate) poll_sleep_ns: u64,
+    pub(crate) progress_subscribe_ns: u64,
+    pub(crate) progress_notification_count: u64,
+    pub(crate) progress_wait_ns: u64,
+    pub(crate) completion_notification_delay_ns: u64,
+    pub(crate) cqe_to_observed_ns: u64,
+    pub(crate) native: ReadCompletionTiming,
     pub(crate) lease_publish_ns: u64,
     pub(crate) read_done_send_ns: u64,
     pub(crate) done_wait_ns: u64,
@@ -189,7 +216,6 @@ pub(crate) struct ChildTransportSession {
     piece_length: u64,
     allocation_bytes: u64,
     max_outstanding: usize,
-    poll_interval: Duration,
     completion_timeout: Duration,
 }
 
@@ -205,13 +231,11 @@ impl ChildTransportSession {
         allocation_bytes: u64,
         max_read_size: u32,
         max_outstanding: usize,
-        poll_interval: Duration,
         completion_timeout: Duration,
     ) -> Result<Self> {
         if control.identity() != identity
             || allocation_bytes < piece_length
             || max_outstanding == 0
-            || poll_interval.is_zero()
             || completion_timeout.is_zero()
         {
             return Err(protocol("invalid Child READ session configuration"));
@@ -227,7 +251,6 @@ impl ChildTransportSession {
             piece_length,
             allocation_bytes,
             max_outstanding,
-            poll_interval,
             completion_timeout,
         })
     }
@@ -359,6 +382,12 @@ impl ChildTransportSession {
         timing.progress_query_ns = result.progress_query_ns;
         timing.post_command_ns = result.post_command_ns;
         timing.poll_sleep_ns = result.poll_sleep_ns;
+        timing.progress_subscribe_ns = result.progress_subscribe_ns;
+        timing.progress_notification_count = result.progress_notification_count;
+        timing.progress_wait_ns = result.progress_wait_ns;
+        timing.completion_notification_delay_ns = result.completion_notification_delay_ns;
+        timing.cqe_to_observed_ns = result.cqe_to_observed_ns;
+        timing.native = result.native;
         debug!(
             task_id = %self.request.task_id,
             piece_number = self.request.piece_number,
@@ -371,6 +400,18 @@ impl ChildTransportSession {
             progress_query_ns = timing.progress_query_ns,
             post_command_ns = timing.post_command_ns,
             poll_sleep_ns = timing.poll_sleep_ns,
+            progress_subscribe_ns = timing.progress_subscribe_ns,
+            progress_notification_count = timing.progress_notification_count,
+            progress_wait_ns = timing.progress_wait_ns,
+            completion_notification_delay_ns = timing.completion_notification_delay_ns,
+            cqe_to_observed_ns = timing.cqe_to_observed_ns,
+            native_timed_wr_count = timing.native.native_timed_wr_count,
+            native_post_call_ns = timing.native.native_post_call_ns,
+            native_post_to_cqe_sum_ns = timing.native.native_post_to_cqe_sum_ns,
+            native_post_to_cqe_max_ns = timing.native.native_post_to_cqe_max_ns,
+            native_read_envelope_ns = timing.native.envelope_ns(),
+            post_admission_wait_ns = timing.native.post_admission_wait_ns,
+            post_queue_wait_ns = timing.native.post_queue_wait_ns,
             "urma READ child completed data transfer"
         );
         // Lease flow stage 1: stop posting and close the import while keeping
@@ -544,64 +585,120 @@ impl ChildTransportSession {
         max_read_size: u32,
     ) -> Result<ReadTransportResult> {
         let deadline = Instant::now() + self.completion_timeout;
-        let mut read_post_batch_count = 0u64;
-        let mut progress_query_count = 0u64;
-        let mut progress_query_ns = 0u64;
-        let mut post_command_ns = 0u64;
-        let mut poll_sleep_ns = 0u64;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(protocol("Child READ completion deadline expired"));
-            }
-            let query_start = Instant::now();
-            let progress = self.fabric.read_child_progress(child_id).await?;
-            progress_query_ns =
-                progress_query_ns.saturating_add(query_start.elapsed().as_nanos() as u64);
-            progress_query_count = progress_query_count.saturating_add(1);
-            validate_progress(progress, self.piece_length)?;
-            if progress.failed {
-                return Err(protocol("native Child READ failed"));
-            }
-            if progress.read_succeeded {
-                return Ok(ReadTransportResult {
-                    completed_bytes: progress.retired_bytes,
-                    read_wr_count: progress.retired_wr_count,
-                    read_post_batch_count,
-                    progress_query_count,
-                    progress_query_ns,
-                    post_command_ns,
-                    poll_sleep_ns,
-                });
-            }
-            let available = self
-                .max_outstanding
-                .saturating_sub(progress.outstanding_wr_count);
-            let mut remaining = self.piece_length - progress.accepted_bytes;
-            let remaining_wr_count = remaining.div_ceil(u64::from(max_read_size));
-            let mut lengths = Vec::with_capacity(
-                available.min(usize::try_from(remaining_wr_count).unwrap_or(usize::MAX)),
-            );
-            for _ in 0..available {
-                if remaining == 0 {
-                    break;
-                }
-                let length = remaining.min(u64::from(max_read_size)) as u32;
-                lengths.push(length);
-                remaining -= u64::from(length);
-            }
-            if !lengths.is_empty() {
-                let batch_length = lengths.len();
-                let post_start = Instant::now();
-                let posted = self.fabric.post_read_child_batch(child_id, lengths).await?;
-                post_command_ns =
-                    post_command_ns.saturating_add(post_start.elapsed().as_nanos() as u64);
-                debug_assert_eq!(posted, batch_length);
-                read_post_batch_count = read_post_batch_count.saturating_add(1);
-            }
-            let sleep_start = Instant::now();
-            sleep(self.poll_interval).await;
-            poll_sleep_ns = poll_sleep_ns.saturating_add(sleep_start.elapsed().as_nanos() as u64);
+        let subscribe_start = Instant::now();
+        let progress = timeout_at(
+            deadline,
+            self.fabric.subscribe_read_child_progress(child_id),
+        )
+        .await
+        .map_err(|_| protocol("Child READ completion deadline expired"))??;
+        let subscribe_ns = subscribe_start.elapsed().as_nanos() as u64;
+        drive_read_notifications(
+            progress,
+            self.piece_length,
+            self.max_outstanding,
+            max_read_size,
+            deadline,
+            subscribe_ns,
+            |lengths| self.fabric.post_read_child_batch(child_id, lengths),
+        )
+        .await
+    }
+}
+
+/// Progress snapshots remain in the watch channel even when a post/CQE happens
+/// before the waiter runs. Notification Drop only cancels interest, never DMA.
+async fn drive_read_notifications<F, Fut>(
+    mut updates: tokio::sync::watch::Receiver<ReadChildUpdate>,
+    piece_length: u64,
+    max_outstanding: usize,
+    max_read_size: u32,
+    deadline: Instant,
+    progress_subscribe_ns: u64,
+    mut post: F,
+) -> Result<ReadTransportResult>
+where
+    F: FnMut(Vec<u32>) -> Fut,
+    Fut: std::future::Future<Output = Result<usize>>,
+{
+    let mut read_post_batch_count = 0u64;
+    let mut post_command_ns = 0u64;
+    let mut progress_notification_count = 0u64;
+    let mut progress_wait_ns = 0u64;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(protocol("Child READ completion deadline expired"));
         }
+        let update = *updates.borrow_and_update();
+        let observed_at = std::time::Instant::now();
+        let progress = update.progress;
+        validate_progress(progress, piece_length)?;
+        if update.interrupted || progress.failed {
+            return Err(protocol("native Child READ failed or interrupted"));
+        }
+        if progress.read_succeeded {
+            return Ok(ReadTransportResult {
+                completed_bytes: progress.retired_bytes,
+                read_wr_count: progress.retired_wr_count,
+                read_post_batch_count,
+                // Kept for existing log consumers; there are no polling queries
+                // or deliberate sleeps on the event-driven path.
+                progress_query_count: 0,
+                progress_query_ns: 0,
+                post_command_ns,
+                poll_sleep_ns: 0,
+                progress_subscribe_ns,
+                progress_notification_count,
+                progress_wait_ns,
+                completion_notification_delay_ns: observed_at
+                    .saturating_duration_since(update.notified_at)
+                    .as_nanos() as u64,
+                cqe_to_observed_ns: update.timing.last_cqe_at.map_or(0, |at| {
+                    observed_at.saturating_duration_since(at).as_nanos() as u64
+                }),
+                native: update.timing,
+            });
+        }
+        if progress.posting_stopped {
+            return Err(protocol("Child READ posting stopped before success"));
+        }
+        let available = max_outstanding.saturating_sub(progress.outstanding_wr_count);
+        let mut remaining = piece_length - progress.accepted_bytes;
+        let remaining_wr_count = remaining.div_ceil(u64::from(max_read_size));
+        let mut lengths = Vec::with_capacity(
+            available.min(usize::try_from(remaining_wr_count).unwrap_or(usize::MAX)),
+        );
+        for _ in 0..available {
+            if remaining == 0 {
+                break;
+            }
+            let length = remaining.min(u64::from(max_read_size)) as u32;
+            lengths.push(length);
+            remaining -= u64::from(length);
+        }
+        if !lengths.is_empty() {
+            let batch_length = lengths.len();
+            let post_start = Instant::now();
+            let posted = timeout_at(deadline, post(lengths))
+                .await
+                .map_err(|_| protocol("Child READ completion deadline expired"))??;
+            post_command_ns =
+                post_command_ns.saturating_add(post_start.elapsed().as_nanos() as u64);
+            if posted != batch_length {
+                return Err(protocol("inconsistent READ post batch result"));
+            }
+            read_post_batch_count += 1;
+        }
+        // The owner publishes accepted progress before replying to post. changed()
+        // sees that update even if it was sent before this await, then later sees
+        // CQE progress. No progress command is sent back to the owner.
+        let wait_start = Instant::now();
+        timeout_at(deadline, updates.changed())
+            .await
+            .map_err(|_| protocol("Child READ completion deadline expired"))?
+            .map_err(|_| protocol("Child READ progress notification closed"))?;
+        progress_wait_ns = progress_wait_ns.saturating_add(wait_start.elapsed().as_nanos() as u64);
+        progress_notification_count += 1;
     }
 }
 
@@ -1024,6 +1121,145 @@ impl ParentSourceSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn update_progress(accepted: u64, retired: u64) -> ReadChildUpdate {
+        ReadChildUpdate {
+            progress: ReadChildProgress {
+                piece_length: 8,
+                accepted_bytes: accepted,
+                retired_bytes: retired,
+                accepted_wr_count: accepted / 4,
+                retired_wr_count: retired / 4,
+                outstanding_wr_count: ((accepted - retired) / 4) as usize,
+                posting_stopped: false,
+                failed: false,
+                read_succeeded: retired == 8,
+            },
+            timing: ReadCompletionTiming::default(),
+            notified_at: std::time::Instant::now(),
+            interrupted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_driver_refills_window_when_completion_precedes_await() {
+        let (tx, rx) = tokio::sync::watch::channel(update_progress(0, 0));
+        let mut accepted = 0;
+        let mut batches = 0;
+        let result = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_secs(1),
+            0,
+            |lengths| {
+                // Simulates a full post + CQE before the submit future returns.
+                // With outstanding=1, the second WR must wait for retirement.
+                assert_eq!(lengths, vec![4]);
+                accepted += 4;
+                batches += 1;
+                tx.send_replace(update_progress(accepted, accepted));
+                std::future::ready(Ok(1))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(batches, 2);
+        assert_eq!(result.completed_bytes, 8);
+        assert_eq!(result.read_wr_count, 2);
+        assert_eq!(result.read_post_batch_count, 2);
+        assert_eq!(result.progress_notification_count, 2);
+        assert_eq!(result.progress_query_count, 0);
+        assert_eq!(result.poll_sleep_ns, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_driver_sees_completion_before_subscription_without_posting() {
+        let (_, rx) = tokio::sync::watch::channel(update_progress(8, 8));
+        let result = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_secs(1),
+            0,
+            |_| std::future::ready(Err(protocol("must not post completed Piece"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.completed_bytes, 8);
+        assert_eq!(result.read_post_batch_count, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_driver_fails_on_closed_channel_and_deadline() {
+        let (tx, rx) = tokio::sync::watch::channel(update_progress(4, 0));
+        drop(tx);
+        let closed = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_secs(1),
+            0,
+            |_| std::future::ready(Err(protocol("must not post full window"))),
+        )
+        .await;
+        assert!(closed
+            .unwrap_err()
+            .to_string()
+            .contains("notification closed"));
+        let (_tx, rx) = tokio::sync::watch::channel(update_progress(4, 0));
+        let expired = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_millis(5),
+            0,
+            |_| std::future::ready(Err(protocol("must not post full window"))),
+        )
+        .await;
+        assert!(expired
+            .unwrap_err()
+            .to_string()
+            .contains("deadline expired"));
+    }
+
+    #[tokio::test]
+    async fn notification_driver_deadline_also_bounds_a_stalled_post_command() {
+        let (_tx, rx) = tokio::sync::watch::channel(update_progress(0, 0));
+        let result = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_millis(5),
+            0,
+            |_| std::future::pending::<Result<usize>>(),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_notification_cannot_publish_success() {
+        let mut update = update_progress(8, 8);
+        update.interrupted = true;
+        let (_, rx) = tokio::sync::watch::channel(update);
+        let result = drive_read_notifications(
+            rx,
+            8,
+            1,
+            4,
+            Instant::now() + Duration::from_secs(1),
+            0,
+            |_| std::future::ready(Err(protocol("must not post interrupted Piece"))),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+    }
 
     fn wr_progress(accepted: u64, retired: u64) -> ReadChildProgress {
         ReadChildProgress {

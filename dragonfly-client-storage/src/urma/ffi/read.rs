@@ -185,9 +185,19 @@ pub(crate) enum ReadPost {
     Uncertain { wr: ReadWrHandle, error: FfiError },
 }
 
-pub(crate) struct ReadWrHandle(WrHandle);
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadPostTiming {
+    /// Brackets the native shim call, including its validation and WR setup.
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) returned_at: std::time::Instant,
+}
+
+pub(crate) struct ReadWrHandle(WrHandle, ReadPostTiming);
 
 impl ReadWrHandle {
+    pub(crate) fn timing(&self) -> ReadPostTiming {
+        self.1
+    }
     /// # Safety
     /// The caller must have validated the unique matching CQE or a provider-proven
     /// retirement covering this WR. Timeout, unimport and terminal TCP messages do
@@ -221,6 +231,7 @@ impl JettyHandle {
         let mut raw = std::ptr::null_mut();
         // SAFETY: Owners are live; the shim verifies runtime/target ownership and
         // both ranges. The caller supplies destination exclusivity until retirement.
+        let started_at = std::time::Instant::now();
         let status = unsafe {
             sys::dfurma_post_read(
                 jetty.as_ptr(),
@@ -234,18 +245,28 @@ impl JettyHandle {
                 &mut raw,
             )
         };
+        let timing = ReadPostTiming {
+            started_at,
+            returned_at: std::time::Instant::now(),
+        };
         match (status, NonNull::new(raw)) {
-            (0, Some(raw)) => Ok(ReadPost::Posted(ReadWrHandle(WrHandle {
-                raw: Some(raw),
-                _not_send_sync: PhantomData,
-            }))),
+            (0, Some(raw)) => Ok(ReadPost::Posted(ReadWrHandle(
+                WrHandle {
+                    raw: Some(raw),
+                    _not_send_sync: PhantomData,
+                },
+                timing,
+            ))),
             (0, None) => Err(FfiError::NullHandle),
             (status, None) => Ok(ReadPost::Rejected(FfiError::Status(status))),
             (status, Some(raw)) => Ok(ReadPost::Uncertain {
-                wr: ReadWrHandle(WrHandle {
-                    raw: Some(raw),
-                    _not_send_sync: PhantomData,
-                }),
+                wr: ReadWrHandle(
+                    WrHandle {
+                        raw: Some(raw),
+                        _not_send_sync: PhantomData,
+                    },
+                    timing,
+                ),
                 error: FfiError::Status(status),
             }),
         }

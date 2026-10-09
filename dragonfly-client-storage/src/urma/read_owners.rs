@@ -10,7 +10,7 @@ use super::{
     },
     read_child_owner::{
         is_read_context, ChildOwner, ChildPostOutcome, ChildProgress, ChildResources, LeaseSpan,
-        ReadRetired,
+        ReadChildUpdate, ReadRetired,
     },
     read_owner::{
         OwnerError, QuarantineReason, ReadBudget, ReadDirection, ReadOwnerId, ReadOwnerRegistry,
@@ -22,6 +22,7 @@ use super::{
     },
 };
 use std::collections::{btree_map::Entry, BTreeMap};
+use tokio::sync::watch;
 
 #[derive(Clone, Copy)]
 struct ReadRoute {
@@ -100,12 +101,16 @@ pub(crate) enum ChildAdmission {
 pub(crate) struct ReadOwners<K, R: ChildResources> {
     registry: ReadOwnerRegistry<ReadBundle<K, R>>,
     routes: BTreeMap<u64, ReadRoute>,
+    // Channels own snapshots only, never native resources or budget. A dropped
+    // receiver cannot cancel DMA or release an owner.
+    progress_watchers: BTreeMap<ReadOwnerId, watch::Sender<ReadChildUpdate>>,
 }
 impl<K, R: ChildResources> ReadOwners<K, R> {
     pub(crate) fn new(budget: ReadBudget) -> Result<Self, OwnerError> {
         Ok(Self {
             registry: ReadOwnerRegistry::new(budget)?,
             routes: BTreeMap::new(),
+            progress_watchers: BTreeMap::new(),
         })
     }
     pub(crate) fn activate_peer(&mut self, peer: ReadPeer) -> Result<(), OwnerError> {
@@ -122,12 +127,84 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     }
     pub(crate) fn begin_shutdown(&mut self) {
         self.registry.begin_shutdown();
+        self.interrupt_waiters();
     }
     pub(crate) fn drain_peer(&mut self, peer: ReadPeer) -> Result<(), OwnerError> {
-        self.registry.drain_peer(peer)
+        self.registry.drain_peer(peer)?;
+        for (id, tx) in &self.progress_watchers {
+            if id.peer() == peer {
+                tx.send_modify(|update| {
+                    update.interrupted = true;
+                    update.notified_at = std::time::Instant::now();
+                });
+            }
+        }
+        Ok(())
     }
     pub(crate) fn retire(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
-        self.registry.retire(id)
+        self.registry.retire(id)?;
+        self.notify_child(id, true);
+        Ok(())
+    }
+
+    pub(crate) fn interrupt_waiters(&mut self) {
+        for tx in self.progress_watchers.values() {
+            tx.send_modify(|update| {
+                update.interrupted = true;
+                update.notified_at = std::time::Instant::now();
+            });
+        }
+    }
+
+    pub(crate) fn subscribe_child_progress(
+        &mut self,
+        id: ReadOwnerId,
+    ) -> Result<watch::Receiver<ReadChildUpdate>, ReadDispatchError> {
+        // Validate identity even if a sender already exists.
+        let child = self.registry.active_owner(id)?.child_mut()?;
+        let update = ReadChildUpdate {
+            progress: child.progress(),
+            timing: child.timing(),
+            notified_at: std::time::Instant::now(),
+            interrupted: false,
+        };
+        Ok(self
+            .progress_watchers
+            .entry(id)
+            .or_insert_with(|| watch::channel(update).0)
+            .subscribe())
+    }
+
+    fn notify_child(&mut self, id: ReadOwnerId, interrupted: bool) {
+        let Some(tx) = self.progress_watchers.get(&id) else {
+            return;
+        };
+        let Ok(bundle) = self.registry.retained_owner(id) else {
+            return;
+        };
+        let Ok(child) = bundle.child_mut() else {
+            return;
+        };
+        let already_interrupted = tx.borrow().interrupted;
+        tx.send_replace(ReadChildUpdate {
+            progress: child.progress(),
+            timing: child.timing(),
+            notified_at: std::time::Instant::now(),
+            interrupted: already_interrupted || interrupted,
+        });
+    }
+
+    pub(crate) fn record_post_command_wait(
+        &mut self,
+        id: ReadOwnerId,
+        admission_ns: u64,
+        queue_ns: u64,
+    ) -> Result<(), ReadDispatchError> {
+        self.registry
+            .retained_owner(id)?
+            .child_mut()?
+            .record_post_command_wait(admission_ns, queue_ns);
+        Ok(())
     }
 
     /// # Safety
@@ -264,6 +341,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             // attempt. An uncertain accepted WR remains routed while quarantined.
             self.registry
                 .quarantine(id, QuarantineReason::PostUncertain)?;
+            self.notify_child(id, true);
             return Err(error.into());
         }
         Ok(context.expect("successful READ post has a context"))
@@ -285,6 +363,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.post(id, length)?;
             posted += 1;
         }
+        self.notify_child(id, false);
         Ok(posted)
     }
 
@@ -329,6 +408,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
                         "READ CQE queue or native identity mismatch",
                     ))
                 });
+            self.notify_child(route.owner, true);
             return Some(Err(error));
         }
         // SAFETY: A route exists only after the matching native post retained
@@ -342,6 +422,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
                 route.length,
                 record.status == 0,
             )
+            .observed_at(record.observed_at)
         };
         Some(self.complete(route.owner, retired))
     }
@@ -361,11 +442,17 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         } else {
             self.routes.remove(&context);
         }
+        self.notify_child(id, result.is_err());
         result.map_err(Into::into)
     }
     pub(crate) fn reap_child(&mut self, id: ReadOwnerId) -> Result<bool, ReapError<FfiError>> {
-        self.registry
-            .reap_with(id, |bundle| bundle.child_mut()?.reap())
+        let result = self
+            .registry
+            .reap_with(id, |bundle| bundle.child_mut()?.reap());
+        if matches!(result, Ok(true)) {
+            self.progress_watchers.remove(&id);
+        }
+        result
     }
 
     /// First lease stage: stop posting and close the import while keeping the
@@ -407,8 +494,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         &mut self,
         id: ReadOwnerId,
     ) -> Result<bool, ReapError<FfiError>> {
-        self.registry
-            .reap_with(id, |bundle| bundle.child_mut()?.recycle_lease())
+        let result = self
+            .registry
+            .reap_with(id, |bundle| bundle.child_mut()?.recycle_lease());
+        if matches!(result, Ok(true)) {
+            self.progress_watchers.remove(&id);
+        }
+        result
     }
 }
 
@@ -501,6 +593,144 @@ mod tests {
             _ => panic!("expected admission"),
         }
     }
+    fn read_cqe(context: u64, status: i32) -> super::super::ffi::CompletionRecord {
+        super::super::ffi::CompletionRecord {
+            observed_at: Some(std::time::Instant::now()),
+            status,
+            user_ctx: context,
+            local_id: 7,
+            is_jetty: true,
+            user_ctx_valid: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn notifications_keep_early_and_out_of_order_completions_until_observed() {
+        let mut owners = setup();
+        let closes = Rc::new(Cell::new(0));
+        let id = create(&mut owners, closes.clone());
+        let mut updates = owners.subscribe_child_progress(id).unwrap();
+        updates.borrow_and_update();
+        owners.post_batch(id, &[2, 2]).unwrap();
+        let contexts: Vec<_> = owners.routes.keys().copied().collect();
+        owners
+            .route_completion(read_cqe(contexts[1], 0), false)
+            .unwrap()
+            .unwrap();
+        // Updates precede changed(). Coalescing must retain exact progress,
+        // and one CQE must not permit publication of the whole Piece.
+        updates.changed().await.unwrap();
+        let partial = *updates.borrow_and_update();
+        assert_eq!(partial.progress.retired_bytes, 2);
+        assert_eq!(partial.progress.outstanding_wr_count, 1);
+        assert!(!partial.progress.read_succeeded);
+        assert!(owners.publish_child_lease(id).is_err());
+        owners
+            .route_completion(read_cqe(contexts[0], 0), false)
+            .unwrap()
+            .unwrap();
+        updates.changed().await.unwrap();
+        assert!(updates.borrow_and_update().progress.read_succeeded);
+        assert_eq!(owners.usage().bytes, 8);
+        assert_eq!(closes.get(), 0);
+        // A late subscription observes already-completed state immediately.
+        assert!(
+            owners
+                .subscribe_child_progress(id)
+                .unwrap()
+                .borrow()
+                .progress
+                .read_succeeded
+        );
+        owners.retire(id).unwrap();
+        owners.reap_child(id).unwrap();
+        assert!(updates.changed().await.is_ok()); // retirement notification
+        updates.borrow_and_update();
+        assert!(updates.changed().await.is_err()); // sender removed on reap
+    }
+
+    #[tokio::test]
+    async fn failed_cqe_and_shutdown_wake_waiters_without_releasing_dma_resources() {
+        let mut owners = setup();
+        let closes = Rc::new(Cell::new(0));
+        let id = create(&mut owners, closes.clone());
+        let mut updates = owners.subscribe_child_progress(id).unwrap();
+        owners.post_batch(id, &[2, 2]).unwrap();
+        updates.borrow_and_update();
+        let context = *owners.routes.keys().next().unwrap();
+        owners
+            .route_completion(read_cqe(context, -1), false)
+            .unwrap()
+            .unwrap();
+        updates.changed().await.unwrap();
+        assert!(updates.borrow_and_update().progress.failed);
+        assert_eq!(owners.outstanding_completions(), 1);
+        owners.begin_shutdown();
+        updates.changed().await.unwrap();
+        assert!(updates.borrow_and_update().interrupted);
+        assert_eq!(owners.usage().bytes, 8);
+        assert_eq!(owners.reap_child(id), Ok(false));
+        assert_eq!(closes.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_drain_and_retire_interrupt_only_the_matching_waiters() {
+        let mut owners = setup();
+        let other_peer = ReadPeer {
+            id: 2,
+            generation: 1,
+        };
+        owners.activate_peer(other_peer).unwrap();
+        // Fit two distinct peers inside the shared eight-byte destination cap.
+        let spec = ChildSpec {
+            allocation_bytes: 4,
+            ..SPEC
+        };
+        let id = match unsafe {
+            owners.create_child(PEER, spec, || {
+                ChildCreation::Ready(Mock {
+                    closes: Rc::new(Cell::new(0)),
+                })
+            })
+        } {
+            ChildAdmission::Ready(id) => id,
+            _ => panic!("expected admission"),
+        };
+        let other = match unsafe {
+            owners.create_child(other_peer, spec, || {
+                ChildCreation::Ready(Mock {
+                    closes: Rc::new(Cell::new(0)),
+                })
+            })
+        } {
+            ChildAdmission::Ready(id) => id,
+            _ => panic!("expected admission"),
+        };
+        let mut updates = owners.subscribe_child_progress(id).unwrap();
+        let mut other_updates = owners.subscribe_child_progress(other).unwrap();
+        owners.drain_peer(PEER).unwrap();
+        updates.changed().await.unwrap();
+        assert!(updates.borrow_and_update().interrupted);
+        assert!(!other_updates.has_changed().unwrap());
+        owners.retire(other).unwrap();
+        other_updates.changed().await.unwrap();
+        assert!(other_updates.borrow().interrupted);
+    }
+
+    #[test]
+    fn dropping_progress_receiver_does_not_retire_owner_or_credits() {
+        let mut owners = setup();
+        let closes = Rc::new(Cell::new(0));
+        let id = create(&mut owners, closes.clone());
+        let updates = owners.subscribe_child_progress(id).unwrap();
+        owners.post_batch(id, &[4]).unwrap();
+        drop(updates);
+        assert_eq!(owners.outstanding_completions(), 1);
+        assert_eq!(owners.usage().bytes, 8);
+        assert_eq!(closes.get(), 0);
+    }
+
     #[test]
     fn shared_source_and_destination_reservations_charge_one_budget() {
         let mut owners = setup();
@@ -663,6 +893,7 @@ mod tests {
     fn read_cqe_wrong_queue_or_jetty_keeps_wr_routed_and_quarantines_owner() {
         let mut owners = setup();
         let id = create(&mut owners, Rc::new(Cell::new(0)));
+        let updates = owners.subscribe_child_progress(id).unwrap();
         let context = owners.post(id, 4).unwrap();
         let record = super::super::ffi::CompletionRecord {
             status: 0,
@@ -675,6 +906,7 @@ mod tests {
             ..Default::default()
         };
         assert!(owners.route_completion(record, true).unwrap().is_err());
+        assert!(updates.borrow().interrupted);
         assert_eq!(owners.outstanding_completions(), 1);
         assert_eq!(owners.usage().quarantined_entries, 1);
         assert_eq!(owners.reap_child(id), Ok(false));
@@ -727,7 +959,9 @@ mod tests {
             ChildAdmission::Ready(id) => id,
             _ => panic!("expected admission"),
         };
+        let updates = owners.subscribe_child_progress(id).unwrap();
         assert!(owners.post(id, 4).is_err());
+        assert!(updates.borrow().interrupted);
         let user_ctx = context.get();
         assert!(is_read_context(user_ctx));
         assert_eq!(owners.outstanding_completions(), 1);

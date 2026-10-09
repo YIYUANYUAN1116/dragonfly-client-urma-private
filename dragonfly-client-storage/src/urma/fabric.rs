@@ -15,8 +15,9 @@ use super::{
     credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
     runtime::{
-        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadLeaseSpan,
-        ReadSourceAdmission, ReadSourceId, ReadSourceRequest, RuntimeConfig, UrmaRuntime,
+        ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadChildUpdate,
+        ReadLeaseSpan, ReadSourceAdmission, ReadSourceId, ReadSourceRequest, RuntimeConfig,
+        UrmaRuntime,
     },
     Error, Result,
 };
@@ -571,7 +572,22 @@ impl UrmaFabricHandle {
         id: ReadChildId,
         lengths: Vec<u32>,
     ) -> Result<usize> {
-        self.submit(|reply| FabricCommand::PostReadChildBatch { id, lengths, reply })
+        let admission_start = std::time::Instant::now();
+        self.submit(|reply| FabricCommand::PostReadChildBatch {
+            id,
+            lengths,
+            reply,
+            admission_wait_ns: admission_start.elapsed().as_nanos() as u64,
+            enqueued_at: std::time::Instant::now(),
+        })
+        .await
+    }
+
+    pub(crate) async fn subscribe_read_child_progress(
+        &self,
+        id: ReadChildId,
+    ) -> Result<watch::Receiver<ReadChildUpdate>> {
+        self.submit(|reply| FabricCommand::SubscribeReadChildProgress { id, reply })
             .await
     }
 
@@ -1032,6 +1048,8 @@ enum FabricCommand {
     },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
     PostReadChildBatch {
+        admission_wait_ns: u64,
+        enqueued_at: std::time::Instant,
         id: ReadChildId,
         lengths: Vec<u32>,
         reply: oneshot::Sender<Result<usize>>,
@@ -1040,6 +1058,10 @@ enum FabricCommand {
     ReadChildProgress {
         id: ReadChildId,
         reply: oneshot::Sender<Result<ReadChildProgress>>,
+    },
+    SubscribeReadChildProgress {
+        id: ReadChildId,
+        reply: oneshot::Sender<Result<watch::Receiver<ReadChildUpdate>>>,
     },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
     RetireReadChild {
@@ -1238,6 +1260,9 @@ fn run_owner(
                 }
             }
             Err(error) => {
+                if poisoned.is_none() {
+                    runtime.interrupt_read_waiters();
+                }
                 poison_once(&mut poisoned, error.to_string(), &readiness_tx);
                 thread::sleep(PROGRESS_IDLE_INTERVAL);
             }
@@ -1291,9 +1316,25 @@ fn handle_command(
             let _ = reply.send(result);
             OwnerControl::Continue
         }
-        FabricCommand::PostReadChildBatch { id, lengths, reply } => {
+        FabricCommand::PostReadChildBatch {
+            id,
+            lengths,
+            reply,
+            admission_wait_ns,
+            enqueued_at,
+        } => {
+            let queue_wait_ns = enqueued_at.elapsed().as_nanos() as u64;
             let result = reject_if_poisoned(poisoned)
+                .and_then(|()| {
+                    runtime.record_read_post_command_wait(id, admission_wait_ns, queue_wait_ns)
+                })
                 .and_then(|()| runtime.post_read_child_batch(id, &lengths));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::SubscribeReadChildProgress { id, reply } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.subscribe_read_child_progress(id));
             let _ = reply.send(result);
             OwnerControl::Continue
         }

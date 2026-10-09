@@ -80,6 +80,9 @@ impl<R> CreditedChild<R> {
 impl<R: ChildResources> ChildResources for CreditedChild<R> {
     type Wr = CreditedWr<R::Wr>;
     type Lease = R::Lease;
+    fn post_timing(wr: &Self::Wr) -> Option<super::ffi::read::ReadPostTiming> {
+        R::post_timing(&wr.wr)
+    }
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
         let permit = match ReadWrCredits::acquire(&self.credits, self.peer) {
             Ok(permit) => permit,

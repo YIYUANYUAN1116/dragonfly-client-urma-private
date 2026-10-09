@@ -44,9 +44,6 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{debug, instrument, warn};
 
-/// Poll interval for the Child transfer completion wait.
-const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
 type ReadSessionSlot = Arc<tokio::sync::Mutex<Option<Arc<ReadLaneSession>>>>;
 
 /// A persistent READ lane bound to one parent connection.
@@ -283,7 +280,6 @@ impl UrmaReadClient {
             piece_length,
             read_config.max_read_size.as_u64() as u32,
             read_config.max_outstanding_per_peer as usize,
-            COMPLETION_POLL_INTERVAL,
             self.transfer_timeout,
         )
         .map_err(|error| ClientError::Unknown(error.to_string()))?;
@@ -329,6 +325,18 @@ impl UrmaReadClient {
             progress_query_ns = success.timing.progress_query_ns,
             post_command_ns = success.timing.post_command_ns,
             poll_sleep_ns = success.timing.poll_sleep_ns,
+            progress_subscribe_ns = success.timing.progress_subscribe_ns,
+            progress_notification_count = success.timing.progress_notification_count,
+            progress_wait_ns = success.timing.progress_wait_ns,
+            completion_notification_delay_ns = success.timing.completion_notification_delay_ns,
+            cqe_to_observed_ns = success.timing.cqe_to_observed_ns,
+            native_timed_wr_count = success.timing.native.native_timed_wr_count,
+            native_post_call_ns = success.timing.native.native_post_call_ns,
+            native_post_to_cqe_sum_ns = success.timing.native.native_post_to_cqe_sum_ns,
+            native_post_to_cqe_max_ns = success.timing.native.native_post_to_cqe_max_ns,
+            native_read_envelope_ns = success.timing.native.envelope_ns(),
+            post_admission_wait_ns = success.timing.native.post_admission_wait_ns,
+            post_queue_wait_ns = success.timing.native.post_queue_wait_ns,
             lease_publish_ns = success.timing.lease_publish_ns,
             read_done_send_ns = success.timing.read_done_send_ns,
             done_wait_ns = success.timing.done_wait_ns,

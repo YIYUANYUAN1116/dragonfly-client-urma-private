@@ -31,18 +31,7 @@ pub(crate) enum ReadChildAdmission {
     Quarantined { id: ReadChildId, error: Error },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadChildProgress {
-    pub(crate) piece_length: u64,
-    pub(crate) accepted_bytes: u64,
-    pub(crate) retired_bytes: u64,
-    pub(crate) accepted_wr_count: u64,
-    pub(crate) retired_wr_count: u64,
-    pub(crate) outstanding_wr_count: usize,
-    pub(crate) posting_stopped: bool,
-    pub(crate) failed: bool,
-    pub(crate) read_succeeded: bool,
-}
+pub(crate) use super::read_child_owner::{ChildProgress as ReadChildProgress, ReadChildUpdate};
 
 /// CPU-visible span of a published READ destination lease. The registered
 /// buffer itself stays owned by the Child owner on the fabric owner thread;
@@ -931,18 +920,43 @@ mod native {
                     "READ-only runtime is not enabled".into(),
                 ));
             };
-            let progress = owners.child_progress(id.0).map_err(read_dispatch_error)?;
-            Ok(ReadChildProgress {
-                piece_length: progress.piece_length,
-                accepted_bytes: progress.accepted_bytes,
-                retired_bytes: progress.retired_bytes,
-                accepted_wr_count: progress.accepted_wr_count,
-                retired_wr_count: progress.retired_wr_count,
-                outstanding_wr_count: progress.outstanding_wr_count,
-                posting_stopped: progress.posting_stopped,
-                failed: progress.failed,
-                read_succeeded: progress.read_succeeded,
-            })
+            owners.child_progress(id.0).map_err(read_dispatch_error)
+        }
+
+        pub(crate) fn subscribe_read_child_progress(
+            &mut self,
+            id: ReadChildId,
+        ) -> Result<tokio::sync::watch::Receiver<ReadChildUpdate>> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners
+                .subscribe_child_progress(id.0)
+                .map_err(read_dispatch_error)
+        }
+
+        pub(crate) fn record_read_post_command_wait(
+            &mut self,
+            id: ReadChildId,
+            admission_ns: u64,
+            queue_ns: u64,
+        ) -> Result<()> {
+            let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                return Err(Error::InvalidConfiguration(
+                    "READ-only runtime is not enabled".into(),
+                ));
+            };
+            owners
+                .record_post_command_wait(id.0, admission_ns, queue_ns)
+                .map_err(read_dispatch_error)
+        }
+
+        pub(crate) fn interrupt_read_waiters(&mut self) {
+            if let RuntimeReadState::Active { owners, .. } = &mut self.read {
+                owners.interrupt_waiters();
+            }
         }
 
         /// First lease stage: stop posting and close the native import while

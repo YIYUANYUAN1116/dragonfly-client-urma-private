@@ -48,7 +48,6 @@ const MAX_JFS_SGE: u32 = 4;
 const MAX_OUTSTANDING: usize = 8;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_TIMEOUT: Duration = Duration::from_secs(120);
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const CHILD_ROLE_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_CHILD";
 const CONTROL_ADDR_ENV: &str = "DRAGONFLY_URMA_READ_HARNESS_ADDR";
 const TEST_ROLE_ENV: &str = "URMA_TEST_ROLE";
@@ -150,7 +149,6 @@ async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
         PIECE_LENGTH,
         MAX_READ_SIZE,
         MAX_OUTSTANDING,
-        POLL_INTERVAL,
         COMPLETION_TIMEOUT,
     )?;
     let success = unsafe { session.run_transport_only().await }.map_err(|failure| failure.error)?;
