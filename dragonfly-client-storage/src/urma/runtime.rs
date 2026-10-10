@@ -278,7 +278,7 @@ mod native {
         rc::Rc,
         sync::atomic::{AtomicBool, Ordering},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,6 +547,7 @@ mod native {
         completions: CompletionRouter,
         read: RuntimeReadState,
         source_workers: Option<super::super::read_source_workers::SourceWorkers>,
+        orphan_sources: super::super::read_source_workers::OrphanSources,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -717,6 +718,7 @@ mod native {
                 completions: CompletionRouter::new(16)?,
                 read,
                 source_workers: None,
+                orphan_sources: Default::default(),
                 _not_send_sync: PhantomData,
             })
         }
@@ -1055,6 +1057,7 @@ mod native {
             self.source_workers
                 .as_ref()
                 .is_some_and(|workers| workers.pending())
+                || self.orphan_sources.pending()
         }
         pub(crate) unsafe fn submit_source_registration(
             &mut self,
@@ -1168,6 +1171,7 @@ mod native {
                 match (completion.outcome, reply) {
                     (Outcome::Register(registration), Reply::Register(reply)) => {
                         let known_ready = matches!(&registration, Registration::Ready { .. });
+                        let known_rejected = matches!(&registration, Registration::Rejected(_));
                         let result = match registration {
                             Registration::Rejected(error) => {
                                 let _ = owners.reject_worker_source(completion.id);
@@ -1212,14 +1216,15 @@ mod native {
                                 }
                             }
                         };
-                        if reply.send(result).is_err() && known_ready {
-                            // No offer was delivered: no remote capability was
-                            // published. Retire, then revoke asynchronously; never
-                            // release backing just because the receiver disappeared.
+                        if reply.send(result).is_err() && !known_rejected {
                             let id = ReadSourceId(completion.id);
                             let _ = self.retire_read_source(id);
-                            let (reply, _ignored) = tokio::sync::oneshot::channel();
-                            unsafe { self.submit_source_cleanup(id, true, reply) };
+                            self.orphan_sources
+                                .track(completion.id, known_ready, Instant::now());
+                            if !known_ready {
+                                tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
+                                    "unreceived uncertain source retained; independent rollback proof required");
+                            }
                         }
                     }
                     (Outcome::Cleanup(result), Reply::Cleanup(reply)) => {
@@ -1233,16 +1238,49 @@ mod native {
                                     native_error("worker_source_cleanup", error)
                                 }
                             });
+                        if matches!(&result, Ok(true)) {
+                            self.orphan_sources.retired(completion.id);
+                        }
                         let _ = reply.send(result);
+                    }
+                    (Outcome::Cleanup(result), Reply::OrphanCleanup) => {
+                        let result = owners.complete_worker_cleanup(completion.id, result);
+                        if matches!(result, Ok(true)) {
+                            self.orphan_sources.retired(completion.id);
+                        } else {
+                            let terminal =
+                                self.orphan_sources
+                                    .failed(completion.id, Instant::now(), false);
+                            tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
+                                terminal, error = ?result, "unpublished source cleanup incomplete");
+                        }
+                    }
+                    (Outcome::Lost, Reply::OrphanCleanup) => {
+                        let _ = owners.complete_worker_cleanup(
+                            completion.id,
+                            Err(ffi::FfiError::Contract("source worker lost")),
+                        );
+                        self.orphan_sources
+                            .failed(completion.id, Instant::now(), true);
+                        tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
+                            "orphan source worker lost; resources retained without retry");
                     }
                     (Outcome::Lost, Reply::Register(reply)) => {
                         let _ = owners.attach_worker_source(completion.id, completion.worker, true);
-                        let _ = reply.send(Ok(ReadSourceAdmission::Quarantined {
-                            id: ReadSourceId(completion.id),
-                            error: Error::Protocol(
-                                "source worker lost; budget and backing retained".into(),
-                            ),
-                        }));
+                        if reply
+                            .send(Ok(ReadSourceAdmission::Quarantined {
+                                id: ReadSourceId(completion.id),
+                                error: Error::Protocol(
+                                    "source worker lost; budget and backing retained".into(),
+                                ),
+                            }))
+                            .is_err()
+                        {
+                            self.orphan_sources
+                                .track(completion.id, false, Instant::now());
+                            tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
+                                "unreceived lost source retained; independent rollback proof required");
+                        }
                     }
                     (Outcome::Lost, Reply::Cleanup(reply)) => {
                         let _ = owners.complete_worker_cleanup(
@@ -1254,6 +1292,35 @@ mod native {
                         )));
                     }
                     _ => unreachable!("source worker operation/reply mismatch"),
+                }
+            }
+            for id in self.orphan_sources.due(Instant::now()) {
+                let worker = match &mut self.read {
+                    RuntimeReadState::Active { owners, .. } => owners.worker_source(id),
+                    _ => unreachable!("orphan source without READ owners"),
+                };
+                self.orphan_sources.dispatched(id);
+                // Only definitely registered sources whose reply was rejected
+                // enter this queue. Their descriptor/token was never published;
+                // successful unregister under the deployment contract permits release.
+                let submitted = worker.as_ref().is_ok_and(|&worker| unsafe {
+                    self.source_workers.as_mut().unwrap().orphan_cleanup(
+                        id,
+                        worker,
+                        UnregisterPermit::new(id),
+                        SourceRevoked::new(id),
+                    )
+                });
+                if !submitted {
+                    if let RuntimeReadState::Active { owners, .. } = &mut self.read {
+                        let _ = owners.complete_worker_cleanup(
+                            id,
+                            Err(ffi::FfiError::Contract("orphan cleanup worker unavailable")),
+                        );
+                    }
+                    self.orphan_sources.failed(id, Instant::now(), true);
+                    tracing::warn!(source_id = ?id, source_worker_index = ?worker,
+                        "orphan source cleanup unavailable; resources retained without retry");
                 }
             }
         }

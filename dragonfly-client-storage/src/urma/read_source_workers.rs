@@ -129,6 +129,7 @@ pub(crate) struct Completion {
 pub(crate) enum Reply {
     Register(oneshot::Sender<Result<ReadSourceAdmission>>),
     Cleanup(oneshot::Sender<Result<bool>>),
+    OrphanCleanup,
 }
 struct Pending {
     worker: usize,
@@ -139,6 +140,59 @@ struct Worker {
     join: Option<JoinHandle<()>>,
     failed: bool,
 }
+/// Owner-only bookkeeping; entries hold identities, never native resources.
+/// Only definitely registered, unpublished offers may be automatically reaped.
+#[derive(Default)]
+pub(crate) struct OrphanSources {
+    entries: BTreeMap<ReadOwnerId, Orphan>,
+}
+struct Orphan {
+    attempts: usize,
+    next: Option<Instant>,
+    in_flight: bool,
+}
+impl OrphanSources {
+    pub(crate) fn track(&mut self, id: ReadOwnerId, unpublished_ready: bool, now: Instant) {
+        self.entries.entry(id).or_insert(Orphan {
+            attempts: 0,
+            next: unpublished_ready.then_some(now),
+            in_flight: false,
+        });
+    }
+    pub(crate) fn pending(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.in_flight || entry.next.is_some())
+    }
+    pub(crate) fn due(&self, now: Instant) -> Vec<ReadOwnerId> {
+        self.entries
+            .iter()
+            .filter_map(|(&id, entry)| {
+                (!entry.in_flight && entry.next.is_some_and(|next| next <= now)).then_some(id)
+            })
+            .collect()
+    }
+    pub(crate) fn dispatched(&mut self, id: ReadOwnerId) {
+        let entry = self.entries.get_mut(&id).expect("tracked orphan");
+        entry.attempts += 1;
+        entry.next = None;
+        entry.in_flight = true;
+    }
+    /// Returns true when retrying stops. A dead worker must never be retried.
+    pub(crate) fn failed(&mut self, id: ReadOwnerId, now: Instant, worker_lost: bool) -> bool {
+        let entry = self.entries.get_mut(&id).expect("tracked orphan");
+        entry.in_flight = false;
+        let terminal = worker_lost || entry.attempts >= 3;
+        entry.next = (!terminal).then(|| {
+            now + std::time::Duration::from_millis(if entry.attempts <= 1 { 100 } else { 500 })
+        });
+        terminal
+    }
+    pub(crate) fn retired(&mut self, id: ReadOwnerId) {
+        self.entries.remove(&id);
+    }
+}
+
 pub(crate) struct SourceWorkers {
     workers: Vec<Worker>,
     completed: mpsc::Receiver<Completion>,
@@ -292,6 +346,26 @@ impl SourceWorkers {
         reply: oneshot::Sender<Result<bool>>,
     ) -> std::result::Result<(), Reply> {
         let reply = Reply::Cleanup(reply);
+        self.enqueue_cleanup(id, worker, permit, revoked, reply)
+    }
+    pub(crate) fn orphan_cleanup(
+        &mut self,
+        id: ReadOwnerId,
+        worker: usize,
+        permit: UnregisterPermit,
+        revoked: SourceRevoked,
+    ) -> bool {
+        self.enqueue_cleanup(id, worker, permit, Some(revoked), Reply::OrphanCleanup)
+            .is_ok()
+    }
+    fn enqueue_cleanup(
+        &mut self,
+        id: ReadOwnerId,
+        worker: usize,
+        permit: UnregisterPermit,
+        revoked: Option<SourceRevoked>,
+        reply: Reply,
+    ) -> std::result::Result<(), Reply> {
         if self.stopping || self.pending.contains_key(&id) || self.workers[worker].failed {
             return Err(reply);
         }
@@ -312,6 +386,22 @@ impl SourceWorkers {
         Ok(())
     }
     pub(crate) fn completions(&mut self) -> Vec<(Completion, Reply)> {
+        let finished = self.finished_workers();
+        self.complete_finished(finished)
+    }
+    fn finished_workers(&self) -> Vec<usize> {
+        // Snapshot before draining: every completion from these threads has
+        // already been sent. Threads finishing later are handled next poll.
+        self.workers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, worker)| {
+                (!self.stopping && worker.join.as_ref().is_some_and(|join| join.is_finished()))
+                    .then_some(index)
+            })
+            .collect()
+    }
+    fn complete_finished(&mut self, finished: Vec<usize>) -> Vec<(Completion, Reply)> {
         let mut results = Vec::new();
         while let Ok(completion) = self.completed.try_recv() {
             if let Some(pending) = self.pending.remove(&completion.id) {
@@ -319,26 +409,24 @@ impl SourceWorkers {
                 results.push((completion, pending.reply));
             }
         }
-        for (index, worker) in self.workers.iter_mut().enumerate() {
-            if !self.stopping && worker.join.as_ref().is_some_and(|join| join.is_finished()) {
-                worker.failed = true;
-                let ids = self
-                    .pending
-                    .iter()
-                    .filter(|(_, pending)| pending.worker == index)
-                    .map(|(&id, _)| id)
-                    .collect::<Vec<_>>();
-                for id in ids {
-                    let pending = self.pending.remove(&id).unwrap();
-                    results.push((
-                        Completion {
-                            id,
-                            worker: index,
-                            outcome: Outcome::Lost,
-                        },
-                        pending.reply,
-                    ));
-                }
+        for index in finished {
+            self.workers[index].failed = true;
+            let ids = self
+                .pending
+                .iter()
+                .filter(|(_, pending)| pending.worker == index)
+                .map(|(&id, _)| id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                let pending = self.pending.remove(&id).unwrap();
+                results.push((
+                    Completion {
+                        id,
+                        worker: index,
+                        outcome: Outcome::Lost,
+                    },
+                    pending.reply,
+                ));
             }
         }
         results
@@ -482,7 +570,7 @@ mod tests {
             .collect();
         (SourceWorkers::start_factories(factories).unwrap(), gate, rx)
     }
-    fn id() -> ReadOwnerId {
+    fn registry() -> ReadOwnerRegistry<()> {
         let cap = ReadCapacity {
             bytes: 64,
             entries: 8,
@@ -504,7 +592,19 @@ mod tests {
             generation: 1,
         };
         registry.activate_peer(peer).unwrap();
-        registry.reserve(peer, ReadDirection::Source, 8).unwrap()
+        registry
+    }
+    fn id() -> ReadOwnerId {
+        registry()
+            .reserve(
+                ReadPeer {
+                    id: 1,
+                    generation: 1,
+                },
+                ReadDirection::Source,
+                8,
+            )
+            .unwrap()
     }
     fn backing() -> ReadBacking<()> {
         ReadBacking::new(
@@ -539,6 +639,202 @@ mod tests {
         }
         pool.join().unwrap();
     }
+    #[test]
+    fn completion_sent_after_exit_snapshot_is_preserved_before_lost_detection() {
+        let completed_id = id();
+        let lost_id = id();
+        let (completed_tx, completed) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            completed_tx
+                .send(Completion {
+                    id: completed_id,
+                    worker: 0,
+                    outcome: Outcome::Cleanup(Ok(ReapDecision::Retired(unsafe {
+                        VerifiedRetirement::new(completed_id)
+                    }))),
+                })
+                .unwrap();
+            drop(rx);
+            panic!("next operation lost");
+        });
+        let mut pool = SourceWorkers {
+            workers: vec![Worker {
+                tx,
+                join: Some(join),
+                failed: false,
+            }],
+            completed,
+            pending: [
+                (
+                    completed_id,
+                    Pending {
+                        worker: 0,
+                        reply: Reply::OrphanCleanup,
+                    },
+                ),
+                (
+                    lost_id,
+                    Pending {
+                        worker: 0,
+                        reply: Reply::OrphanCleanup,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            next: 0,
+            stopping: false,
+        };
+        let snapshot = pool.finished_workers();
+        assert!(snapshot.is_empty());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pool.stopped() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let results = pool.complete_finished(snapshot);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, completed_id);
+        assert!(matches!(
+            results[0].0.outcome,
+            Outcome::Cleanup(Ok(ReapDecision::Retired(_)))
+        ));
+        let results = pool.completions();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, lost_id);
+        assert!(matches!(results[0].0.outcome, Outcome::Lost));
+        assert!(!pool.pending());
+        assert!(pool.join().is_err());
+    }
+    #[test]
+    fn orphan_cleanup_retries_without_new_requests_then_releases_budget() {
+        let (mut pool, gate, entered) = setup(1);
+        let mut registry = registry();
+        let source = registry
+            .reserve(
+                ReadPeer {
+                    id: 1,
+                    generation: 1,
+                },
+                ReadDirection::Source,
+                8,
+            )
+            .unwrap();
+        registry.attach(source, ()).unwrap();
+        registry.retire(source).unwrap();
+        drop(submit(&mut pool, source));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        gate.unblock();
+        let (completion, reply) = wait(&mut pool, 1).pop().unwrap();
+        assert!(matches!(
+            completion.outcome,
+            Outcome::Register(Registration::Ready { .. })
+        ));
+        let Reply::Register(reply) = reply else {
+            panic!()
+        };
+        assert!(reply.is_closed());
+        let mut orphans = OrphanSources::default();
+        let now = Instant::now();
+        orphans.track(source, true, now);
+        for attempt in 0..2 {
+            let tick = now + Duration::from_secs(attempt);
+            assert_eq!(orphans.due(tick), vec![source]);
+            orphans.dispatched(source);
+            assert!(orphans.due(tick).is_empty());
+            assert!(pool.orphan_cleanup(
+                source,
+                0,
+                unsafe { UnregisterPermit::new(source) },
+                unsafe { SourceRevoked::new(source) }
+            ));
+            let (completion, reply) = wait(&mut pool, 1).pop().unwrap();
+            assert!(matches!(reply, Reply::OrphanCleanup));
+            match completion.outcome {
+                Outcome::Cleanup(Err(_)) if attempt == 0 => {
+                    assert!(registry
+                        .reap_with(source, |_| Err::<ReapDecision, _>(FfiError::Status(-5)))
+                        .is_err());
+                    assert_eq!(registry.usage().source_bytes, 8);
+                    assert!(!orphans.failed(source, tick, false));
+                    assert!(orphans.pending());
+                    assert!(orphans.due(tick).is_empty());
+                }
+                Outcome::Cleanup(Ok(ReapDecision::Retired(proof))) if attempt == 1 => {
+                    assert_eq!(
+                        registry
+                            .reap_with(source, |_| Ok::<_, FfiError>(ReapDecision::Retired(proof))),
+                        Ok(true)
+                    );
+                    assert_eq!(registry.usage().source_bytes, 0);
+                    orphans.retired(source);
+                }
+                _ => panic!("unexpected orphan cleanup result"),
+            }
+        }
+        assert!(!orphans.pending());
+        assert!(orphans.entries.is_empty());
+        finish(&mut pool);
+    }
+    #[test]
+    fn orphan_cleanup_result_survives_worker_stop_and_clears_shutdown_pending() {
+        let (mut pool, gate, entered) = setup(1);
+        let source = id();
+        drop(submit(&mut pool, source));
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        gate.unblock();
+        wait(&mut pool, 1);
+        gate.cleanup_attempts.store(1, Ordering::SeqCst);
+        let mut orphans = OrphanSources::default();
+        orphans.track(source, true, Instant::now());
+        orphans.dispatched(source);
+        assert!(pool.orphan_cleanup(
+            source,
+            0,
+            unsafe { UnregisterPermit::new(source) },
+            unsafe { SourceRevoked::new(source) }
+        ));
+        assert!(orphans.pending());
+        pool.stop();
+        let (completion, reply) = wait(&mut pool, 1).pop().unwrap();
+        assert!(matches!(reply, Reply::OrphanCleanup));
+        assert!(matches!(
+            completion.outcome,
+            Outcome::Cleanup(Ok(ReapDecision::Retired(_)))
+        ));
+        orphans.retired(source);
+        assert!(!orphans.pending());
+        assert!(!pool.pending());
+        finish(&mut pool);
+    }
+
+    #[test]
+    fn orphan_retry_exhaustion_and_uncertainty_stop_progress_without_forgetting_ids() {
+        let mut orphans = OrphanSources::default();
+        let source = id();
+        let uncertain = id();
+        let lost = id();
+        let now = Instant::now();
+        orphans.track(source, true, now);
+        orphans.track(uncertain, false, now);
+        orphans.track(lost, true, now);
+        orphans.dispatched(lost);
+        assert!(orphans.failed(lost, now, true));
+        for attempt in 0..3 {
+            let tick = now + Duration::from_secs(attempt);
+            assert_eq!(orphans.due(tick), vec![source]);
+            orphans.dispatched(source);
+            assert_eq!(orphans.failed(source, tick, false), attempt == 2);
+        }
+        assert!(!orphans.pending());
+        assert!(orphans.due(now + Duration::from_secs(60)).is_empty());
+        assert_eq!(orphans.entries.len(), 3);
+    }
+
     #[test]
     fn blocked_native_calls_overlap_on_distinct_workers_without_blocking_owner() {
         let (mut pool, gate, entered) = setup(2);
