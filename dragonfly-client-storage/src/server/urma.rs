@@ -26,6 +26,7 @@ use crate::urma::read_control::{
     ReadLaneControl,
 };
 use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION, READ_DFUR_VERSION};
+use crate::urma::read_region::{RegionKey, RegionRequest, RegionSession};
 use crate::urma::read_session::ParentSourceSession;
 use crate::urma::rendezvous::{
     write_frame, CapabilityRegistry, CommonPieceRequest, Frame, PieceMetadata, RendezvousError,
@@ -417,6 +418,9 @@ impl UrmaServer {
             }
         });
         let publish_read = read_parent.is_some();
+        let cache_regions = read_parent
+            .as_ref()
+            .is_some_and(|read| read.region_pieces > 1);
         let handler = Arc::new(UrmaServerHandler::new(
             self.storage.clone(),
             self.upload_bandwidth_limiter.clone(),
@@ -467,6 +471,9 @@ impl UrmaServer {
             PublishedCapability(registry.clone())
         });
 
+        if cache_regions {
+            self.storage.bind_read_region_cache(fabric.clone());
+        }
         let mut readiness = fabric.subscribe_readiness();
         let mut connections = JoinSet::new();
         loop {
@@ -541,7 +548,18 @@ impl UrmaServer {
         drop(listener);
         connections.abort_all();
         while connections.join_next().await.is_some() {}
-        fabric.shutdown().await.map_err(client_error)
+        if publish_read {
+            // Idle Regions can be revoked after discovery and accepted lanes
+            // stop. Undrained leases stay retained and make shutdown fail closed.
+            if let Err(error) = unsafe { fabric.close_idle_read_regions().await } {
+                warn!(%error, "READ Region shutdown retained resources");
+            }
+        }
+        let result = fabric.shutdown().await.map_err(client_error);
+        if result.is_ok() && cache_regions {
+            self.storage.unbind_read_region_cache();
+        }
+        result
     }
 }
 
@@ -573,6 +591,9 @@ struct UrmaServerHandler {
 struct ReadParentConfig {
     capability: ReadLaneCapability,
     _revocation_gate: ProviderRevocationValidated,
+    region_pieces: u32,
+    max_regions: usize,
+    source_bytes: u64,
 }
 
 /// Startup evidence that the deployment provider passed the external source
@@ -682,7 +703,7 @@ fn allocate_read_token(space: &ReadTokenSpace) -> ClientResult<u32> {
     }
 }
 
-/// Builds the READ lane capability advertised during the version-5 handshake.
+/// Builds the READ lane capability advertised during the version-6 handshake.
 fn read_parent_config(
     read: &UrmaReadServer,
     fabric: &UrmaFabricHandle,
@@ -700,6 +721,9 @@ fn read_parent_config(
             },
         },
         _revocation_gate: ProviderRevocationValidated,
+        region_pieces: read.region_pieces,
+        max_regions: read.max_regions,
+        source_bytes: read.source_bytes.as_u64(),
     }
 }
 
@@ -768,7 +792,7 @@ impl UrmaServerHandler {
     ) -> ClientResult<()> {
         Span::current().record("remote_address", remote_address.as_str());
         // Version split: RM-READ lanes share the rendezvous MAGIC but speak
-        // DFUR version 5. Peeking keeps the legacy session untouched.
+        // DFUR version 6. Peeking keeps the legacy session untouched.
         if let Some(version) = peek_envelope_version(&stream, self.control_timeout).await? {
             if version == READ_DFUR_VERSION {
                 return self.handle_read_lane(stream, remote_address).await;
@@ -1368,7 +1392,12 @@ impl UrmaServerHandler {
         request: &CommonPieceRequest,
         piece_id: &str,
     ) -> ClientResult<PieceSource> {
-        if self.mmap_content {
+        if self.mmap_content
+            || self
+                .read
+                .as_ref()
+                .is_some_and(|read| read.region_pieces > 1)
+        {
             match self
                 .storage
                 .map_upload_piece(piece_id, &request.task_id, request.kind)
@@ -1403,7 +1432,7 @@ impl UrmaServerHandler {
         Ok(PieceSource::Reader(reader))
     }
 
-    /// Serves one RM-READ lane: version-5 handshake, Child-side Jetty import, and
+    /// Serves one RM-READ lane: version-6 handshake, Child-side Jetty import, and
     /// Child-initiated transfer admission. Only control frames use this TCP
     /// stream; Piece bytes move inside the registered READ budget.
     async fn handle_read_lane(
@@ -1436,6 +1465,17 @@ impl UrmaServerHandler {
             .create_lane(self.peer_config)
             .await
             .map_err(client_error)?;
+        let region_session = match self
+            .fabric
+            .read_region_session(lane_id, session_generation)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.fabric.close_lane(lane_id).await;
+                return Err(client_error(error));
+            }
+        };
         if let Err(error) = write_handshake(
             &mut stream,
             &ReadHandshake::Connected {
@@ -1480,7 +1520,13 @@ impl UrmaServerHandler {
             let transfer_lane = lane.clone();
             transfers.spawn(async move {
                 if let Err(error) = handler
-                    .serve_read_transfer(lane_id, effective_max_read_size, accepted, transfer_lane)
+                    .serve_read_transfer(
+                        lane_id,
+                        region_session,
+                        effective_max_read_size,
+                        accepted,
+                        transfer_lane,
+                    )
                     .await
                 {
                     debug!(%error, "urma READ transfer ended with a Piece-local error");
@@ -1498,7 +1544,69 @@ impl UrmaServerHandler {
             .close_lane(lane_id)
             .await
             .map_err(client_error)?;
+        // close_lane closed the matching target under the startup provider gate.
+        unsafe { self.fabric.drain_read_regions(region_session).await }.map_err(client_error)?;
         self.cleanup_retained_read_sources(lane_id).await
+    }
+
+    /// Select only completed contiguous disk Pieces. Missing neighbours never
+    /// delay the requested Piece; the cache may retain a single-Piece Region.
+    async fn region_range(
+        &self,
+        locator: &crate::urma::read_protocol::ReadPieceLocator,
+        piece: &crate::metadata::Piece,
+        file_length: u64,
+        count: u32,
+    ) -> ClientResult<(u64, u64)> {
+        let single = (piece.offset, piece.length);
+        let first = locator.piece_number / count * count;
+        let Some(last) = first.checked_add(count) else {
+            return Ok(single);
+        };
+        let mut pieces = Vec::new();
+        for number in first..last {
+            let id = self.storage.piece_id(&locator.task_id, number);
+            let Some(next) = self.piece_metadata(locator.kind, &id)? else {
+                return Ok(single);
+            };
+            let ready = next.is_finished()
+                && !self
+                    .storage
+                    .cache
+                    .contains_piece(&locator.task_id, &id)
+                    .await;
+            pieces.push(crate::urma::read_region::RegionPiece {
+                number,
+                offset: next.offset,
+                length: next.length,
+                ready,
+            });
+            if !ready || next.offset.checked_add(next.length) == Some(file_length) {
+                break;
+            }
+        }
+        crate::urma::read_region::select_region(
+            crate::urma::read_region::RegionPiece {
+                number: locator.piece_number,
+                offset: piece.offset,
+                length: piece.length,
+                ready: true,
+            },
+            file_length,
+            &pieces,
+        )
+        .map_err(client_error)
+    }
+
+    async fn map_read_region(
+        &self,
+        locator: &crate::urma::read_protocol::ReadPieceLocator,
+        offset: u64,
+        length: u64,
+    ) -> ClientResult<MappedPiece> {
+        self.storage
+            .map_upload_region(locator.kind, &locator.task_id, offset, length)
+            .await
     }
 
     /// Publishes one Piece as a registered READ source and waits at the
@@ -1508,6 +1616,7 @@ impl UrmaServerHandler {
     async fn serve_read_transfer(
         self: Arc<Self>,
         lane_id: u16,
+        region_session: RegionSession,
         effective_max_read_size: u32,
         accepted: AcceptedReadTransfer,
         lane: Arc<ReadLaneControl>,
@@ -1551,6 +1660,7 @@ impl UrmaServerHandler {
                 piece.length
             )));
         }
+        let identity = accepted.control.identity();
         let (session, locator) = ParentSourceSession::accept(
             self.fabric.clone(),
             lane_id,
@@ -1571,6 +1681,128 @@ impl UrmaServerHandler {
         let source_open_start = Instant::now();
         let source = self.open_piece_source(&source_request, &piece_id).await?;
         let source_open_ns = source_open_start.elapsed().as_nanos() as u64;
+        if let (Some(read), PieceSource::Mapped(mapped)) = (&self.read, &source) {
+            if read.region_pieces > 1 {
+                if let Some((device, inode, file_length)) = mapped.file_identity() {
+                    let (mut offset, mut length) = self
+                        .region_range(&locator, &piece, file_length, read.region_pieces)
+                        .await?;
+                    if length > read.source_bytes {
+                        offset = piece.offset;
+                        length = piece.length;
+                    }
+                    let acquire_start = Instant::now();
+                    let kind = match locator.kind {
+                        PieceKind::Piece => 0,
+                        PieceKind::PersistentPiece => 1,
+                        PieceKind::PersistentCachePiece => 2,
+                    };
+                    let key = RegionKey {
+                        kind,
+                        task_id: locator.task_id.clone(),
+                        device,
+                        inode,
+                        file_length,
+                        offset,
+                        length,
+                    };
+                    let request =
+                        |backing: Option<ReadBacking<()>>| -> ClientResult<RegionRequest> {
+                            Ok(RegionRequest {
+                                session: region_session,
+                                identity,
+                                key: key.clone(),
+                                remote_offset: piece.offset - offset,
+                                piece_length: piece.length,
+                                max_regions: read.max_regions,
+                                token: if backing.is_some() {
+                                    Some(ReadToken::new(next_read_token()?))
+                                } else {
+                                    None
+                                },
+                                backing,
+                            })
+                        };
+                    // Cache hits need no Region mmap or native registration.
+                    let mut admission =
+                        unsafe { self.fabric.acquire_read_region(request(None)?).await };
+                    if matches!(&admission, Ok(None)) {
+                        if let Ok(region_map) = self.map_read_region(&locator, offset, length).await
+                        {
+                            if region_map.file_identity() != Some((device, inode, file_length)) {
+                                return Err(ClientError::Unknown(
+                                    "READ Region backing changed during mapping".into(),
+                                ));
+                            }
+                            admission = unsafe {
+                                self.fabric
+                                    .acquire_read_region(request(Some(ReadBacking::new(
+                                        ReadSourceMemory::Mapped(region_map),
+                                        (),
+                                    )))?)
+                                    .await
+                            };
+                        }
+                    }
+                    match admission {
+                        Ok(Some(offer)) => {
+                            info!(
+                                piece_id,
+                                region_bytes = offer.descriptor.length,
+                                region_offset = piece.offset - offer.remote_offset,
+                                region_cache_hit = offer.cache_hit,
+                                region_cached_bytes = offer.cached_bytes,
+                                region_cached_count = offer.cached_regions,
+                                region_active_leases = offer.active_leases,
+                                region_register_seg_ns = offer.register_stages.seg_ns,
+                                region_register_token_ns = offer.register_stages.token_ns,
+                                region_acquire_ns = acquire_start.elapsed().as_nanos() as u64,
+                                region_generation = offer.segment_generation,
+                                "urma READ Region lease acquired"
+                            );
+                            match unsafe {
+                                session
+                                    .publish_region_and_wait_read_done(offer, self.transfer_timeout)
+                                    .await
+                            } {
+                                Ok((parent, pending)) => {
+                                    collect_upload_piece_traffic_metrics(pending.completed_length);
+                                    info!(
+                                        piece_id,
+                                        source_e2e_ns =
+                                            source_e2e_start.elapsed().as_nanos() as u64,
+                                        source_open_ns,
+                                        wait_read_done_ns = pending.wait_read_done_ns,
+                                        region_generation = pending.segment_generation,
+                                        "urma READ Region Piece fully read; releasing lease"
+                                    );
+                                    // Terminal completion releases only this transfer's lease.
+                                    // Other peers continue using the same registered Region.
+                                    unsafe { parent.revoke_and_finish(pending).await }
+                                        .map_err(client_error)?;
+                                    collect_upload_piece_finished_metrics();
+                                    return Ok(());
+                                }
+                                Err(failure) => {
+                                    // Shared owners are not added to per-lane source cleanup:
+                                    // unregistering one would invalidate every other reader.
+                                    // The exact session's leases stay retained until lane close.
+                                    lane.abort("READ Region transfer failed; retaining lease");
+                                    return Err(client_error(failure.error));
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(piece_id, "READ Region unavailable; using exact Piece")
+                        }
+                        Err(error) => {
+                            lane.abort("READ Region registration or cleanup uncertain");
+                            return Err(client_error(error));
+                        }
+                    }
+                }
+            }
+        }
         let source_copy_start = Instant::now();
         let memory = match source {
             PieceSource::Mapped(mapped) => {
@@ -1599,7 +1831,7 @@ impl UrmaServerHandler {
         let source_copy_ns = source_copy_start.elapsed().as_nanos() as u64;
         let token = ReadToken::new(next_read_token()?);
 
-        // SAFETY: The version-5 handshake authenticated this lane and the
+        // SAFETY: The version-6 handshake authenticated this lane and the
         // accepted length was proven to match the immutable Storage Piece.
         let (parent, pending) = match unsafe {
             session.publish_and_wait_read_done(
@@ -1607,6 +1839,7 @@ impl UrmaServerHandler {
                     peer_id: lane_id,
                     backing: ReadBacking::new(memory, ()),
                     token,
+                    shared: false,
                 },
                 self.transfer_timeout,
             )

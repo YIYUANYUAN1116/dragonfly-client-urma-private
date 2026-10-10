@@ -477,7 +477,12 @@ impl Content {
             // page faults under memory pressure.
             mmap.advise(memmap2::Advice::Sequential).ok();
             mmap.advise(memmap2::Advice::WillNeed).ok();
-            Ok(super::content::MappedPiece::new(mmap))
+            Ok(super::content::MappedPiece::with_file_identity(
+                mmap,
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+            ))
         })
         .await
         .map_err(|err| Error::Unknown(format!("mmap piece task join failed: {err}")))??;
@@ -1524,6 +1529,47 @@ impl Content {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn test_region_mapping_retains_old_inode_after_task_path_replacement() {
+        let dir = tempdir().unwrap();
+        let content = Content::new(Arc::new(Config::default()), dir.path())
+            .await
+            .unwrap();
+        let path = dir.path().join("region-source");
+        std::fs::write(&path, vec![7u8; 8192]).unwrap();
+        let old = content
+            .map_path_range(path.clone(), 4096, 4096)
+            .await
+            .unwrap();
+        let old_identity = old.file_identity().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![9u8; 8192]).unwrap();
+        let new = content
+            .map_path_range(path.clone(), 4096, 4096)
+            .await
+            .unwrap();
+        assert_ne!(old_identity, new.file_identity().unwrap());
+        assert!(old.as_slice().iter().all(|byte| *byte == 7));
+        assert!(new.as_slice().iter().all(|byte| *byte == 9));
+        use crate::urma::ffi::read::source::{ReadBacking, ReadSourceMemory};
+        let direct = ReadBacking::new(ReadSourceMemory::Mapped(old), ());
+        assert_eq!(direct.direct_file_identity(), Some(old_identity));
+        let unaligned = content.map_path_range(path, 1, 4096).await.unwrap();
+        assert_eq!(
+            ReadBacking::new(ReadSourceMemory::Mapped(unaligned), ()).direct_file_identity(),
+            None
+        );
+        assert_eq!(
+            ReadBacking::new(
+                ReadSourceMemory::Bytes(vec![1; 4096].into_boxed_slice()),
+                ()
+            )
+            .direct_file_identity(),
+            None
+        );
+    }
+
     use super::*;
     use crate::content;
     use dragonfly_client_config::dfdaemon::WritebackMode;

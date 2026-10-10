@@ -28,6 +28,7 @@ pub(crate) mod read_owner;
 mod read_owners;
 #[allow(dead_code)]
 pub(crate) mod read_protocol;
+pub(crate) mod read_region;
 #[allow(dead_code)]
 pub(crate) mod read_session;
 #[cfg(test)]

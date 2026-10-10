@@ -73,6 +73,7 @@ pub(crate) enum ChildCreation<R> {
 pub(crate) struct ChildSpec {
     pub(crate) allocation_bytes: u64,
     pub(crate) piece_length: u64,
+    pub(crate) remote_offset: u64,
     pub(crate) jetty_id: u32,
     pub(crate) max_outstanding: usize,
 }
@@ -118,6 +119,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     }
     pub(crate) fn usage(&self) -> ReadUsage {
         self.registry.usage()
+    }
+    pub(crate) fn peer_usage(&self, peer: ReadPeer) -> ReadUsage {
+        self.registry.peer_usage(peer)
     }
     pub(crate) fn peer_drained(&self, peer: ReadPeer) -> bool {
         self.registry.peer_usage(peer).entries == 0
@@ -218,6 +222,17 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     ) -> SourceAdmission<K> {
         // SAFETY: Caller provides native guarantees, shared registry admits bytes.
         unsafe { self.registry.register_source(peer, runtime, backing, token) }
+    }
+    pub(crate) unsafe fn register_shared_source(
+        &mut self,
+        runtime: &mut NativeRuntime,
+        backing: ReadBacking<K>,
+        token: &ReadToken,
+    ) -> SourceAdmission<K> {
+        unsafe {
+            self.registry
+                .register_source_scoped(None, runtime, backing, token)
+        }
     }
     pub(crate) fn source_descriptor(
         &mut self,
@@ -571,6 +586,7 @@ mod tests {
         piece_length: 4,
         jetty_id: 7,
         max_outstanding: 2,
+        remote_offset: 0,
     };
     fn setup() -> ReadOwners<(), Mock> {
         let cap = |bytes, entries| ReadCapacity { bytes, entries };

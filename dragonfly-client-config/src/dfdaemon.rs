@@ -1153,6 +1153,18 @@ pub struct UrmaReadServer {
     )]
     pub quarantine_bytes: ByteSize,
 
+    /// Number of consecutive finished Pieces sharing a Parent registration.
+    /// One preserves per-Piece registration; larger values enable task-scoped
+    /// READ permissions and an on-demand, byte-bounded Region cache.
+    #[serde(default = "default_urma_read_region_pieces")]
+    #[validate(range(min = 1, max = 64))]
+    pub region_pieces: u32,
+
+    /// Maximum cached Parent Regions, including entries pending revocation.
+    #[serde(default = "default_urma_read_max_regions")]
+    #[validate(range(min = 1, max = 65536))]
+    pub max_regions: usize,
+
     /// READ WRs one peer may keep outstanding on one Piece transfer.
     #[serde(default = "default_urma_read_max_outstanding_per_peer")]
     #[validate(range(min = 1, max = 1024))]
@@ -1178,6 +1190,8 @@ impl Default for UrmaReadServer {
     fn default() -> Self {
         Self {
             provider_revocation_validated: false,
+            region_pieces: default_urma_read_region_pieces(),
+            max_regions: default_urma_read_max_regions(),
             total_bytes: default_urma_read_total_bytes(),
             source_bytes: default_urma_read_source_bytes(),
             destination_bytes: default_urma_read_destination_bytes(),
@@ -1190,6 +1204,14 @@ impl Default for UrmaReadServer {
             max_jfs_sge: default_urma_read_max_jfs_sge(),
         }
     }
+}
+
+fn default_urma_read_region_pieces() -> u32 {
+    1
+}
+
+fn default_urma_read_max_regions() -> usize {
+    64
 }
 
 fn default_urma_read_total_bytes() -> ByteSize {
@@ -2207,6 +2229,31 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn urma_read_region_configuration_is_opt_in_and_bounded() {
+        let defaults: UrmaReadServer = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(defaults.region_pieces, 1);
+        let region: UrmaReadServer =
+            serde_yaml::from_str("regionPieces: 8\nmaxRegions: 4").unwrap();
+        assert_eq!(region.region_pieces, 8);
+        assert_eq!(region.max_regions, 4);
+        assert!(region.validate().is_ok());
+        for count in [0, 65] {
+            assert!(UrmaReadServer {
+                region_pieces: count,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(UrmaReadServer {
+            max_regions: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
     use super::*;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;

@@ -176,6 +176,7 @@ pub(crate) struct NativeChild<K> {
     // register/unregister. Buffers from an uncertain creation never re-enter.
     pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
     allocation_bytes: u64,
+    remote_offset: u64,
     buffer_uncertain: bool,
     _keepalive: K,
 }
@@ -202,6 +203,7 @@ impl<K> NativeChild<K> {
             import_uncertain: false,
             pool,
             allocation_bytes,
+            remote_offset: 0,
             buffer_uncertain: false,
             _keepalive: keepalive,
         }
@@ -244,7 +246,10 @@ impl<K> NativeChild<K> {
     ) -> super::read_owners::ChildCreation<Self> {
         use super::read_owners::ChildCreation;
         if spec.piece_length == 0
-            || descriptor.length != spec.piece_length
+            || spec
+                .remote_offset
+                .checked_add(spec.piece_length)
+                .is_none_or(|end| end > descriptor.length)
             || spec.allocation_bytes < spec.piece_length
             || max_read_size == 0
         {
@@ -289,6 +294,7 @@ impl<K> NativeChild<K> {
             import_uncertain: false,
             pool,
             allocation_bytes: spec.allocation_bytes,
+            remote_offset: spec.remote_offset,
             buffer_uncertain,
             _keepalive: keepalive,
         };
@@ -331,6 +337,18 @@ impl<K> NativeChild<K> {
     }
 }
 
+fn segment_request(request: &ReadRequest, piece_offset: u64) -> Result<ReadRequest, FfiError> {
+    let remote_offset = piece_offset
+        .checked_add(request.remote_offset)
+        .ok_or(FfiError::Contract("READ offset overflow"))?;
+    Ok(ReadRequest {
+        local_offset: request.local_offset,
+        remote_offset,
+        length: request.length,
+        user_ctx: request.user_ctx,
+    })
+}
+
 impl<K> ChildResources for NativeChild<K> {
     type Wr = ReadWrHandle;
     type Lease = SegmentHandle;
@@ -355,7 +373,11 @@ impl<K> ChildResources for NativeChild<K> {
                 "shared Jetty is busy",
             )));
         };
-        unsafe { jetty.post_read(&self.target, local, remote, request) }.map(|post| match post {
+        let request = match segment_request(request, self.remote_offset) {
+            Ok(request) => request,
+            Err(error) => return Ok(ChildPost::Rejected(error)),
+        };
+        unsafe { jetty.post_read(&self.target, local, remote, &request) }.map(|post| match post {
             ReadPost::Posted(wr) => ChildPost::Posted(wr),
             ReadPost::Rejected(error) => ChildPost::Rejected(error),
             ReadPost::Uncertain { wr, error } => ChildPost::Uncertain(wr, error),
@@ -686,6 +708,33 @@ impl<R: ChildResources> ChildOwner<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_request_uses_region_piece_offset_for_every_wr() {
+        let remote: Vec<u8> = (0..96).collect();
+        let mut local = vec![0; 32];
+        for (offset, length) in [(0, 13), (13, 13), (26, 6)] {
+            let request = ReadRequest {
+                local_offset: offset,
+                remote_offset: offset,
+                length,
+                user_ctx: offset + 1,
+            };
+            let posted = segment_request(&request, 32).unwrap();
+            let src = posted.remote_offset as usize;
+            let dst = posted.local_offset as usize;
+            local[dst..dst + length as usize].copy_from_slice(&remote[src..src + length as usize]);
+            assert_eq!(posted.user_ctx, offset + 1);
+        }
+        assert_eq!(local, remote[32..64]);
+        let request = ReadRequest {
+            local_offset: 0,
+            remote_offset: 1,
+            length: 1,
+            user_ctx: 1,
+        };
+        assert!(segment_request(&request, u64::MAX).is_err());
+    }
+
     use super::*;
     use crate::urma::read_owner::{
         ReadBudget, ReadCapacity, ReadDirection, ReadOwnerRegistry, ReadPeer,

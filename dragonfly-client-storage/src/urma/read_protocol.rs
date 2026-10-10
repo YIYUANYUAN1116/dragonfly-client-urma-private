@@ -14,7 +14,7 @@ use crate::{
 use std::collections::{HashSet, VecDeque};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) const READ_DFUR_VERSION: u8 = 5;
+pub(crate) const READ_DFUR_VERSION: u8 = 6;
 pub(crate) const READ_DESCRIPTOR_VERSION: u32 = 1;
 const EID_LENGTH: usize = 16;
 
@@ -58,7 +58,7 @@ impl<'a> WireReader<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub(crate) struct ReadTransferIdentity {
     pub(crate) session_generation: u64,
     pub(crate) transfer_id: u32,
@@ -156,6 +156,8 @@ pub(crate) struct ReadSegmentOffer {
     /// READ wire has no separate metadata frame, so the offer carries the
     /// download position back to the Child alongside the descriptor.
     pub(crate) piece_offset: u64,
+    pub(crate) remote_offset: u64,
+    pub(crate) piece_length: u64,
     /// Piece digest recorded by the Parent's Storage. Empty means the Parent
     /// has no digest for this Piece and the Child skips the integrity check.
     pub(crate) digest: String,
@@ -178,6 +180,11 @@ impl ReadSegmentOffer {
     fn validate(&self) -> Result<()> {
         if self.descriptor_version != READ_DESCRIPTOR_VERSION
             || self.length == 0
+            || self.piece_length == 0
+            || self
+                .remote_offset
+                .checked_add(self.piece_length)
+                .is_none_or(|end| end > self.length)
             || self.segment_generation == 0
             || self.effective_max_read_size == 0
         {
@@ -199,6 +206,8 @@ impl ReadSegmentOffer {
         payload.extend_from_slice(&self.segment_generation.to_be_bytes());
         payload.extend_from_slice(&self.effective_max_read_size.to_be_bytes());
         payload.extend_from_slice(&self.piece_offset.to_be_bytes());
+        payload.extend_from_slice(&self.remote_offset.to_be_bytes());
+        payload.extend_from_slice(&self.piece_length.to_be_bytes());
         put_bytes(payload, self.digest.as_bytes());
     }
 
@@ -219,6 +228,8 @@ impl ReadSegmentOffer {
             segment_generation: reader.u64()?,
             effective_max_read_size: reader.u32()?,
             piece_offset: reader.u64()?,
+            remote_offset: reader.u64()?,
+            piece_length: reader.u64()?,
             digest: reader.string(MAX_STRING_LENGTH)?,
         };
         offer.validate()?;
@@ -650,6 +661,10 @@ impl ParentReadState {
 
     /// Commits the writer ordering point: after this returns, Cancel without a
     /// segment generation is invalid even if the peer has not read the Offer yet.
+    pub(crate) fn piece_length(&self) -> u64 {
+        self.length
+    }
+
     pub(crate) fn offer_published(&mut self, segment_generation: u64) -> Result<()> {
         require_generation(segment_generation)?;
         if self.phase != ParentPhase::RegisteringSource {
@@ -851,7 +866,7 @@ impl ChildReadState {
 
     fn validate_offer(&self, offer: &ReadSegmentOffer) -> Result<()> {
         offer.validate()?;
-        if offer.length != self.length || offer.effective_max_read_size > self.max_read_size {
+        if offer.piece_length != self.length || offer.effective_max_read_size > self.max_read_size {
             return Err(protocol("SegmentOffer length or READ limit mismatch"));
         }
         Ok(())
@@ -916,6 +931,36 @@ impl ReadTombstones {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn region_offer_round_trip_reads_one_piece_and_checks_remote_bounds() {
+        let mut region = offer(41);
+        region.length = 4 * 64 * 1024;
+        region.remote_offset = 2 * 64 * 1024;
+        let frame = ReadFrame::SegmentOffer {
+            identity: ID,
+            offer: region.clone(),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        write_read_frame(&mut writer, &frame).await.unwrap();
+        assert_eq!(read_read_frame(&mut reader).await.unwrap(), frame);
+        let mut child = ChildReadState::new(ID, 64 * 1024, 4096).unwrap();
+        assert_eq!(child.on_frame(&frame).unwrap(), ChildAction::StartRead);
+        for (offset, length) in [(region.length, 1), (u64::MAX, 2), (0, 0)] {
+            let mut invalid = region.clone();
+            invalid.remote_offset = offset;
+            invalid.piece_length = length;
+            assert!(invalid.validate().is_err());
+        }
+        region.piece_length = 32 * 1024;
+        let mut other = ChildReadState::new(ID, 64 * 1024, 4096).unwrap();
+        assert!(other
+            .on_frame(&ReadFrame::SegmentOffer {
+                identity: ID,
+                offer: region
+            })
+            .is_err());
+    }
+
     use super::*;
 
     const ID: ReadTransferIdentity = ReadTransferIdentity {
@@ -939,6 +984,8 @@ mod tests {
             effective_max_read_size: 4096,
             piece_offset: 512,
             digest: "crc32:42".into(),
+            remote_offset: 0,
+            piece_length: 64 * 1024,
         }
     }
 

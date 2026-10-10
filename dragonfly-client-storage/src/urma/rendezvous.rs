@@ -96,7 +96,7 @@ impl UrmaCapability {
 pub struct UrmaAdvertisement {
     pub capability: UrmaCapability,
     pub port: u16,
-    /// Rendezvous port serving the RM-READ data plane (DFUR version 5). Zero
+    /// Rendezvous port serving the RM-READ data plane (DFUR version 6). Zero
     /// means the parent has no READ capability; READ and legacy lanes share
     /// the same listener when both are served, so this usually equals `port`.
     pub read_port: u16,

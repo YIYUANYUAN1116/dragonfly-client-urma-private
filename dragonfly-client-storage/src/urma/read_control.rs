@@ -1,4 +1,4 @@
-//! Version 5 READ lane handshake and transfer dispatcher.
+//! Version 6 READ lane handshake and transfer dispatcher.
 //!
 //! Handshake ownership stays outside the dispatcher so native lane creation and
 //! rollback remain explicit. After handshake, one reader and writer task route
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_five_handshake_round_trips_and_echoes_session_generation() {
+    async fn version_six_handshake_round_trips_and_echoes_session_generation() {
         let frame = ReadHandshake::Connect {
             capability: capability(),
             session_generation: 41,

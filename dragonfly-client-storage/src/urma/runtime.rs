@@ -16,6 +16,7 @@ pub(crate) struct ReadChildRequest {
     pub(crate) peer_id: u16,
     pub(crate) allocation_bytes: u64,
     pub(crate) piece_length: u64,
+    pub(crate) remote_offset: u64,
     pub(crate) max_outstanding: usize,
     pub(crate) descriptor: ReadDescriptor,
     pub(crate) token: ReadToken,
@@ -53,10 +54,17 @@ pub(crate) struct ReadSourceRequest {
     pub(crate) peer_id: u16,
     pub(crate) backing: ReadBacking<()>,
     pub(crate) token: ReadToken,
+    pub(crate) shared: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadSourceId(ReadOwnerId);
+#[cfg(test)]
+impl ReadSourceId {
+    pub(crate) fn mock(id: ReadOwnerId) -> Self {
+        Self(id)
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)] // Consumed by the gated READ session state machine.
@@ -539,6 +547,9 @@ mod native {
         peers: HashMap<u16, PeerTarget>,
         completions: CompletionRouter,
         read: RuntimeReadState,
+        regions: super::super::read_region::RegionCache,
+        region_source_limit: ReadCapacity,
+        region_peer_limit: ReadCapacity,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -651,6 +662,20 @@ mod native {
 
             debug_assert_eq!(send_jfc.kind(), JfcKind::Send);
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
+            let empty = ReadCapacity {
+                bytes: 0,
+                entries: 0,
+            };
+            let region_source_limit = config
+                .read
+                .as_ref()
+                .map(|r| r.budget.source)
+                .unwrap_or(empty);
+            let region_peer_limit = config
+                .read
+                .as_ref()
+                .map(|r| r.budget.per_peer_source)
+                .unwrap_or(empty);
             let read = match config.read {
                 Some(read) => {
                     let credits = match ReadWrCredits::new(
@@ -708,6 +733,9 @@ mod native {
                 peers: HashMap::new(),
                 completions: CompletionRouter::new(16)?,
                 read,
+                regions: super::super::read_region::RegionCache::default(),
+                region_source_limit,
+                region_peer_limit,
                 _not_send_sync: PhantomData,
             })
         }
@@ -870,6 +898,7 @@ mod native {
                 piece_length: request.piece_length,
                 jetty_id,
                 max_outstanding: request.max_outstanding,
+                remote_offset: request.remote_offset,
             };
             // SAFETY: The caller provides authenticated descriptor/generation
             // and exact Piece ownership; runtime supplies the retained handles,
@@ -1030,6 +1059,25 @@ mod native {
                 id: request.peer_id,
                 generation: peer.generation(),
             };
+            if !request.shared {
+                let (leased_bytes, leased_entries) = self.regions.peer_usage(read_peer);
+                let exact = match &self.read {
+                    RuntimeReadState::Active { owners, .. } => owners.peer_usage(read_peer),
+                    _ => return Err(Error::Protocol("READ runtime disabled".into())),
+                };
+                if request.backing.len()
+                    > self
+                        .region_peer_limit
+                        .bytes
+                        .saturating_sub(leased_bytes.saturating_add(exact.source_bytes))
+                    || leased_entries.saturating_add(exact.source_entries)
+                        >= self.region_peer_limit.entries
+                {
+                    return Err(Error::Protocol(
+                        "Parent per-peer source capacity exhausted".into(),
+                    ));
+                }
+            }
             let native = self
                 .native
                 .as_mut()
@@ -1042,7 +1090,12 @@ mod native {
             let ReadSourceRequest { backing, token, .. } = request;
             // SAFETY: The caller supplies immutable exact-range backing and
             // authenticated generation; the owner registry supplies admission.
-            match unsafe { owners.register_source(read_peer, native, backing, &token) } {
+            let admission = if request.shared {
+                unsafe { owners.register_shared_source(native, backing, &token) }
+            } else {
+                unsafe { owners.register_source(read_peer, native, backing, &token) }
+            };
+            match admission {
                 SourceAdmission::Registered(id) => match owners.source_descriptor(id) {
                     Ok(descriptor) => Ok(ReadSourceAdmission::Ready(ReadSourceOffer {
                         id: ReadSourceId(id),
@@ -1073,6 +1126,322 @@ mod native {
                     error: native_error("register_read_source", error),
                 }),
             }
+        }
+
+        pub(crate) fn read_region_session(
+            &self,
+            peer_id: u16,
+            generation: u64,
+        ) -> Result<super::super::read_region::RegionSession> {
+            if generation == 0 {
+                return Err(Error::Protocol("zero Region session generation".into()));
+            }
+            let peer = self
+                .peers
+                .get(&peer_id)
+                .ok_or_else(|| Error::Protocol("unknown Region peer".into()))?;
+            if peer.is_draining() {
+                return Err(Error::Protocol("Region peer draining".into()));
+            }
+            Ok(super::super::read_region::RegionSession {
+                peer: ReadPeer {
+                    id: peer_id,
+                    generation: peer.generation(),
+                },
+                generation,
+            })
+        }
+
+        /// Registers once on the owner thread; queued concurrent requests hit
+        /// the same entry. Dropped replies retain their lease until lane cleanup.
+        /// # Safety
+        /// Finished immutable task ranges and the deployment revocation gate
+        /// must be validated before enabling this cache.
+        pub(crate) unsafe fn acquire_read_region(
+            &mut self,
+            request: super::super::read_region::RegionRequest,
+        ) -> Result<Option<super::super::read_region::RegionOffer>> {
+            use super::super::read_region::RegionEntry;
+            if !self.accepting {
+                return Err(Error::Protocol("Region admission stopped".into()));
+            }
+            let peer = self
+                .peers
+                .get(&request.session.peer.id)
+                .ok_or_else(|| Error::Protocol("unknown Region peer".into()))?;
+            if peer.is_draining() {
+                return Err(Error::Protocol("Region peer draining".into()));
+            }
+            let read_peer = ReadPeer {
+                id: request.session.peer.id,
+                generation: peer.generation(),
+            };
+            if read_peer != request.session.peer
+                || request.identity.session_generation != request.session.generation
+            {
+                return Err(Error::Protocol(
+                    "Region peer/session generation mismatch".into(),
+                ));
+            }
+            let key = &request.key;
+            let end = key.offset.checked_add(key.length);
+            if request.max_regions == 0
+                || key.length == 0
+                || request
+                    .backing
+                    .as_ref()
+                    .is_some_and(|backing| key.length != backing.len())
+                || end.is_none_or(|end| end > key.file_length)
+                || request
+                    .remote_offset
+                    .checked_add(request.piece_length)
+                    .is_none_or(|end| end > key.length)
+            {
+                return Err(Error::Protocol(
+                    "invalid Region backing or Piece bounds".into(),
+                ));
+            }
+            if request.backing.as_ref().is_some_and(|backing| {
+                backing.direct_file_identity() != Some((key.device, key.inode, key.file_length))
+            }) {
+                // Clean fallback for unaligned or copied buffers. Only a retained
+                // file map makes device/inode a stable cache identity.
+                return Ok(None);
+            }
+            let usage = match &self.read {
+                RuntimeReadState::Active { owners, .. } => owners.peer_usage(read_peer),
+                _ => return Err(Error::Protocol("READ runtime disabled".into())),
+            };
+            let lease_limit = ReadCapacity {
+                bytes: self
+                    .region_peer_limit
+                    .bytes
+                    .saturating_sub(usage.source_bytes),
+                entries: self
+                    .region_peer_limit
+                    .entries
+                    .saturating_sub(usage.source_entries),
+            };
+            let (leased_bytes, leased_entries) = self.regions.peer_usage(read_peer);
+            if request.piece_length > lease_limit.bytes.saturating_sub(leased_bytes)
+                || leased_entries >= lease_limit.entries
+            {
+                return Ok(None);
+            }
+            self.regions.check_lease(
+                request.identity,
+                read_peer,
+                request.piece_length,
+                lease_limit,
+            )?;
+            let containing = if self.regions.entries.contains_key(key) {
+                Some(key.clone())
+            } else {
+                self.regions
+                    .containing(key, request.remote_offset, request.piece_length)
+            };
+            let remote_offset = match &containing {
+                Some(cached) => key.offset + request.remote_offset - cached.offset,
+                None => request.remote_offset,
+            };
+            let hit = containing.is_some();
+            let key = containing.unwrap_or_else(|| key.clone());
+            let key = &key;
+            if !hit {
+                let Some(backing) = request.backing else {
+                    return Ok(None);
+                };
+                let token = request
+                    .token
+                    .ok_or_else(|| Error::Protocol("Region registration token missing".into()))?;
+                if key.length > self.region_source_limit.bytes {
+                    return Ok(None);
+                }
+                // Do not upgrade overlapping single-Piece registrations while
+                // a transfer still uses them. Idle overlaps are revoked first.
+                let overlaps = self
+                    .regions
+                    .entries
+                    .keys()
+                    .filter(|other| key.overlaps(other))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if overlaps.iter().any(|other| !self.regions.idle(other)) {
+                    return Ok(None);
+                }
+                for other in overlaps {
+                    unsafe {
+                        self.evict_read_region(&other)?;
+                    }
+                }
+                loop {
+                    let usage = match &self.read {
+                        RuntimeReadState::Active { owners, .. } => owners.usage(),
+                        _ => return Err(Error::Protocol("READ runtime disabled".into())),
+                    };
+                    if self.regions.entries.len() + self.regions.uncertain_sources.len()
+                        < request.max_regions
+                        && key.length
+                            <= self
+                                .region_source_limit
+                                .bytes
+                                .saturating_sub(usage.source_bytes)
+                        && usage.source_entries < self.region_source_limit.entries
+                    {
+                        break;
+                    }
+                    let Some(victim) = self.regions.idle_lru() else {
+                        return Ok(None);
+                    };
+                    unsafe {
+                        self.evict_read_region(&victim)?;
+                    }
+                }
+                let generation = super::super::read_session::next_segment_generation()?;
+                let source = match unsafe {
+                    self.register_read_source(ReadSourceRequest {
+                        peer_id: request.session.peer.id,
+                        backing,
+                        token,
+                        shared: true,
+                    })
+                }? {
+                    ReadSourceAdmission::Ready(source) => source,
+                    ReadSourceAdmission::Quarantined { id, error } => {
+                        // No usable descriptor exists. Keep the identity reachable
+                        // for provider recovery as well as the registry's backing
+                        // and charge; never invent a rollback proof at shutdown.
+                        self.regions.uncertain_sources.push((key.clone(), id));
+                        return Err(error);
+                    }
+                };
+                self.regions.entries.insert(
+                    key.clone(),
+                    RegionEntry {
+                        source,
+                        generation,
+                        accepting: true,
+                        last_used: 0,
+                    },
+                );
+            }
+            if !hit {
+                tracing::debug!(region_bytes = key.length, "urma READ Region registered");
+            }
+            self.regions
+                .acquire(
+                    key,
+                    request.identity,
+                    read_peer,
+                    remote_offset,
+                    request.piece_length,
+                    hit,
+                )
+                .map(Some)
+        }
+
+        /// # Safety
+        /// ReadDone/CancelDrained must cover this exact transfer's WRs and import.
+        pub(crate) unsafe fn release_read_region(
+            &mut self,
+            offer: &super::super::read_region::RegionOffer,
+        ) -> Result<()> {
+            self.regions.release(offer)
+        }
+
+        /// # Safety
+        /// The matching lane has closed its target under the validated provider
+        /// contract. A TCP timeout alone does not authorize this operation.
+        pub(crate) unsafe fn drain_read_regions(
+            &mut self,
+            session: super::super::read_region::RegionSession,
+        ) -> Result<()> {
+            self.regions.release_session(session);
+            Ok(())
+        }
+
+        unsafe fn evict_read_region(
+            &mut self,
+            key: &super::super::read_region::RegionKey,
+        ) -> Result<()> {
+            let id = self.regions.begin_eviction(key)?;
+            self.retire_read_source(id)?;
+            // SAFETY: All known leases drained; caller supplies the deployment's
+            // synchronous revoke contract, including access with stale tokens.
+            unsafe {
+                self.unregister_read_source(id)?;
+                if !self.release_read_source_after_revoke(id)? {
+                    return Err(Error::Protocol("Region revoke pending".into()));
+                }
+            }
+            // Native cleanup failures leave the non-accepting entry and charge.
+            self.regions.finish_eviction(key, id)?;
+            tracing::debug!(region_bytes = key.length, "urma READ Region evicted");
+            Ok(())
+        }
+
+        /// Stops new leases for this task, and revokes only idle Regions.
+        /// # Safety
+        /// The deployment provider's synchronous revoke contract must hold.
+        pub(crate) unsafe fn invalidate_read_regions(
+            &mut self,
+            kind: u8,
+            task_id: &str,
+        ) -> Result<bool> {
+            let keys = self
+                .regions
+                .entries
+                .keys()
+                .filter(|key| key.kind == kind && key.task_id == task_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in &keys {
+                self.regions.entries.get_mut(key).unwrap().accepting = false;
+            }
+            let mut ready = !self
+                .regions
+                .uncertain_sources
+                .iter()
+                .any(|(key, _)| key.kind == kind && key.task_id == task_id);
+            for key in keys {
+                if self.regions.idle(&key) {
+                    unsafe {
+                        self.evict_read_region(&key)?;
+                    }
+                } else {
+                    ready = false;
+                }
+            }
+            Ok(ready)
+        }
+
+        /// # Safety
+        /// Provider revocation gate applies. Shutdown never treats abandoned
+        /// leases as drained; Runtime retains resources if any are still active.
+        pub(crate) unsafe fn close_idle_read_regions(&mut self) -> Result<()> {
+            let keys = self
+                .regions
+                .entries
+                .keys()
+                .filter(|key| self.regions.idle(key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in keys {
+                unsafe {
+                    self.evict_read_region(&key)?;
+                }
+            }
+            if !self.regions.uncertain_sources.is_empty() {
+                return Err(Error::Protocol(
+                    "Region shutdown retains uncertain registrations".into(),
+                ));
+            }
+            if self.regions.has_leases() {
+                return Err(Error::Protocol(
+                    "Region shutdown retains undrained leases".into(),
+                ));
+            }
+            Ok(())
         }
 
         /// Stops descriptor dispatch. This is only the local first step of

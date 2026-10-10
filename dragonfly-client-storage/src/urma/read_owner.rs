@@ -11,6 +11,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+pub(crate) const SHARED_SOURCE_PEER: ReadPeer = ReadPeer {
+    id: 0,
+    generation: 1,
+};
+
 static NEXT_REGISTRY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -289,10 +294,24 @@ impl<T> ReadOwnerRegistry<T> {
         direction: ReadDirection,
         bytes: u64,
     ) -> Result<ReadOwnerId, OwnerError> {
+        self.reserve_scoped(peer, direction, bytes, false)
+    }
+
+    pub(crate) fn reserve_shared_source(&mut self, bytes: u64) -> Result<ReadOwnerId, OwnerError> {
+        self.reserve_scoped(SHARED_SOURCE_PEER, ReadDirection::Source, bytes, true)
+    }
+
+    fn reserve_scoped(
+        &mut self,
+        peer: ReadPeer,
+        direction: ReadDirection,
+        bytes: u64,
+        shared: bool,
+    ) -> Result<ReadOwnerId, OwnerError> {
         if !self.accepting {
             return Err(OwnerError::Shutdown);
         }
-        if !self.peer(peer)?.active {
+        if !shared && !self.peer(peer)?.active {
             return Err(OwnerError::PeerDraining);
         }
         if bytes == 0 {
@@ -322,6 +341,11 @@ impl<T> ReadOwnerRegistry<T> {
                 self.budget.source,
                 self.budget.per_peer_source,
             ),
+        };
+        let peer_limit = if shared {
+            self.budget.source
+        } else {
+            peer_limit
         };
         if bytes > limit.bytes - used
             || bytes > self.budget.total.bytes - usage.bytes
@@ -533,6 +557,26 @@ impl<T> ReadOwnerRegistry<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_source_is_charged_once_and_survives_individual_peer_drain() {
+        let mut registry = registry::<u32>();
+        let shared = registry.reserve_shared_source(48).unwrap();
+        registry.attach(shared, 7).unwrap();
+        assert_eq!(registry.usage().source_bytes, 48);
+        assert_eq!(registry.peer_usage(A).source_bytes, 0);
+        assert_eq!(registry.peer_usage(B).source_bytes, 0);
+        registry.drain_peer(A).unwrap();
+        assert_eq!(*registry.active_owner(shared).unwrap(), 7);
+        assert!(registry.reserve_shared_source(17).is_err());
+        registry.begin_shutdown();
+        assert!(registry.active_owner(shared).is_err());
+        assert!(registry.reserve_shared_source(1).is_err());
+        registry
+            .reap_with(shared, |_| Ok::<_, ()>(proof(shared)))
+            .unwrap();
+        assert_eq!(registry.usage().source_bytes, 0);
+    }
+
     use super::*;
     use std::{cell::Cell, rc::Rc};
 

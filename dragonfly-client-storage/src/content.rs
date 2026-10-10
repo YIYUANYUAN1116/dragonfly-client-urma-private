@@ -51,12 +51,41 @@ pub const MAX_BUFFER_POOL_IDLE_BUFFERS: usize = 128;
 #[cfg(feature = "urma")]
 pub struct MappedPiece {
     mmap: memmap2::Mmap,
+    file_identity: Option<(u64, u64, u64)>,
+    gc_pin: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 #[cfg(feature = "urma")]
 impl MappedPiece {
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn new(mmap: memmap2::Mmap) -> Self {
-        Self { mmap }
+        Self {
+            mmap,
+            file_identity: None,
+            gc_pin: None,
+        }
+    }
+
+    pub(crate) fn with_file_identity(
+        mmap: memmap2::Mmap,
+        device: u64,
+        inode: u64,
+        length: u64,
+    ) -> Self {
+        Self {
+            mmap,
+            file_identity: Some((device, inode, length)),
+            gc_pin: None,
+        }
+    }
+
+    pub(crate) fn with_gc_pin(mut self, pin: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        self.gc_pin = Some(pin);
+        self
+    }
+
+    pub(crate) fn file_identity(&self) -> Option<(u64, u64, u64)> {
+        self.file_identity
     }
 
     pub fn as_slice(&self) -> &[u8] {

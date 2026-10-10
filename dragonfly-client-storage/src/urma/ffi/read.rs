@@ -9,6 +9,7 @@ pub(crate) mod source;
 /// Version 1 represents only pinned, non-cacheable, read-only/plain-token source
 /// Segments with no provider extension. An eventual exporter must reject any
 /// context it cannot represent exactly, rather than silently dropping attributes.
+#[derive(Clone)]
 pub(crate) struct ReadDescriptor {
     pub(crate) version: u32,
     pub(crate) eid: [u8; EID_SIZE],
@@ -30,6 +31,7 @@ impl fmt::Debug for ReadDescriptor {
 }
 
 /// Never include the access token in tracing, errors or a derived Debug dump.
+#[derive(Clone)]
 pub(crate) struct ReadToken(u32);
 
 impl ReadToken {

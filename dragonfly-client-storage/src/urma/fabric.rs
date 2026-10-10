@@ -14,6 +14,7 @@ use super::{
     },
     credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
+    read_region::{RegionOffer, RegionRequest, RegionSession},
     runtime::{
         ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadChildUpdate,
         ReadLeaseSpan, ReadSourceAdmission, ReadSourceId, ReadSourceRequest, RuntimeConfig,
@@ -495,6 +496,62 @@ impl UrmaFabricHandle {
     pub fn rx_registered_bytes(&self) -> u64 {
         let pool = &self.inner.runtime_config.buffer_pool;
         u64::try_from(pool.slot_size.saturating_mul(pool.rx_slot_count)).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) async fn read_region_session(
+        &self,
+        peer_id: u16,
+        generation: u64,
+    ) -> Result<RegionSession> {
+        self.submit(|reply| FabricCommand::ReadRegionSession {
+            peer_id,
+            generation,
+            reply,
+        })
+        .await
+    }
+
+    /// # Safety
+    /// Immutable Region backing and provider revocation contract must hold.
+    pub(crate) async unsafe fn acquire_read_region(
+        &self,
+        request: RegionRequest,
+    ) -> Result<Option<RegionOffer>> {
+        self.submit(|reply| FabricCommand::AcquireReadRegion { request, reply })
+            .await
+    }
+    /// # Safety
+    /// This transfer completed all remote reads and unimported its Segment.
+    pub(crate) async unsafe fn release_read_region(&self, offer: RegionOffer) -> Result<()> {
+        self.submit_urgent(|reply| FabricCommand::ReleaseReadRegion { offer, reply })
+            .await
+    }
+    /// # Safety
+    /// Lane target has closed under the provider gate, not just TCP EOF.
+    pub(crate) async unsafe fn drain_read_regions(&self, session: RegionSession) -> Result<()> {
+        self.submit_urgent(|reply| FabricCommand::DrainReadRegions { session, reply })
+            .await
+    }
+    /// # Safety
+    /// Caller installed the deployment's source revocation gate.
+    pub(crate) async unsafe fn invalidate_read_regions(
+        &self,
+        kind: u8,
+        task_id: String,
+    ) -> Result<bool> {
+        self.submit_urgent(|reply| FabricCommand::InvalidateReadRegions {
+            kind,
+            task_id,
+            reply,
+        })
+        .await
+    }
+
+    /// # Safety
+    /// Validated provider revocation contract; active leases remain retained.
+    pub(crate) async unsafe fn close_idle_read_regions(&self) -> Result<()> {
+        self.submit_urgent(|reply| FabricCommand::CloseIdleReadRegions { reply })
+            .await
     }
 
     /// Maximum logical SEND window after dividing the TX reserve across the
@@ -1084,6 +1141,31 @@ enum FabricCommand {
         reply: oneshot::Sender<Result<bool>>,
     },
     #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+    ReadRegionSession {
+        peer_id: u16,
+        generation: u64,
+        reply: oneshot::Sender<Result<RegionSession>>,
+    },
+    AcquireReadRegion {
+        request: RegionRequest,
+        reply: oneshot::Sender<Result<Option<RegionOffer>>>,
+    },
+    ReleaseReadRegion {
+        offer: RegionOffer,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    DrainReadRegions {
+        session: RegionSession,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    InvalidateReadRegions {
+        kind: u8,
+        task_id: String,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    CloseIdleReadRegions {
+        reply: oneshot::Sender<Result<()>>,
+    },
     RegisterReadSource {
         request: ReadSourceRequest,
         reply: oneshot::Sender<Result<ReadSourceAdmission>>,
@@ -1364,6 +1446,44 @@ fn handle_command(
             let result =
                 reject_if_poisoned(poisoned).and_then(|()| runtime.recycle_read_child_lease(id));
             let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ReadRegionSession {
+            peer_id,
+            generation,
+            reply,
+        } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.read_region_session(peer_id, generation));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::AcquireReadRegion { request, reply } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| unsafe { runtime.acquire_read_region(request) });
+            // A dropped receiver does not prove no remote access. Its lease
+            // remains bound to the lane's session until explicit cleanup.
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ReleaseReadRegion { offer, reply } => {
+            let _ = reply.send(unsafe { runtime.release_read_region(&offer) });
+            OwnerControl::Continue
+        }
+        FabricCommand::DrainReadRegions { session, reply } => {
+            let _ = reply.send(unsafe { runtime.drain_read_regions(session) });
+            OwnerControl::Continue
+        }
+        FabricCommand::InvalidateReadRegions {
+            kind,
+            task_id,
+            reply,
+        } => {
+            let _ = reply.send(unsafe { runtime.invalidate_read_regions(kind, &task_id) });
+            OwnerControl::Continue
+        }
+        FabricCommand::CloseIdleReadRegions { reply } => {
+            let _ = reply.send(unsafe { runtime.close_idle_read_regions() });
             OwnerControl::Continue
         }
         FabricCommand::RegisterReadSource { request, reply } => {

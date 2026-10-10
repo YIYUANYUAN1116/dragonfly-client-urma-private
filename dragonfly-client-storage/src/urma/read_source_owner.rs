@@ -142,7 +142,21 @@ impl<T: SourceSlot> ReadOwnerRegistry<T> {
         backing: ReadBacking<T::Keepalive>,
         token: &ReadToken,
     ) -> SourceAdmission<T::Keepalive> {
-        let id = match self.reserve(peer, ReadDirection::Source, backing.len()) {
+        unsafe { self.register_source_scoped(Some(peer), runtime, backing, token) }
+    }
+
+    pub(crate) unsafe fn register_source_scoped(
+        &mut self,
+        peer: Option<ReadPeer>,
+        runtime: &mut NativeRuntime,
+        backing: ReadBacking<T::Keepalive>,
+        token: &ReadToken,
+    ) -> SourceAdmission<T::Keepalive> {
+        let reservation = match peer {
+            Some(peer) => self.reserve(peer, ReadDirection::Source, backing.len()),
+            None => self.reserve_shared_source(backing.len()),
+        };
+        let id = match reservation {
             Ok(id) => id,
             Err(error) => {
                 return SourceAdmission::Rejected {

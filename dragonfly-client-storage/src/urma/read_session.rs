@@ -37,7 +37,7 @@ fn protocol(message: impl Into<String>) -> Error {
     Error::Protocol(message.into())
 }
 
-fn next_segment_generation() -> Result<u64> {
+pub(crate) fn next_segment_generation() -> Result<u64> {
     NEXT_SEGMENT_GENERATION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
@@ -88,6 +88,8 @@ fn wire_offer(
             effective_max_read_size,
             piece_offset,
             digest,
+            remote_offset: 0,
+            piece_length: descriptor.length,
         },
     ))
 }
@@ -361,6 +363,7 @@ impl ChildTransportSession {
                     max_outstanding: self.max_outstanding,
                     descriptor,
                     token,
+                    remote_offset: offer.remote_offset,
                 })
                 .await
         };
@@ -716,8 +719,14 @@ fn validate_progress(progress: ReadChildProgress, piece_length: u64) -> Result<(
     Ok(())
 }
 
-/// Parent adapter stops at the explicit provider-revocation gate. The caller
-/// must not turn ReadDone into the unsafe proof required by source release.
+enum ParentPublication {
+    Piece(ReadSourceRequest),
+    Region(super::read_region::RegionOffer),
+}
+
+/// Parent completion either releases a shared Region lease or crosses the
+/// provider-revocation gate for a dedicated source. ReadDone alone never proves
+/// native revocation; cached backing remains owned until Region eviction.
 pub(crate) struct ParentSourceSession {
     fabric: UrmaFabricHandle,
     lane_id: u16,
@@ -729,6 +738,7 @@ pub(crate) struct ParentSourceSession {
     effective_max_read_size: u32,
     published_source: Option<(ReadSourceId, u64)>,
     awaiting_buffer_ready: bool,
+    region_lease: Option<super::read_region::RegionOffer>,
 }
 
 /// Terminal kind recorded while waiting for ReadDone. `Cancelled` means the
@@ -793,6 +803,7 @@ impl ParentSourceSession {
             effective_max_read_size,
             published_source: None,
             awaiting_buffer_ready: true,
+            region_lease: None,
         })
     }
 
@@ -846,6 +857,7 @@ impl ParentSourceSession {
                 effective_max_read_size,
                 published_source: None,
                 awaiting_buffer_ready: false,
+                region_lease: None,
             },
             request,
         ))
@@ -861,8 +873,34 @@ impl ParentSourceSession {
     /// `request` must hold the authenticated immutable exact-Piece backing for
     /// this transfer and lane.
     pub(crate) async unsafe fn publish_and_wait_read_done(
-        mut self,
+        self,
         request: ReadSourceRequest,
+        completion_timeout: Duration,
+    ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
+        unsafe {
+            self.publish_and_wait(ParentPublication::Piece(request), completion_timeout)
+                .await
+        }
+    }
+
+    /// Region lease completion does not revoke the shared registration.
+    /// # Safety
+    /// The offer is an acquired lease for this exact task transfer; its backing
+    /// remains immutable and the provider revocation gate is validated.
+    pub(crate) async unsafe fn publish_region_and_wait_read_done(
+        self,
+        offer: super::read_region::RegionOffer,
+        completion_timeout: Duration,
+    ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
+        unsafe {
+            self.publish_and_wait(ParentPublication::Region(offer), completion_timeout)
+                .await
+        }
+    }
+
+    async unsafe fn publish_and_wait(
+        mut self,
+        publication: ParentPublication,
         completion_timeout: Duration,
     ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
         let fail =
@@ -870,7 +908,8 @@ impl ParentSourceSession {
                 error,
                 retained_source,
             };
-        if request.peer_id != self.lane_id {
+        if matches!(&publication, ParentPublication::Piece(request) if request.peer_id != self.lane_id)
+        {
             return Err(fail(
                 protocol("Parent source request uses the wrong lane"),
                 None,
@@ -895,21 +934,41 @@ impl ParentSourceSession {
         }
         // SAFETY: Supplied by the method contract and validated state identity.
         let register_start = std::time::Instant::now();
-        let admission = unsafe { self.fabric.register_read_source(request).await };
-        let register_ns = register_start.elapsed().as_nanos() as u64;
-        let offer = match admission {
-            Ok(ReadSourceAdmission::Ready(offer)) => offer,
-            Ok(ReadSourceAdmission::Quarantined { id, error }) => {
-                return Err(fail(
-                    error,
-                    Some(RetainedSourceOwner {
-                        source_id: id,
-                        segment_generation: None,
-                    }),
-                ));
+        let (offer, region_generation) = match publication {
+            ParentPublication::Piece(request) => {
+                match unsafe { self.fabric.register_read_source(request).await } {
+                    Ok(ReadSourceAdmission::Ready(offer)) => (offer, None),
+                    Ok(ReadSourceAdmission::Quarantined { id, error }) => {
+                        return Err(fail(
+                            error,
+                            Some(RetainedSourceOwner {
+                                source_id: id,
+                                segment_generation: None,
+                            }),
+                        ))
+                    }
+                    Err(error) => return Err(fail(error, None)),
+                }
             }
-            Err(error) => return Err(fail(error, None)),
+            ParentPublication::Region(region) => {
+                if region.peer.id != self.lane_id
+                    || region.identity != self.identity
+                    || region.piece_length != self.state.piece_length()
+                {
+                    return Err(fail(protocol("Region lease transfer mismatch"), None));
+                }
+                let offer = ReadSourceOffer {
+                    id: region.source_id,
+                    descriptor: region.descriptor.clone(),
+                    token: region.token.clone(),
+                    register_stages: region.register_stages,
+                };
+                let generation = region.segment_generation;
+                self.region_lease = Some(region);
+                (offer, Some(generation))
+            }
         };
+        let register_ns = register_start.elapsed().as_nanos() as u64;
         let register_stages = offer.register_stages;
         let source_id = offer.id;
         let unpublished = |error: Error| ParentTransportFailure {
@@ -919,11 +978,14 @@ impl ParentSourceSession {
                 segment_generation: None,
             }),
         };
-        let segment_generation = match next_segment_generation() {
+        let segment_generation = match region_generation
+            .map(Ok)
+            .unwrap_or_else(next_segment_generation)
+        {
             Ok(generation) => generation,
             Err(error) => return Err(unpublished(error)),
         };
-        let (source_id, offer) = match wire_offer(
+        let (source_id, mut offer) = match wire_offer(
             offer,
             segment_generation,
             self.effective_max_read_size,
@@ -933,6 +995,10 @@ impl ParentSourceSession {
             Ok(offer) => offer,
             Err(error) => return Err(unpublished(error)),
         };
+        if let Some(region) = &self.region_lease {
+            offer.remote_offset = region.remote_offset;
+            offer.piece_length = region.piece_length;
+        }
         let deadline = Instant::now() + completion_timeout;
         let send_result = tokio::time::timeout_at(
             deadline,
@@ -1029,7 +1095,11 @@ impl ParentSourceSession {
                 }
             }
         };
-        if let Err(error) = self.fabric.retire_read_source(source_id).await {
+        if let Err(error) = if self.region_lease.is_none() {
+            self.fabric.retire_read_source(source_id).await
+        } else {
+            Ok(())
+        } {
             return Err(ParentTransportFailure {
                 error,
                 retained_source: Some(RetainedSourceOwner {
@@ -1068,21 +1138,29 @@ impl ParentSourceSession {
         if self.published_source != Some((pending.source_id, pending.segment_generation)) {
             return Err(protocol("Parent revoke identity mismatch"));
         }
-        // SAFETY: The caller supplies the provider drain proof.
-        if unsafe {
-            self.fabric
-                .unregister_read_source(pending.source_id)
-                .await?
-        } {
-            return Err(protocol("source retired before revocation proof stage"));
-        }
-        // SAFETY: The caller supplies independent remote revocation proof.
-        if !unsafe {
-            self.fabric
-                .release_read_source_after_revoke(pending.source_id)
-                .await?
-        } {
-            return Err(protocol("source remained pending after revocation proof"));
+        if let Some(region) = self.region_lease.take() {
+            // The matching terminal frame confirmed WR drain and Child unimport.
+            // Registration stays live for other transfers and idle cache reuse.
+            unsafe {
+                self.fabric.release_read_region(region).await?;
+            }
+        } else {
+            // SAFETY: The caller supplies the provider drain proof.
+            if unsafe {
+                self.fabric
+                    .unregister_read_source(pending.source_id)
+                    .await?
+            } {
+                return Err(protocol("source retired before revocation proof stage"));
+            }
+            // SAFETY: The caller supplies independent remote revocation proof.
+            if !unsafe {
+                self.fabric
+                    .release_read_source_after_revoke(pending.source_id)
+                    .await?
+            } {
+                return Err(protocol("source remained pending after revocation proof"));
+            }
         }
         match self.state.source_released()? {
             ParentAction::SendDone { segment_generation } => {

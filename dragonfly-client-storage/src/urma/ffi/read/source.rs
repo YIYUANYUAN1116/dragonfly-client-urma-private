@@ -11,7 +11,7 @@ const PROVIDER_PAGE_ALIGNMENT: usize = 4096;
 
 pub(crate) enum ReadSourceMemory {
     Bytes(Box<[u8]>),
-    /// Piece-exact Storage mmap. Page-aligned mappings are registered directly
+    /// Immutable Storage range (one Piece or a cached Region). Page-aligned mappings are registered directly
     /// and retained through verified revocation.
     Mapped(crate::content::MappedPiece),
 }
@@ -40,6 +40,18 @@ pub(crate) struct ReadBacking<K> {
 impl<K> ReadBacking<K> {
     pub(crate) fn len(&self) -> u64 {
         self.memory.bytes().len() as u64
+    }
+
+    /// Cached file Regions require a retained direct map. A copied source would
+    /// no longer retain the inode used in its cache key after unlink.
+    pub(crate) fn direct_file_identity(&self) -> Option<(u64, u64, u64)> {
+        if !self.memory.can_register_directly() {
+            return None;
+        }
+        match &self.memory {
+            ReadSourceMemory::Mapped(mapped) => mapped.file_identity(),
+            _ => None,
+        }
     }
 
     pub(crate) fn new(memory: ReadSourceMemory, keepalive: K) -> Self {

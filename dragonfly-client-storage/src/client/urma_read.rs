@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! RM-READ piece download client (DFUR version 5).
+//! RM-READ piece download client (DFUR version 6).
 //!
 //! One persistent lane per parent carries READ transfers: the Child owns a
 //! fabric-registered destination, sends BufferReady with the Piece locator,
@@ -267,7 +267,7 @@ impl UrmaReadClient {
             piece_number = number,
             "urma READ child starting transfer"
         );
-        // SAFETY: The lane identity was bound to an authenticated version-5
+        // SAFETY: The lane identity was bound to an authenticated version-6
         // handshake and the destination allocation below is exclusively owned
         // by this transfer for its whole lifetime.
         let session = ChildTransportSession::new(

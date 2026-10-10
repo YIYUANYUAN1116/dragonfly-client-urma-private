@@ -151,7 +151,9 @@ impl GC {
         for task in tasks {
             // If the task is expired and not uploading, evict the task.
             if task.is_expired(self.config.gc.policy.task_ttl) {
-                self.storage.delete_task(&task.id).await;
+                if !self.storage.try_delete_task(&task.id).await {
+                    continue;
+                }
                 info!("evict task {}", task.id);
 
                 self.delete_task_from_scheduler(task.clone()).await;
@@ -253,7 +255,9 @@ impl GC {
             }
 
             // Evict the task.
-            self.storage.delete_task(&task.id).await;
+            if !self.storage.try_delete_task(&task.id).await {
+                continue;
+            }
 
             // Update the evicted space.
             evicted_space += task_space;
@@ -288,7 +292,9 @@ impl GC {
         for task in tasks {
             // If the persistent task is expired and not uploading, evict the persistent task.
             if task.is_expired() {
-                self.storage.delete_persistent_task(&task.id).await;
+                if !self.storage.try_delete_persistent_task(&task.id).await {
+                    continue;
+                }
                 info!("evict persistent task {}", task.id);
             }
         }
@@ -368,7 +374,13 @@ impl GC {
         for task in tasks {
             // If the persistent cache task is expired and not uploading, evict the persistent cache task.
             if task.is_expired() {
-                self.storage.delete_persistent_cache_task(&task.id).await;
+                if !self
+                    .storage
+                    .try_delete_persistent_cache_task(&task.id)
+                    .await
+                {
+                    continue;
+                }
                 info!("evict persistent cache task {}", task.id);
             }
         }
@@ -461,7 +473,9 @@ impl GC {
             }
 
             // Evict the task.
-            self.storage.delete_persistent_task(&task.id).await;
+            if !self.storage.try_delete_persistent_task(&task.id).await {
+                continue;
+            }
 
             // Update the evicted space.
             let task_space = task.content_length();
@@ -496,7 +510,13 @@ impl GC {
             }
 
             // Evict the task.
-            self.storage.delete_persistent_cache_task(&task.id).await;
+            if !self
+                .storage
+                .try_delete_persistent_cache_task(&task.id)
+                .await
+            {
+                continue;
+            }
 
             // Update the evicted space.
             let task_space = task.content_length();

@@ -89,6 +89,12 @@ pub struct Storage {
     /// Notifies the waiters of the in-flight pieces when their downloads
     /// complete.
     piece_notifier: PieceNotifier,
+    #[cfg(feature = "urma")]
+    urma_task_locks: std::sync::Mutex<
+        std::collections::HashMap<(u8, String), std::sync::Weak<tokio::sync::RwLock<()>>>,
+    >,
+    #[cfg(feature = "urma")]
+    urma_region_fabric: std::sync::Mutex<Option<crate::urma::fabric::UrmaFabricHandle>>,
 }
 
 /// Implements the storage.
@@ -107,7 +113,110 @@ impl Storage {
             content,
             cache,
             piece_notifier: PieceNotifier::default(),
+            #[cfg(feature = "urma")]
+            urma_task_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "urma")]
+            urma_region_fabric: std::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(feature = "urma")]
+    fn urma_task_lock(
+        &self,
+        kind: crate::rendezvous::PieceKind,
+        task_id: &str,
+    ) -> Arc<tokio::sync::RwLock<()>> {
+        let kind = match kind {
+            crate::rendezvous::PieceKind::Piece => 0,
+            crate::rendezvous::PieceKind::PersistentPiece => 1,
+            crate::rendezvous::PieceKind::PersistentCachePiece => 2,
+        };
+        let mut locks = self.urma_task_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (kind, task_id.to_owned());
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(feature = "urma")]
+    pub(crate) fn bind_read_region_cache(&self, fabric: crate::urma::fabric::UrmaFabricHandle) {
+        *self.urma_region_fabric.lock().unwrap() = Some(fabric);
+    }
+
+    #[cfg(feature = "urma")]
+    pub(crate) fn unbind_read_region_cache(&self) {
+        *self.urma_region_fabric.lock().unwrap() = None;
+    }
+
+    #[cfg(feature = "urma")]
+    async fn prepare_urma_task_gc(
+        &self,
+        kind: crate::rendezvous::PieceKind,
+        task_id: &str,
+    ) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let fabric = self.urma_region_fabric.lock().unwrap().clone();
+        if let Some(fabric) = fabric {
+            let kind_value = match kind {
+                crate::rendezvous::PieceKind::Piece => 0,
+                crate::rendezvous::PieceKind::PersistentPiece => 1,
+                crate::rendezvous::PieceKind::PersistentCachePiece => 2,
+            };
+            // SAFETY: Binding is installed only by the gated READ Parent. Idle
+            // Regions cross that provider's revoke contract; active leases defer GC.
+            match unsafe {
+                fabric
+                    .invalidate_read_regions(kind_value, task_id.to_owned())
+                    .await
+            } {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!(task_id, "defer task GC: READ Region still active");
+                    return None;
+                }
+                Err(error) => {
+                    warn!(task_id, %error, "defer task GC: READ Region revoke failed");
+                    return None;
+                }
+            }
+        }
+        match self.urma_task_lock(kind, task_id).try_write_owned() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                debug!(task_id, "defer task GC: upload mapping still retained");
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "urma")]
+    pub(crate) async fn map_upload_region(
+        &self,
+        kind: crate::rendezvous::PieceKind,
+        task_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<content::MappedPiece> {
+        let pin = self.urma_task_lock(kind, task_id).read_owned().await;
+        let mapped = match kind {
+            crate::rendezvous::PieceKind::Piece => {
+                self.content.map_piece(task_id, offset, length).await
+            }
+            crate::rendezvous::PieceKind::PersistentPiece => {
+                self.content
+                    .map_persistent_piece(task_id, offset, length)
+                    .await
+            }
+            crate::rendezvous::PieceKind::PersistentCachePiece => {
+                self.content
+                    .map_persistent_cache_piece(task_id, offset, length)
+                    .await
+            }
+        }?;
+        Ok(mapped.with_gc_pin(pin))
     }
 
     /// Returns the total space of the disk.
@@ -216,6 +325,19 @@ impl Storage {
     /// Deletes the task metadatas, task content and piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub async fn delete_task(&self, id: &str) {
+        let _ = self.try_delete_task(id).await;
+    }
+
+    /// Returns false when a retained READ source defers eviction. GC callers
+    /// must not account its disk space or remove its scheduler advertisement.
+    pub async fn try_delete_task(&self, id: &str) -> bool {
+        #[cfg(feature = "urma")]
+        let Some(_mapping_guard) = self
+            .prepare_urma_task_gc(crate::rendezvous::PieceKind::Piece, id)
+            .await
+        else {
+            return false;
+        };
         self.metadata
             .delete_task(id)
             .unwrap_or_else(|err| error!("delete task metadata failed: {}", err));
@@ -232,6 +354,7 @@ impl Storage {
         cache.delete_task(id).await.unwrap_or_else(|err| {
             info!("delete task from cache failed: {}", err);
         });
+        true
     }
 
     /// Hard links the persistent task content to the destination.
@@ -381,6 +504,19 @@ impl Storage {
     /// Deletes the persistent task metadatas, persistent task content and piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub async fn delete_persistent_task(&self, id: &str) {
+        let _ = self.try_delete_persistent_task(id).await;
+    }
+
+    /// Returns false when a retained READ source defers eviction. GC callers
+    /// must not account its disk space or remove its scheduler advertisement.
+    pub async fn try_delete_persistent_task(&self, id: &str) -> bool {
+        #[cfg(feature = "urma")]
+        let Some(_mapping_guard) = self
+            .prepare_urma_task_gc(crate::rendezvous::PieceKind::PersistentPiece, id)
+            .await
+        else {
+            return false;
+        };
         self.metadata
             .delete_persistent_task(id)
             .unwrap_or_else(|err| {
@@ -397,6 +533,7 @@ impl Storage {
             .unwrap_or_else(|err| {
                 error!("delete persistent task content failed: {}", err);
             });
+        true
     }
 
     /// Hard links the persistent cache task content to the destination.
@@ -567,6 +704,19 @@ impl Storage {
     /// Deletes the persistent cache task metadatas, persistent cache task content and piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub async fn delete_persistent_cache_task(&self, id: &str) {
+        let _ = self.try_delete_persistent_cache_task(id).await;
+    }
+
+    /// Returns false when a retained READ source defers eviction. GC callers
+    /// must not account its disk space or remove its scheduler advertisement.
+    pub async fn try_delete_persistent_cache_task(&self, id: &str) -> bool {
+        #[cfg(feature = "urma")]
+        let Some(_mapping_guard) = self
+            .prepare_urma_task_gc(crate::rendezvous::PieceKind::PersistentCachePiece, id)
+            .await
+        else {
+            return false;
+        };
         self.metadata
             .delete_persistent_cache_task(id)
             .unwrap_or_else(|err| {
@@ -583,6 +733,7 @@ impl Storage {
             .unwrap_or_else(|err| {
                 error!("delete persistent cache task content failed: {}", err);
             });
+        true
     }
 
     /// Updates the metadata of the cache task and create cache task content
@@ -1298,6 +1449,7 @@ impl Storage {
             ));
         }
 
+        let pin = self.urma_task_lock(kind, task_id).read_owned().await;
         match kind {
             crate::rendezvous::PieceKind::Piece => {
                 self.metadata.upload_task_started(task_id);
@@ -1351,6 +1503,7 @@ impl Storage {
                 }
             }
         }
+        .map(|mapped| mapped.with_gc_pin(pin))
     }
 
     /// Returns the piece metadata.
@@ -2349,6 +2502,81 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn task_gc_defers_until_registered_range_mapping_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(
+            Arc::new(Config::default()),
+            dir.path(),
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let task_id = "region-gc-test";
+        storage.content.create_task(task_id, 8192).await.unwrap();
+        let mapped = storage
+            .map_upload_region(crate::rendezvous::PieceKind::Piece, task_id, 0, 4096)
+            .await
+            .unwrap();
+        assert!(!storage.try_delete_task(task_id).await);
+        assert!(storage.content.map_piece(task_id, 0, 4096).await.is_ok());
+        // Native SourceOwner releases this mapping only after revoke proof.
+        drop(mapped);
+        assert!(storage.try_delete_task(task_id).await);
+        assert!(storage.content.map_piece(task_id, 0, 4096).await.is_err());
+    }
+
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn gc_mapping_pins_are_task_kind_scoped_and_cover_persistent_tasks() {
+        use crate::rendezvous::PieceKind;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(
+            Arc::new(Config::default()),
+            dir.path(),
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        for kind in [
+            PieceKind::Piece,
+            PieceKind::PersistentPiece,
+            PieceKind::PersistentCachePiece,
+        ] {
+            let pin = storage
+                .urma_task_lock(kind, "region-gc-test")
+                .read_owned()
+                .await;
+            let deleted = match kind {
+                PieceKind::Piece => storage.try_delete_task("region-gc-test").await,
+                PieceKind::PersistentPiece => {
+                    storage.try_delete_persistent_task("region-gc-test").await
+                }
+                PieceKind::PersistentCachePiece => {
+                    storage
+                        .try_delete_persistent_cache_task("region-gc-test")
+                        .await
+                }
+            };
+            assert!(!deleted);
+            drop(pin);
+            assert!(storage
+                .prepare_urma_task_gc(kind, "region-gc-test")
+                .await
+                .is_some());
+        }
+        let pin = storage
+            .urma_task_lock(PieceKind::Piece, "same-id")
+            .read_owned()
+            .await;
+        assert!(storage
+            .prepare_urma_task_gc(PieceKind::PersistentPiece, "same-id")
+            .await
+            .is_some());
+        drop(pin);
+    }
 
     fn content_stream(
         content: &'static [u8],
