@@ -13,6 +13,7 @@
 //! never substitute for provider-side revocation evidence.
 
 use super::read_child_owner::{ReadChildUpdate, ReadCompletionTiming};
+use super::read_handoff::ResourceGuard;
 use super::{
     fabric::UrmaFabricHandle,
     ffi::read::{source::ReadSourceStages, ReadDescriptor, ReadToken},
@@ -28,13 +29,22 @@ use super::{
     Error, Result,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::time::{timeout, timeout_at, Duration, Instant};
+use tokio::time::{timeout_at, Duration, Instant};
 use tracing::debug;
 
 static NEXT_SEGMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn protocol(message: impl Into<String>) -> Error {
     Error::Protocol(message.into())
+}
+
+async fn until<T>(
+    deadline: Instant,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    timeout_at(deadline, future)
+        .await
+        .map_err(|_| protocol("Child READ transfer deadline expired"))?
 }
 
 fn next_segment_generation() -> Result<u64> {
@@ -116,6 +126,7 @@ pub(crate) struct ReadTransportResult {
 pub(crate) struct PublishedChildLease {
     pub(crate) child_id: ReadChildId,
     pub(crate) span: ReadLeaseSpan,
+    pub(crate) guard: ResourceGuard,
 }
 
 /// Success outcome of the Child transport adapter including the published
@@ -217,6 +228,8 @@ pub(crate) struct ChildTransportSession {
     allocation_bytes: u64,
     max_outstanding: usize,
     completion_timeout: Duration,
+    deadline: Instant,
+    child_guard: Option<ResourceGuard>,
 }
 
 impl ChildTransportSession {
@@ -252,7 +265,14 @@ impl ChildTransportSession {
             allocation_bytes,
             max_outstanding,
             completion_timeout,
+            deadline: Instant::now() + completion_timeout,
+            child_guard: None,
         })
+    }
+
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Runs one Piece through READ and terminal control, then publishes the
@@ -320,19 +340,19 @@ impl ChildTransportSession {
     > {
         let mut timing = ChildTransportTiming::default();
         let stage_start = Instant::now();
-        self.control
-            .send(ReadFrame::BufferReady {
+        until(
+            self.deadline,
+            self.control.send(ReadFrame::BufferReady {
                 identity: self.identity,
                 accepted_length: self.piece_length,
                 request: self.request.clone(),
-            })
-            .await
-            .map_err(|error| (error, None))?;
+            }),
+        )
+        .await
+        .map_err(|error| (error, None))?;
         timing.buffer_ready_send_ns = stage_start.elapsed().as_nanos() as u64;
         let stage_start = Instant::now();
-        let frame = self
-            .control
-            .receive()
+        let frame = until(self.deadline, self.control.receive())
             .await
             .map_err(|error| (error, None))?;
         timing.segment_offer_wait_ns = stage_start.elapsed().as_nanos() as u64;
@@ -352,26 +372,27 @@ impl ChildTransportSession {
         // SAFETY: The method contract supplies authenticated identity and
         // exclusive destination ownership; the state machine validated Offer.
         let stage_start = Instant::now();
-        let admission = unsafe {
-            self.fabric
-                .create_read_child(ReadChildRequest {
-                    peer_id: self.lane_id,
-                    allocation_bytes: self.allocation_bytes,
-                    piece_length: self.piece_length,
-                    max_outstanding: self.max_outstanding,
-                    descriptor,
-                    token,
-                })
-                .await
-        };
+        let admission = until(self.deadline, unsafe {
+            self.fabric.create_read_child(ReadChildRequest {
+                peer_id: self.lane_id,
+                allocation_bytes: self.allocation_bytes,
+                piece_length: self.piece_length,
+                max_outstanding: self.max_outstanding,
+                descriptor,
+                token,
+            })
+        })
+        .await;
         timing.destination_admission_ns = stage_start.elapsed().as_nanos() as u64;
         let child_id = match admission {
             Ok(ReadChildAdmission::Ready(id)) => id,
             Ok(ReadChildAdmission::Quarantined { id, error }) => {
-                return Err((error, Some(RetainedChildOwner::Cleanup(id))))
+                self.child_guard = Some(self.fabric.child_guard(id));
+                return Err((error, Some(RetainedChildOwner::Cleanup(id))));
             }
             Err(error) => return Err((error, None)),
         };
+        self.child_guard = Some(self.fabric.child_guard(child_id));
         let stage_start = Instant::now();
         let result = match self.drive_reads(child_id, max_read_size).await {
             Ok(result) => result,
@@ -417,12 +438,22 @@ impl ChildTransportSession {
         // Lease flow stage 1: stop posting and close the import while keeping
         // the registered destination buffer and the full budget charge.
         let stage_start = Instant::now();
-        if let Err(error) = self.fabric.drain_read_child_for_lease(child_id).await {
+        if let Err(error) = until(
+            self.deadline,
+            self.fabric.drain_read_child_for_lease(child_id),
+        )
+        .await
+        {
             return Err((error, Some(RetainedChildOwner::Cleanup(child_id))));
         }
         // Stage 2: extract the CPU span of the final READ content. The lease
         // itself stays on the native owner thread until the caller recycles.
-        let span = match self.fabric.publish_read_child_lease(child_id).await {
+        let span = match until(
+            self.deadline,
+            self.fabric.publish_read_child_lease(child_id),
+        )
+        .await
+        {
             Ok(span) => span,
             Err(error) => return Err((error, Some(RetainedChildOwner::Cleanup(child_id)))),
         };
@@ -443,21 +474,22 @@ impl ChildTransportSession {
             }
         };
         let stage_start = Instant::now();
-        if let Err(error) = self
-            .control
-            .send(ReadFrame::ReadDone {
+        if let Err(error) = until(
+            self.deadline,
+            self.control.send(ReadFrame::ReadDone {
                 identity: self.identity,
                 segment_generation: action,
                 completed_length: result.completed_bytes,
                 read_wr_count: result.read_wr_count,
-            })
-            .await
+            }),
+        )
+        .await
         {
             return Err((error, Some(RetainedChildOwner::PublishedLease(child_id))));
         }
         timing.read_done_send_ns = stage_start.elapsed().as_nanos() as u64;
         let done_wait_start = Instant::now();
-        let terminal = match self.control.receive().await {
+        let terminal = match until(self.deadline, self.control.receive()).await {
             Ok(terminal) => terminal,
             Err(error) => return Err((error, Some(RetainedChildOwner::PublishedLease(child_id)))),
         };
@@ -479,7 +511,11 @@ impl ChildTransportSession {
             action,
             piece_offset,
             digest,
-            PublishedChildLease { child_id, span },
+            PublishedChildLease {
+                child_id,
+                span,
+                guard: self.child_guard.take().expect("published child guard"),
+            },
             timing,
         ))
     }
@@ -493,6 +529,7 @@ impl ChildTransportSession {
         child: Option<RetainedChildOwner>,
         error: Error,
     ) -> ChildTransportFailure {
+        let cleanup_deadline = Instant::now() + self.completion_timeout.min(Duration::from_secs(1));
         let Some(child) = child else {
             return ChildTransportFailure {
                 error,
@@ -500,7 +537,12 @@ impl ChildTransportSession {
             };
         };
         if let RetainedChildOwner::PublishedLease(child_id) = child {
-            let retained_child = match self.fabric.recycle_published_child_lease(child_id).await {
+            let retained_child = match until(
+                cleanup_deadline,
+                self.fabric.recycle_published_child_lease(child_id),
+            )
+            .await
+            {
                 Ok(true) => None,
                 Ok(false) | Err(_) => Some(child),
             };
@@ -520,20 +562,26 @@ impl ChildTransportSession {
             _ => None,
         };
         if let Some(generation) = generation {
-            let _ = self
-                .control
-                .send(ReadFrame::Cancel {
+            let _ = until(
+                cleanup_deadline,
+                self.control.send(ReadFrame::Cancel {
                     identity: self.identity,
                     segment_generation: Some(generation),
                     reason: "child READ transport failure".into(),
-                })
-                .await;
+                }),
+            )
+            .await;
         }
-        let counts = match self.fabric.read_child_progress(child_id).await {
+        let counts = match until(cleanup_deadline, self.fabric.read_child_progress(child_id)).await
+        {
             Ok(progress) => drainable_wr_counts(Some(progress)),
             Err(_) => None,
         };
-        let drained = self.fabric.retire_read_child_for_cleanup(child_id).await;
+        let drained = until(
+            cleanup_deadline,
+            self.fabric.retire_read_child_for_cleanup(child_id),
+        )
+        .await;
         let drained = match drained {
             Ok(true) => true,
             Ok(false) | Err(_) => false,
@@ -550,19 +598,20 @@ impl ChildTransportSession {
             }) = self.state.import_drained(accepted, retired)
             {
                 if wire_generation == published_generation
-                    && self
-                        .control
-                        .send(ReadFrame::CancelDrained {
+                    && until(
+                        cleanup_deadline,
+                        self.control.send(ReadFrame::CancelDrained {
                             identity: self.identity,
                             segment_generation: Some(wire_generation),
                             accepted_wr_count: accepted,
                             retired_wr_count: retired,
-                        })
-                        .await
-                        .is_ok()
+                        }),
+                    )
+                    .await
+                    .is_ok()
                 {
-                    let cancelled = timeout(self.completion_timeout, self.control.receive()).await;
-                    if let Ok(Ok(frame)) = cancelled {
+                    let cancelled = until(cleanup_deadline, self.control.receive()).await;
+                    if let Ok(frame) = cancelled {
                         if matches!(self.state.on_frame(&frame), Ok(ChildAction::Cancelled)) {
                             let _ = self.control.finish(Some(wire_generation));
                         }
@@ -584,7 +633,7 @@ impl ChildTransportSession {
         child_id: ReadChildId,
         max_read_size: u32,
     ) -> Result<ReadTransportResult> {
-        let deadline = Instant::now() + self.completion_timeout;
+        let deadline = self.deadline;
         let subscribe_start = Instant::now();
         let progress = timeout_at(
             deadline,
@@ -718,6 +767,13 @@ fn validate_progress(progress: ReadChildProgress, piece_length: u64) -> Result<(
 
 /// Parent adapter stops at the explicit provider-revocation gate. The caller
 /// must not turn ReadDone into the unsafe proof required by source release.
+#[derive(Clone, Copy)]
+pub(crate) enum SourceState {
+    Registered,
+    Retained,
+    Released,
+}
+
 pub(crate) struct ParentSourceSession {
     fabric: UrmaFabricHandle,
     lane_id: u16,
@@ -729,6 +785,8 @@ pub(crate) struct ParentSourceSession {
     effective_max_read_size: u32,
     published_source: Option<(ReadSourceId, u64)>,
     awaiting_buffer_ready: bool,
+    source_guard: Option<ResourceGuard>,
+    on_source_state: Option<std::sync::Arc<dyn Fn(ReadSourceId, SourceState) + Send + Sync>>,
 }
 
 /// Terminal kind recorded while waiting for ReadDone. `Cancelled` means the
@@ -819,11 +877,30 @@ impl ParentSourceSession {
                 effective_max_read_size,
                 published_source: None,
                 awaiting_buffer_ready: false,
+                source_guard: None,
+                on_source_state: None,
             },
             request,
         ))
     }
 
+    pub(crate) fn on_source_state(
+        mut self,
+        callback: impl Fn(ReadSourceId, SourceState) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_source_state = Some(std::sync::Arc::new(callback));
+        self
+    }
+    fn guard_source(&mut self, id: ReadSourceId, ready: bool) {
+        self.source_guard = Some(if let Some(callback) = self.on_source_state.clone() {
+            callback(id, SourceState::Registered);
+            ResourceGuard::new(move || callback(id, SourceState::Retained))
+        } else if ready {
+            self.fabric.source_guard(id)
+        } else {
+            self.fabric.retained_source_guard(id)
+        });
+    }
     /// Registers and publishes a source, then waits until ReadDone or a full
     /// cancel drain requests the provider-specific revoke step. It never
     /// fabricates that proof. Failures return a `ParentTransportFailure`
@@ -873,6 +950,7 @@ impl ParentSourceSession {
         let offer = match admission {
             Ok(ReadSourceAdmission::Ready(offer)) => offer,
             Ok(ReadSourceAdmission::Quarantined { id, error }) => {
+                self.guard_source(id, false);
                 return Err(fail(
                     error,
                     Some(RetainedSourceOwner {
@@ -885,6 +963,7 @@ impl ParentSourceSession {
         };
         let register_stages = offer.register_stages;
         let source_id = offer.id;
+        self.guard_source(source_id, true);
         let unpublished = |error: Error| ParentTransportFailure {
             error,
             retained_source: Some(RetainedSourceOwner {
@@ -906,6 +985,12 @@ impl ParentSourceSession {
             Ok(offer) => offer,
             Err(error) => return Err(unpublished(error)),
         };
+        if self.on_source_state.is_none() {
+            if let Some(guard) = self.source_guard.take() {
+                guard.disarm();
+            }
+            self.source_guard = Some(self.fabric.retained_source_guard(source_id));
+        }
         let deadline = Instant::now() + completion_timeout;
         let send_result = tokio::time::timeout_at(
             deadline,
@@ -1056,6 +1141,12 @@ impl ParentSourceSession {
                 .await?
         } {
             return Err(protocol("source remained pending after revocation proof"));
+        }
+        if let Some(callback) = &self.on_source_state {
+            callback(pending.source_id, SourceState::Released);
+        }
+        if let Some(guard) = self.source_guard.take() {
+            guard.disarm();
         }
         match self.state.source_released()? {
             ParentAction::SendDone { segment_generation } => {
@@ -1293,5 +1384,54 @@ mod tests {
         // The native owner ID cannot be forged here; token redaction and full
         // descriptor round-trip remain covered by read_protocol/ffi tests.
         assert!(format!("{:?}", ReadToken::new(0xfeed_beef)).contains("REDACTED"));
+    }
+    #[tokio::test]
+    async fn offer_and_done_waits_expire_without_losing_the_cancel_route() {
+        use super::super::read_control::ReadLaneControl;
+        let (child_stream, parent_stream) = tokio::io::duplex(4096);
+        let child = ReadLaneControl::spawn(child_stream, 41, 2, 4).unwrap();
+        let parent = ReadLaneControl::spawn(parent_stream, 41, 2, 4).unwrap();
+        for transfer_id in [1, 2] {
+            let identity = ReadTransferIdentity {
+                session_generation: 41,
+                transfer_id,
+                metadata_generation: 100 + u64::from(transfer_id),
+            };
+            let mut child_control = child.register(identity).unwrap();
+            let parent_control = parent.register(identity).unwrap();
+            let error = until(
+                Instant::now() + Duration::from_millis(10),
+                child_control.receive(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("deadline expired"));
+            // Timeout cancels only the wait. The owner can still run the
+            // cancellation exchange rather than losing its transfer route.
+            let frame = ReadFrame::Cancelled {
+                identity,
+                segment_generation: None,
+            };
+            parent_control.send(frame.clone()).await.unwrap();
+            assert_eq!(
+                until(
+                    Instant::now() + Duration::from_secs(1),
+                    child_control.receive()
+                )
+                .await
+                .unwrap(),
+                frame
+            );
+        }
+    }
+    #[tokio::test]
+    async fn stalled_handshake_expires_while_tcp_control_remains_open() {
+        let (mut child, _parent) = tokio::io::duplex(4096);
+        let result = until(
+            Instant::now() + Duration::from_millis(10),
+            super::super::read_control::read_handshake(&mut child),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
     }
 }

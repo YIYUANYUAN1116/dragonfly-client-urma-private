@@ -23,8 +23,9 @@ use crate::urma::read_control::{
     read_handshake, write_handshake, AcceptedReadTransfer, ReadHandshake, ReadLaneCapability,
     ReadLaneControl,
 };
+use crate::urma::read_handoff::ResourceGuard;
 use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION};
-use crate::urma::read_session::ParentSourceSession;
+use crate::urma::read_session::{ParentSourceSession, SourceState};
 use crate::urma::rendezvous::{CapabilityRegistry, UrmaAdvertisement, UrmaCapability};
 use crate::urma::runtime::{ReadSourceId, ReadSourceRequest};
 use crate::urma::server_session_idle_timeout;
@@ -50,16 +51,51 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use dragonfly_client_util::shutdown;
 
-/// Absorbs short scheduler hand-off delays while a completed persistent-lane
-/// Piece releases its process-wide transfer permit. Sustained overload still
-/// receives a transfer-local BUSY response.
+type SourceLedger = Arc<std::sync::Mutex<HashMap<u16, Vec<ReadSourceId>>>>;
+
+fn record_source_state(ledger: &SourceLedger, lane_id: u16, id: ReadSourceId, state: SourceState) {
+    let mut sources = ledger.lock().unwrap();
+    match state {
+        SourceState::Registered => {
+            let entries = sources.entry(lane_id).or_default();
+            if !entries.contains(&id) {
+                entries.push(id);
+            }
+        }
+        SourceState::Released => {
+            if let Some(entries) = sources.get_mut(&lane_id) {
+                entries.retain(|entry| *entry != id);
+            }
+        }
+        // The identity stays in the ledger or its cleanup batch. A late
+        // cancellation must not recreate an identity already fully released.
+        SourceState::Retained => {}
+    }
+}
+
+fn source_cleanup_guard(
+    ledger: SourceLedger,
+    remaining: Arc<std::sync::Mutex<Vec<ReadSourceId>>>,
+    lane_id: u16,
+) -> ResourceGuard {
+    ResourceGuard::new(move || {
+        let pending = remaining.lock().unwrap();
+        let mut ledger = ledger.lock().unwrap();
+        let entries = ledger.entry(lane_id).or_default();
+        for id in pending.iter() {
+            if !entries.contains(id) {
+                entries.push(*id);
+            }
+        }
+    })
+}
 
 fn client_error(error: UrmaError) -> ClientError {
     ClientError::Unknown(error.to_string())
@@ -284,6 +320,21 @@ impl UrmaServer {
         drop(listener);
         connections.abort_all();
         while connections.join_next().await.is_some() {}
+        // Source identities are recorded as soon as registration is claimed,
+        // so cancelled transfer futures cannot hide them from shutdown.
+        let source_lanes: Vec<_> = handler
+            .retained_read_sources
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        for lane_id in source_lanes {
+            let _ = fabric.close_lane(lane_id).await;
+            if let Err(error) = handler.cleanup_retained_read_sources(lane_id).await {
+                warn!(lane_id, %error, "READ shutdown source cleanup incomplete");
+            }
+        }
         fabric.shutdown().await.map_err(client_error)
     }
 }
@@ -301,7 +352,7 @@ struct UrmaServerHandler {
     max_concurrent_transfers: usize,
     /// READ publication parameters with the validated provider gate.
     read: ReadParentConfig,
-    retained_read_sources: Mutex<HashMap<u16, Vec<ReadSourceId>>>,
+    retained_read_sources: SourceLedger,
 }
 
 /// Parent-side READ lane parameters derived from the process configuration.
@@ -453,7 +504,7 @@ impl UrmaServerHandler {
             mmap_content,
             max_concurrent_transfers,
             read,
-            retained_read_sources: Mutex::new(HashMap::new()),
+            retained_read_sources: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -575,11 +626,19 @@ impl UrmaServerHandler {
             let handler = self.clone();
             let transfer_lane = lane.clone();
             transfers.spawn(async move {
-                if let Err(error) = handler
-                    .serve_read_transfer(lane_id, effective_max_read_size, accepted, transfer_lane)
-                    .await
-                {
-                    debug!(%error, "urma READ transfer ended with a Piece-local error");
+                let result = time::timeout(
+                    handler.transfer_timeout,
+                    handler.clone().serve_read_transfer(
+                        lane_id,
+                        effective_max_read_size,
+                        accepted,
+                        transfer_lane.clone(),
+                    ),
+                )
+                .await;
+                if !matches!(&result, Ok(Ok(()))) {
+                    transfer_lane.abort("READ Parent transfer failed or timed out");
+                    debug!(?result, "urma READ transfer failed; retiring lane");
                 }
             });
             while let Some(completed) = transfers.try_join_next() {
@@ -662,6 +721,14 @@ impl UrmaServerHandler {
             effective_max_read_size,
         )
         .map_err(client_error)?;
+        let retained_handler = self.clone();
+        let retained_lane = lane.clone();
+        let session = session.on_source_state(move |id, state| {
+            record_source_state(&retained_handler.retained_read_sources, lane_id, id, state);
+            if matches!(state, SourceState::Retained) {
+                retained_lane.abort("READ source retained after failure or cancellation");
+            }
+        });
         let source_open_start = Instant::now();
         let source = self
             .open_piece_source(locator.kind, &locator.task_id, &piece_id)
@@ -712,15 +779,9 @@ impl UrmaServerHandler {
             Ok(published) => published,
             Err(failure) => {
                 if let Some(retained) = failure.retained_source {
-                    debug!(lane_id, segment_generation = ?retained.segment_generation, "retaining READ source after transport failure");
+                    debug!(lane_id, source_id = ?retained.source_id, segment_generation = ?retained.segment_generation, "retaining READ source after transport failure");
                     // Fail closed: the source stays registered and budgeted
                     // until lane close plus the provider gate proves revocation.
-                    self.retained_read_sources
-                        .lock()
-                        .await
-                        .entry(lane_id)
-                        .or_default()
-                        .push(retained.source_id);
                     lane.abort("READ source retained after transfer failure");
                     warn!(piece_id, "urma READ source owner retained for cleanup");
                 }
@@ -767,31 +828,54 @@ impl UrmaServerHandler {
         let sources = self
             .retained_read_sources
             .lock()
-            .await
+            .unwrap()
             .remove(&lane_id)
             .unwrap_or_default();
+        let remaining = Arc::new(std::sync::Mutex::new(sources.clone()));
+        let restore = source_cleanup_guard(
+            self.retained_read_sources.clone(),
+            remaining.clone(),
+            lane_id,
+        );
         let mut retained = Vec::new();
         let mut first_error = None;
         for source_id in sources {
-            let result = async {
-                let _ = self.fabric.retire_read_source(source_id).await;
-                // SAFETY: The lane target is closed and startup required the
-                // deployment provider's synchronous revocation contract.
-                unsafe {
-                    self.fabric.unregister_read_source(source_id).await?;
-                    if !self
-                        .fabric
-                        .release_read_source_after_revoke(source_id)
-                        .await?
-                    {
-                        return Err(UrmaError::Protocol(
-                            "retained READ source remained pending after lane close".into(),
-                        ));
+            let mut result = Ok(());
+            for attempt in 0..3 {
+                result = time::timeout(self.transfer_timeout, async {
+                    let _ = self.fabric.retire_read_source(source_id).await;
+                    // SAFETY: The lane target is closed and startup required the
+                    // deployment provider's synchronous revocation contract.
+                    unsafe {
+                        self.fabric.unregister_read_source(source_id).await?;
+                        if !self
+                            .fabric
+                            .release_read_source_after_revoke(source_id)
+                            .await?
+                        {
+                            return Err(UrmaError::Protocol(
+                                "retained READ source remained pending after lane close".into(),
+                            ));
+                        }
                     }
+                    Ok::<(), UrmaError>(())
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(UrmaError::Protocol(
+                        "retained READ source cleanup deadline expired".into(),
+                    ))
+                });
+                if result.is_ok() {
+                    break;
                 }
-                Ok::<(), UrmaError>(())
+                if attempt < 2 {
+                    time::sleep(Duration::from_millis(if attempt == 0 { 100 } else { 500 })).await;
+                }
             }
-            .await;
+            if result.is_ok() {
+                remaining.lock().unwrap().retain(|id| *id != source_id);
+            }
             if let Err(error) = result {
                 if first_error.is_none() {
                     first_error = Some(error.to_string());
@@ -799,11 +883,14 @@ impl UrmaServerHandler {
                 retained.push(source_id);
             }
         }
+        restore.disarm();
         if !retained.is_empty() {
             self.retained_read_sources
                 .lock()
-                .await
-                .insert(lane_id, retained);
+                .unwrap()
+                .entry(lane_id)
+                .or_default()
+                .extend(retained);
             return Err(ClientError::Unknown(first_error.unwrap_or_else(|| {
                 "retained READ source cleanup failed".to_string()
             })));
@@ -859,5 +946,58 @@ mod tests {
             }
         }
         ReadTokenSpace::with_test_keys(keys)
+    }
+    fn source_ids() -> [ReadSourceId; 2] {
+        use crate::urma::read_owner::{
+            ReadBudget, ReadCapacity, ReadDirection, ReadOwnerRegistry, ReadPeer,
+        };
+        let cap = ReadCapacity {
+            bytes: 64,
+            entries: 4,
+        };
+        let mut registry = ReadOwnerRegistry::<()>::new(ReadBudget {
+            total: ReadCapacity {
+                bytes: 128,
+                entries: 8,
+            },
+            source: cap,
+            destination: cap,
+            per_peer_source: cap,
+            per_peer_destination: cap,
+            quarantine: cap,
+        })
+        .unwrap();
+        let peer = ReadPeer {
+            id: 1,
+            generation: 1,
+        };
+        registry.activate_peer(peer).unwrap();
+        [
+            ReadSourceId(registry.reserve(peer, ReadDirection::Source, 8).unwrap()),
+            ReadSourceId(registry.reserve(peer, ReadDirection::Source, 8).unwrap()),
+        ]
+    }
+    #[test]
+    fn source_ledger_retains_failed_revoke_and_does_not_resurrect_released_ids() {
+        let ledger = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let id = source_ids()[0];
+        record_source_state(&ledger, 7, id, SourceState::Registered);
+        record_source_state(&ledger, 7, id, SourceState::Retained);
+        assert_eq!(ledger.lock().unwrap()[&7], vec![id]);
+        record_source_state(&ledger, 7, id, SourceState::Released);
+        record_source_state(&ledger, 7, id, SourceState::Retained);
+        assert!(ledger.lock().unwrap()[&7].is_empty());
+    }
+    #[test]
+    fn cancelled_cleanup_batch_restores_only_unreleased_sources_without_duplicates() {
+        let ledger = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ids = source_ids();
+        let remaining = Arc::new(std::sync::Mutex::new(ids.to_vec()));
+        let guard = source_cleanup_guard(ledger.clone(), remaining.clone(), 7);
+        // First source finished; cancellation occurs while processing the second.
+        remaining.lock().unwrap().remove(0);
+        record_source_state(&ledger, 7, ids[1], SourceState::Registered);
+        drop(guard);
+        assert_eq!(ledger.lock().unwrap()[&7], vec![ids[1]]);
     }
 }

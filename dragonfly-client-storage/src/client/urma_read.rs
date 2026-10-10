@@ -51,6 +51,9 @@ struct ReadLaneSession {
     lane_id: u16,
     session_generation: u64,
     control: Arc<ReadLaneControl>,
+    // Last cached/in-flight lane reference retires its native peer, including
+    // when an async close is cancelled before acquiring the session mutex.
+    _guard: crate::urma::read_handoff::ResourceGuard,
 }
 
 /// A fully read destination lease. The registered buffer content is final
@@ -94,6 +97,9 @@ impl UrmaReadPieceLease {
     /// Returns false when the native owner could not prove a full close; the
     /// id stays registered for a later cleanup pass.
     pub async fn recycle(mut self) -> ClientResult<()> {
+        // Consumer workers have joined; cancellation or native failure may now
+        // enqueue recycling safely, unlike Drop of a lease still used by Storage.
+        let guard = self.fabric.child_guard(self.child_id);
         match self
             .fabric
             .recycle_published_child_lease(self.child_id)
@@ -101,6 +107,7 @@ impl UrmaReadPieceLease {
         {
             Ok(true) => {
                 self.armed = false;
+                guard.disarm();
                 Ok(())
             }
             Ok(false) => Err(ClientError::Unknown(
@@ -138,8 +145,8 @@ pub struct UrmaReadClient {
     /// addr is the address of the parent's URMA rendezvous server.
     addr: String,
 
-    /// transfer_timeout bounds the handshake, each transfer completion wait,
-    /// and the accept gate.
+    /// One deadline bounds lane acquisition and the Piece transfer.
+    /// Cancellation cleanup uses a separate bounded grace.
     transfer_timeout: Duration,
 
     /// session owns the persistent READ lane shared by pieces of this parent.
@@ -222,11 +229,12 @@ impl UrmaReadClient {
         piece_length: u64,
     ) -> ClientResult<(UrmaReadPieceLease, u64, String)> {
         let transfer_total_start = Instant::now();
+        let deadline = tokio::time::Instant::now() + self.transfer_timeout;
         let retained_cleanup_start = Instant::now();
         self.retry_retained_children().await;
         let retained_cleanup_ns = retained_cleanup_start.elapsed().as_nanos() as u64;
         let lane_acquire_start = Instant::now();
-        let (lane, reused_session) = self.lane().await?;
+        let (lane, reused_session) = self.lane(deadline).await?;
         let lane_acquire_ns = lane_acquire_start.elapsed().as_nanos() as u64;
         let transfer_id = self
             .next_transfer_id
@@ -282,7 +290,8 @@ impl UrmaReadClient {
             read_config.max_outstanding_per_peer as usize,
             self.transfer_timeout,
         )
-        .map_err(|error| ClientError::Unknown(error.to_string()))?;
+        .map_err(|error| ClientError::Unknown(error.to_string()))?
+        .with_deadline(deadline);
         let session_run_start = Instant::now();
         let success = match unsafe { session.run_transport_only().await } {
             Ok(success) => success,
@@ -304,6 +313,7 @@ impl UrmaReadClient {
             span: success.lease.span,
             armed: true,
         };
+        success.lease.guard.disarm();
         debug!(
             parent_addr = self.addr,
             completed_bytes = success.completed_bytes,
@@ -359,16 +369,20 @@ impl UrmaReadClient {
             return;
         }
         let mut still_retained = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         for owner in pending {
-            let released = match owner {
-                RetainedChildOwner::Cleanup(id) => {
-                    self.fabric.retire_read_child_for_cleanup(id).await
+            let released = tokio::time::timeout_at(deadline, async {
+                match owner {
+                    RetainedChildOwner::Cleanup(id) => {
+                        self.fabric.retire_read_child_for_cleanup(id).await
+                    }
+                    RetainedChildOwner::PublishedLease(id) => {
+                        self.fabric.recycle_published_child_lease(id).await
+                    }
                 }
-                RetainedChildOwner::PublishedLease(id) => {
-                    self.fabric.recycle_published_child_lease(id).await
-                }
-            };
-            if !matches!(released, Ok(true)) {
+            })
+            .await;
+            if !matches!(released, Ok(Ok(true))) {
                 still_retained.push(owner);
             }
         }
@@ -384,28 +398,41 @@ impl UrmaReadClient {
     /// Retires the cached native lane after the caller removes this client from
     /// peer reuse. Retained transfer owners are retried before lane close.
     pub async fn close(&self) -> ClientResult<()> {
+        tokio::time::timeout(
+            self.transfer_timeout.min(Duration::from_secs(1)),
+            self.close_inner(),
+        )
+        .await?
+    }
+    async fn close_inner(&self) -> ClientResult<()> {
         self.retry_retained_children().await;
         let lane = self.session.lock().await.take();
         let Some(lane) = lane else {
             return Ok(());
         };
         let lane_id = lane.lane_id;
+        let guard = self.fabric.lane_guard(lane_id);
         drop(lane);
-        self.fabric
-            .close_lane(lane_id)
-            .await
-            .map_err(|error| ClientError::Unknown(error.to_string()))
+        let result = self.fabric.close_lane(lane_id).await;
+        if result.is_ok() {
+            guard.disarm();
+        }
+        result.map_err(|error| ClientError::Unknown(error.to_string()))
     }
 
     /// Returns the persistent lane, connecting and handshaking on first use.
     /// The caller must treat any later transfer error as lane failure and
     /// retire the cached client; the next client rebuilds a fresh lane.
-    async fn lane(&self) -> ClientResult<(Arc<ReadLaneSession>, bool)> {
-        let mut slot = self.session.lock().await;
+    async fn lane(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ClientResult<(Arc<ReadLaneSession>, bool)> {
+        let mut slot = tokio::time::timeout_at(deadline, self.session.lock()).await?;
         if let Some(lane) = slot.as_ref() {
             return Ok((lane.clone(), true));
         }
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        let mut stream =
+            tokio::time::timeout_at(deadline, TcpStream::connect(&self.addr)).await??;
         let socket = SockRef::from(&stream);
         socket.set_tcp_nodelay(true)?;
         socket.set_tcp_keepalive(
@@ -416,10 +443,13 @@ impl UrmaReadClient {
         )?;
 
         let urma_config = &self.config.storage.server.urma;
-        let (lane_id, descriptor) = self.fabric.create_lane().await.map_err(|error| {
-            ClientError::Unknown(format!("urma READ lane create failed: {error}"))
-        })?;
-        let established = async {
+        let (lane_id, descriptor) = tokio::time::timeout_at(deadline, self.fabric.create_lane())
+            .await?
+            .map_err(|error| {
+                ClientError::Unknown(format!("urma READ lane create failed: {error}"))
+            })?;
+        let guard = self.fabric.lane_guard(lane_id);
+        let established = tokio::time::timeout_at(deadline, async {
             let session_generation = next_session_generation().map_err(|error| {
                 ClientError::Unknown(format!("urma READ session generation failed: {error}"))
             })?;
@@ -462,17 +492,17 @@ impl UrmaReadClient {
                 lane_id,
                 session_generation,
                 control: Arc::new(control),
+                _guard: self.fabric.lane_guard(lane_id),
             }))
-        }
+        })
         .await;
+        let established = established.map_err(ClientError::from)?;
         let lane = match established {
             Ok(lane) => lane,
-            Err(error) => {
-                let _ = self.fabric.close_lane(lane_id).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         *slot = Some(lane.clone());
+        guard.disarm();
         Ok((lane, false))
     }
 }

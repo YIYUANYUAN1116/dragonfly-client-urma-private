@@ -1,5 +1,6 @@
 //! Bounded-by-admission source executor. Native sources never leave their
 //! worker. Only owned immutable backing, identities, proofs and DTOs cross.
+use super::read_handoff::ResourceReply;
 use super::{
     ffi::{
         read::{
@@ -127,7 +128,7 @@ pub(crate) struct Completion {
     pub(crate) outcome: Outcome,
 }
 pub(crate) enum Reply {
-    Register(oneshot::Sender<Result<ReadSourceAdmission>>),
+    Register(ResourceReply<ReadSourceAdmission>),
     Cleanup(oneshot::Sender<Result<bool>>),
     OrphanCleanup,
 }
@@ -141,7 +142,8 @@ struct Worker {
     failed: bool,
 }
 /// Owner-only bookkeeping; entries hold identities, never native resources.
-/// Only definitely registered, unpublished offers may be automatically reaped.
+/// Source callers allow automatic cleanup only for definitely registered,
+/// unpublished offers; Child callers allow it only after consumer abandonment.
 #[derive(Default)]
 pub(crate) struct OrphanSources {
     entries: BTreeMap<ReadOwnerId, Orphan>,
@@ -152,10 +154,10 @@ struct Orphan {
     in_flight: bool,
 }
 impl OrphanSources {
-    pub(crate) fn track(&mut self, id: ReadOwnerId, unpublished_ready: bool, now: Instant) {
+    pub(crate) fn track(&mut self, id: ReadOwnerId, cleanup_allowed: bool, now: Instant) {
         self.entries.entry(id).or_insert(Orphan {
             attempts: 0,
-            next: unpublished_ready.then_some(now),
+            next: cleanup_allowed.then_some(now),
             in_flight: false,
         });
     }
@@ -308,7 +310,7 @@ impl SourceWorkers {
         id: ReadOwnerId,
         backing: ReadBacking<()>,
         token: ReadToken,
-        reply: oneshot::Sender<Result<ReadSourceAdmission>>,
+        reply: ResourceReply<ReadSourceAdmission>,
     ) -> std::result::Result<(), Reply> {
         let reply = Reply::Register(reply);
         if self.stopping || self.pending.contains_key(&id) {
@@ -615,8 +617,8 @@ mod tests {
     fn submit(
         pool: &mut SourceWorkers,
         id: ReadOwnerId,
-    ) -> oneshot::Receiver<Result<ReadSourceAdmission>> {
-        let (tx, rx) = oneshot::channel();
+    ) -> oneshot::Receiver<Result<super::super::read_handoff::Handoff<ReadSourceAdmission>>> {
+        let (tx, rx) = ResourceReply::test_channel();
         assert!(pool.register(id, backing(), ReadToken::new(7), tx).is_ok());
         rx
     }
@@ -946,7 +948,7 @@ mod tests {
             wait(&mut pool, 1).pop().unwrap().0.outcome,
             Outcome::Lost
         ));
-        let (tx, _rx) = oneshot::channel();
+        let (tx, _rx) = ResourceReply::test_channel();
         assert!(pool
             .register(id(), backing(), ReadToken::new(9), tx)
             .is_err());

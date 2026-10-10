@@ -7,6 +7,7 @@
 //! admission plus a non-dropping lifecycle path, and never receives a raw
 //! UMDK handle.
 
+use super::read_handoff::{ResourceGuard, ResourceReply};
 use super::{
     lane::{JettyDescriptor, TransportMode},
     runtime::{
@@ -227,8 +228,11 @@ impl UrmaFabricHandle {
     /// Creates a local lane and returns its stable id plus the serialized local
     /// Jetty descriptor for the existing Dragonfly control plane.
     pub(crate) async fn create_lane(&self) -> Result<(u16, Vec<u8>)> {
-        self.submit(|reply| FabricCommand::CreateLane { reply })
-            .await
+        self.submit_resource(
+            |reply| FabricCommand::CreateLane { reply },
+            |(lane_id, _)| Abandoned::Lane(*lane_id),
+        )
+        .await
     }
 
     /// Imports the peer descriptor and transitions the lane to Ready.
@@ -248,8 +252,17 @@ impl UrmaFabricHandle {
         &self,
         request: ReadChildRequest,
     ) -> Result<ReadChildAdmission> {
-        self.submit(|reply| FabricCommand::CreateReadChild { request, reply })
-            .await
+        self.submit_resource(
+            |reply| FabricCommand::CreateReadChild { request, reply },
+            |admission| {
+                Abandoned::Child(match admission {
+                    ReadChildAdmission::Ready(id) | ReadChildAdmission::Quarantined { id, .. } => {
+                        *id
+                    }
+                })
+            },
+        )
+        .await
     }
 
     pub(crate) async fn post_read_child_batch(
@@ -296,8 +309,11 @@ impl UrmaFabricHandle {
     /// Extracts the CPU span of the fully read registered destination buffer
     /// for Storage. The lease itself stays on the owner thread until recycle.
     pub(crate) async fn publish_read_child_lease(&self, id: ReadChildId) -> Result<ReadLeaseSpan> {
-        self.submit(|reply| FabricCommand::PublishReadChildLease { id, reply })
-            .await
+        self.submit_resource(
+            |reply| FabricCommand::PublishReadChildLease { id, reply },
+            move |_| Abandoned::Child(id),
+        )
+        .await
     }
 
     /// Consumes a published destination lease: retires the Child owner and
@@ -321,8 +337,14 @@ impl UrmaFabricHandle {
         &self,
         request: ReadSourceRequest,
     ) -> Result<ReadSourceAdmission> {
-        self.submit(|reply| FabricCommand::RegisterReadSource { request, reply })
-            .await
+        self.submit_resource(
+            |reply| FabricCommand::RegisterReadSource { request, reply },
+            |admission| match admission {
+                ReadSourceAdmission::Ready(offer) => Abandoned::Source(offer.id, true),
+                ReadSourceAdmission::Quarantined { id, .. } => Abandoned::Source(*id, false),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn retire_read_source(&self, id: ReadSourceId) -> Result<()> {
@@ -353,6 +375,55 @@ impl UrmaFabricHandle {
     pub(crate) async fn close_lane(&self, lane_id: u16) -> Result<()> {
         self.submit(|reply| FabricCommand::CloseLane { lane_id, reply })
             .await
+    }
+
+    async fn submit_resource<T>(
+        &self,
+        make_command: impl FnOnce(ResourceReply<T>) -> FabricCommand,
+        abandoned: impl Fn(&T) -> Abandoned + Send + 'static,
+    ) -> Result<T> {
+        let command_tx = self.command_sender()?;
+        let permit = self
+            .inner
+            .command_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| fabric_stopped())?;
+        let (sender, receiver) = oneshot::channel();
+        let cleanup_tx = command_tx.clone();
+        let reply = ResourceReply::new(sender, move |value| {
+            let action = abandoned(value);
+            let tx = cleanup_tx.clone();
+            ResourceGuard::new(move || {
+                let _ = tx.send(CommandEnvelope::urgent(FabricCommand::Abandon { action }));
+            })
+        });
+        command_tx
+            .send(CommandEnvelope::admitted(make_command(reply), permit))
+            .map_err(|_| fabric_stopped())?;
+        Ok(receiver.await.map_err(|_| fabric_stopped())??.claim())
+    }
+
+    pub(crate) fn child_guard(&self, id: ReadChildId) -> ResourceGuard {
+        self.resource_guard(Abandoned::Child(id))
+    }
+    pub(crate) fn lane_guard(&self, id: u16) -> ResourceGuard {
+        self.resource_guard(Abandoned::Lane(id))
+    }
+    pub(crate) fn source_guard(&self, id: ReadSourceId) -> ResourceGuard {
+        self.resource_guard(Abandoned::Source(id, true))
+    }
+    pub(crate) fn retained_source_guard(&self, id: ReadSourceId) -> ResourceGuard {
+        self.resource_guard(Abandoned::Source(id, false))
+    }
+    fn resource_guard(&self, action: Abandoned) -> ResourceGuard {
+        let tx = self.command_sender().ok();
+        ResourceGuard::new(move || {
+            if let Some(tx) = tx {
+                let _ = tx.send(CommandEnvelope::urgent(FabricCommand::Abandon { action }));
+            }
+        })
     }
 
     async fn submit<T>(
@@ -450,9 +521,18 @@ impl Drop for FabricInner {
     }
 }
 
+pub(crate) enum Abandoned {
+    Lane(u16),
+    Child(ReadChildId),
+    Source(ReadSourceId, bool),
+}
+
 enum FabricCommand {
+    Abandon {
+        action: Abandoned,
+    },
     CreateLane {
-        reply: oneshot::Sender<Result<(u16, Vec<u8>)>>,
+        reply: ResourceReply<(u16, Vec<u8>)>,
     },
     ConnectLane {
         lane_id: u16,
@@ -462,7 +542,7 @@ enum FabricCommand {
 
     CreateReadChild {
         request: ReadChildRequest,
-        reply: oneshot::Sender<Result<ReadChildAdmission>>,
+        reply: ResourceReply<ReadChildAdmission>,
     },
 
     PostReadChildBatch {
@@ -494,7 +574,7 @@ enum FabricCommand {
 
     PublishReadChildLease {
         id: ReadChildId,
-        reply: oneshot::Sender<Result<ReadLeaseSpan>>,
+        reply: ResourceReply<ReadLeaseSpan>,
     },
 
     RecycleReadChildLease {
@@ -504,7 +584,7 @@ enum FabricCommand {
 
     RegisterReadSource {
         request: ReadSourceRequest,
-        reply: oneshot::Sender<Result<ReadSourceAdmission>>,
+        reply: ResourceReply<ReadSourceAdmission>,
     },
 
     RetireReadSource {
@@ -596,12 +676,12 @@ fn run_owner(
                     if let OwnerControl::Shutdown(reply) =
                         handle_command(envelope.command, &mut runtime, poisoned.as_deref())
                     {
-                        finish_owner(runtime, &readiness_tx, reply);
+                        finish_owner(runtime, &readiness_tx, reply, &mut command_rx);
                         return;
                     }
                 }
                 None => {
-                    finish_owner(runtime, &readiness_tx, None);
+                    finish_owner(runtime, &readiness_tx, None, &mut command_rx);
                     return;
                 }
             }
@@ -614,13 +694,13 @@ fn run_owner(
                     if let OwnerControl::Shutdown(reply) =
                         handle_command(envelope.command, &mut runtime, poisoned.as_deref())
                     {
-                        finish_owner(runtime, &readiness_tx, reply);
+                        finish_owner(runtime, &readiness_tx, reply, &mut command_rx);
                         return;
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    finish_owner(runtime, &readiness_tx, None);
+                    finish_owner(runtime, &readiness_tx, None, &mut command_rx);
                     return;
                 }
             }
@@ -657,6 +737,16 @@ fn handle_command(
     poisoned: Option<&str>,
 ) -> OwnerControl {
     match command {
+        FabricCommand::Abandon { action } => {
+            match action {
+                Abandoned::Lane(id) => {
+                    let _ = runtime.close_peer_target(id);
+                }
+                Abandoned::Child(id) => runtime.abandon_read_child(id),
+                Abandoned::Source(id, ready) => runtime.abandon_read_source(id, ready),
+            }
+            OwnerControl::Continue
+        }
         FabricCommand::CreateLane { reply } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
                 let (lane_id, descriptor) = runtime.create_peer_target()?;
@@ -737,8 +827,7 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::RecycleReadChildLease { id, reply } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.recycle_read_child_lease(id));
+            let result = runtime.recycle_read_child_lease(id);
             let _ = reply.send(result);
             OwnerControl::Continue
         }
@@ -805,8 +894,24 @@ fn finish_owner(
     runtime: UrmaRuntime,
     readiness_tx: &watch::Sender<FabricReadiness>,
     reply: Option<oneshot::Sender<Result<()>>>,
+    commands: &mut mpsc::UnboundedReceiver<CommandEnvelope>,
 ) {
-    let result = shutdown_runtime(runtime, readiness_tx);
+    let result = runtime.shutdown_with_progress(|runtime| {
+        for _ in 0..MAX_COMMANDS_PER_TICK {
+            let Ok(envelope) = commands.try_recv() else {
+                break;
+            };
+            if let OwnerControl::Shutdown(Some(reply)) =
+                handle_command(envelope.command, runtime, Some("shutting down"))
+            {
+                let _ = reply.send(Err(fabric_stopped()));
+            }
+        }
+    });
+    readiness_tx.send_replace(match &result {
+        Ok(()) => FabricReadiness::Stopped,
+        Err(error) => FabricReadiness::Failed(error.to_string()),
+    });
     if let Some(reply) = reply {
         let _ = reply.send(result);
     }

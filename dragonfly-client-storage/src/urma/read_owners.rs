@@ -121,6 +121,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     pub(crate) fn activate_peer(&mut self, peer: ReadPeer) -> Result<(), OwnerError> {
         self.registry.activate_peer(peer)
     }
+    pub(crate) fn contains(&self, id: ReadOwnerId) -> bool {
+        self.registry.state(id).is_ok()
+    }
     pub(crate) fn usage(&self) -> ReadUsage {
         self.registry.usage()
     }
@@ -614,7 +617,7 @@ mod tests {
                 },
             ))
         }
-        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
+        fn close_lease(&mut self, (): ()) -> Result<(), ((), FfiError)> {
             self.closes.set(self.closes.get() + 1);
             Ok(())
         }
@@ -1036,7 +1039,7 @@ mod tests {
             fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
                 Err(FfiError::Contract("mock has no lease"))
             }
-            fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
+            fn close_lease(&mut self, (): ()) -> Result<(), ((), FfiError)> {
                 Ok(())
             }
         }

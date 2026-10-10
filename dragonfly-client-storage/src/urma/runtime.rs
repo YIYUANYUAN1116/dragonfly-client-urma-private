@@ -1,3 +1,4 @@
+use super::read_handoff::ResourceReply;
 use super::{
     ffi::read::{
         source::{ReadBacking, ReadSourceStages},
@@ -422,6 +423,7 @@ mod native {
         read: RuntimeReadState,
         source_workers: Option<super::super::read_source_workers::SourceWorkers>,
         orphan_sources: super::super::read_source_workers::OrphanSources,
+        orphan_children: super::super::read_source_workers::OrphanSources,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -540,6 +542,7 @@ mod native {
                 read,
                 source_workers: None,
                 orphan_sources: Default::default(),
+                orphan_children: Default::default(),
                 _not_send_sync: PhantomData,
             })
         }
@@ -782,6 +785,9 @@ mod native {
         /// releasing the budget. Requires a retired (or quarantined) Child and
         /// joined Storage consumer workers.
         pub(crate) fn recycle_read_child_lease(&mut self, id: ReadChildId) -> Result<bool> {
+            if !self.read.owners.contains(id.0) {
+                return Ok(true);
+            }
             let RuntimeReadState { owners, .. } = &mut self.read;
             owners
                 .recycle_child_lease(id.0)
@@ -823,11 +829,29 @@ mod native {
                 .as_ref()
                 .is_some_and(|workers| workers.pending())
                 || self.orphan_sources.pending()
+                || self.orphan_children.pending()
+        }
+        pub(crate) fn abandon_read_source(&mut self, id: ReadSourceId, ready: bool) {
+            if self.retire_read_source(id).is_ok() {
+                self.orphan_sources.track(id.0, ready, Instant::now());
+                if !ready {
+                    tracing::warn!(source_id = ?id, "source retained without automatic revocation proof");
+                }
+            }
+        }
+        pub(crate) fn abandon_read_child(&mut self, id: ReadChildId) {
+            if !self.read.owners.contains(id.0) {
+                return;
+            }
+            match self.retire_read_child_for_cleanup(id) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => self.orphan_children.track(id.0, true, Instant::now()),
+            }
         }
         pub(crate) unsafe fn submit_source_registration(
             &mut self,
             request: ReadSourceRequest,
-            reply: tokio::sync::oneshot::Sender<Result<ReadSourceAdmission>>,
+            reply: ResourceReply<ReadSourceAdmission>,
         ) {
             if self.source_workers.is_none() {
                 let _ = reply.send(unsafe { self.register_read_source(request) });
@@ -881,6 +905,12 @@ mod native {
             revoked: bool,
             reply: tokio::sync::oneshot::Sender<Result<bool>>,
         ) {
+            // A cancelled receiver may miss the successful release reply. The
+            // registry removed this exact generation only after verified reap.
+            if !self.read.owners.contains(id.0) {
+                let _ = reply.send(Ok(true));
+                return;
+            }
             if self.source_workers.is_none() {
                 let result = if revoked {
                     unsafe { self.release_read_source_after_revoke(id) }
@@ -925,14 +955,12 @@ mod native {
             use super::super::read_source_workers::{Outcome, Registration, Reply};
             let completions = match &mut self.source_workers {
                 Some(workers) => workers.completions(),
-                None => return,
+                None => Vec::new(),
             };
             for (completion, reply) in completions {
                 let RuntimeReadState { owners, .. } = &mut self.read;
                 match (completion.outcome, reply) {
                     (Outcome::Register(registration), Reply::Register(reply)) => {
-                        let known_ready = matches!(&registration, Registration::Ready { .. });
-                        let known_rejected = matches!(&registration, Registration::Rejected(_));
                         let result = match registration {
                             Registration::Rejected(error) => {
                                 let _ = owners.reject_worker_source(completion.id);
@@ -977,16 +1005,7 @@ mod native {
                                 }
                             }
                         };
-                        if reply.send(result).is_err() && !known_rejected {
-                            let id = ReadSourceId(completion.id);
-                            let _ = self.retire_read_source(id);
-                            self.orphan_sources
-                                .track(completion.id, known_ready, Instant::now());
-                            if !known_ready {
-                                tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
-                                    "unreceived uncertain source retained; independent rollback proof required");
-                            }
-                        }
+                        let _ = reply.send(result);
                     }
                     (Outcome::Cleanup(result), Reply::Cleanup(reply)) => {
                         let result = owners
@@ -1028,20 +1047,12 @@ mod native {
                     }
                     (Outcome::Lost, Reply::Register(reply)) => {
                         let _ = owners.attach_worker_source(completion.id, completion.worker, true);
-                        if reply
-                            .send(Ok(ReadSourceAdmission::Quarantined {
-                                id: ReadSourceId(completion.id),
-                                error: Error::Protocol(
-                                    "source worker lost; budget and backing retained".into(),
-                                ),
-                            }))
-                            .is_err()
-                        {
-                            self.orphan_sources
-                                .track(completion.id, false, Instant::now());
-                            tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
-                                "unreceived lost source retained; independent rollback proof required");
-                        }
+                        let _ = reply.send(Ok(ReadSourceAdmission::Quarantined {
+                            id: ReadSourceId(completion.id),
+                            error: Error::Protocol(
+                                "source worker lost; budget and backing retained".into(),
+                            ),
+                        }));
                     }
                     (Outcome::Lost, Reply::Cleanup(reply)) => {
                         let _ = owners.complete_worker_cleanup(
@@ -1055,7 +1066,34 @@ mod native {
                     _ => unreachable!("source worker operation/reply mismatch"),
                 }
             }
+            for id in self.orphan_children.due(Instant::now()) {
+                if !self.read.owners.contains(id) {
+                    self.orphan_children.retired(id);
+                    continue;
+                }
+                self.orphan_children.dispatched(id);
+                let result = self.recycle_read_child_lease(ReadChildId(id));
+                if matches!(result, Ok(true)) {
+                    self.orphan_children.retired(id);
+                } else {
+                    let terminal = self.orphan_children.failed(id, Instant::now(), false);
+                    tracing::warn!(child_id = ?id, terminal, ?result, "unclaimed READ child cleanup incomplete");
+                }
+            }
             for id in self.orphan_sources.due(Instant::now()) {
+                if self.source_workers.is_none() {
+                    self.orphan_sources.dispatched(id);
+                    // SAFETY: Only a known-ready, never-published source enters
+                    // this queue. No remote reader ever received its capability.
+                    let result = unsafe { self.release_read_source_after_revoke(ReadSourceId(id)) };
+                    if matches!(result, Ok(true)) {
+                        self.orphan_sources.retired(id);
+                    } else {
+                        let terminal = self.orphan_sources.failed(id, Instant::now(), false);
+                        tracing::warn!(source_id = ?id, terminal, ?result, "unpublished synchronous source cleanup incomplete");
+                    }
+                    continue;
+                }
                 let worker = self.read.owners.worker_source(id);
                 self.orphan_sources.dispatched(id);
                 // Only definitely registered sources whose reply was rejected
@@ -1198,6 +1236,9 @@ mod native {
         /// Cleanup-only retirement. A later Storage handoff must extract an
         /// independently owned destination lease before invoking this path.
         pub(crate) fn retire_read_child_for_cleanup(&mut self, id: ReadChildId) -> Result<bool> {
+            if !self.read.owners.contains(id.0) {
+                return Ok(true);
+            }
             let RuntimeReadState { owners, .. } = &mut self.read;
             owners.retire(id.0).map_err(read_owner_error)?;
             owners.reap_child(id.0).map_err(|error| match error {
@@ -1289,8 +1330,14 @@ mod native {
                 .ok_or_else(|| Error::Protocol(format!("unknown URMA PeerTarget {peer_id}")))
         }
 
-        pub(crate) fn shutdown(mut self) -> Result<()> {
-            let result = self.shutdown_inner();
+        pub(crate) fn shutdown(self) -> Result<()> {
+            self.shutdown_with_progress(|_| {})
+        }
+        pub(crate) fn shutdown_with_progress(
+            mut self,
+            mut progress: impl FnMut(&mut Self),
+        ) -> Result<()> {
+            let result = self.shutdown_inner(&mut progress);
             if result.is_err() {
                 // Shutdown consumes the owner-thread runtime, so no later caller can
                 // retry a provider failure. Keep every still-live native owner and
@@ -1302,7 +1349,7 @@ mod native {
             result
         }
 
-        fn shutdown_inner(&mut self) -> Result<()> {
+        fn shutdown_inner(&mut self, progress: &mut impl FnMut(&mut Self)) -> Result<()> {
             if self.poisoned {
                 return Err(Error::Shutdown {
                     failures: vec!["a previous shutdown attempt left native state uncertain".into()],
@@ -1310,18 +1357,20 @@ mod native {
             }
             self.accepting = false;
             self.read.begin_shutdown();
+            progress(self);
             let mut failures = Vec::new();
             // Resolve every dispatched creation before closing the context. A
             // wedged worker is not joined synchronously: retain the whole Runtime.
             let source_deadline = deadline_after(Duration::from_secs(5));
             while self.source_work_pending() && !deadline_expired(source_deadline) {
                 self.poll_source_workers();
+                progress(self);
                 let _ = self.poll_once();
                 thread::sleep(Duration::from_micros(100));
             }
             if self.source_work_pending() {
                 return Err(Error::Shutdown {
-                    failures: vec!["source workers still executing; runtime retained".into()],
+                    failures: vec!["READ lifecycle work still pending; runtime retained".into()],
                 });
             }
             if let Some(workers) = &mut self.source_workers {
@@ -1354,6 +1403,8 @@ mod native {
             }
             let drain_deadline = deadline_after(Duration::from_secs(1));
             while !self.peers.is_empty() && !deadline_expired(drain_deadline) {
+                progress(self);
+                self.poll_source_workers();
                 if let Err(error) = self.poll_once() {
                     push_unique_failure(&mut failures, error.to_string());
                 }
@@ -1377,6 +1428,8 @@ mod native {
                     || !self.read.drained())
                     && !deadline_expired(flush_deadline)
                 {
+                    progress(self);
+                    self.poll_source_workers();
                     if let Err(error) = self.poll_once() {
                         push_unique_failure(&mut failures, error.to_string());
                     }
@@ -1458,7 +1511,7 @@ mod native {
     impl Drop for UrmaRuntime {
         fn drop(&mut self) {
             if !self.poisoned {
-                let _ = self.shutdown_inner();
+                let _ = self.shutdown_inner(&mut |_| {});
             }
         }
     }

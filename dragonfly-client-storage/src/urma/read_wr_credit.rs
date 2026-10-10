@@ -127,7 +127,7 @@ impl<R: ChildResources> ChildResources for CreditedChild<R> {
     fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError> {
         self.resources.extract_lease()
     }
-    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError> {
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), (Self::Lease, FfiError)> {
         self.resources.close_lease(lease)
     }
 }
@@ -157,7 +157,7 @@ mod tests {
         fn extract_lease(&mut self) -> Result<((), LeaseSpan), FfiError> {
             Err(FfiError::Contract("mock has no lease"))
         }
-        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
+        fn close_lease(&mut self, (): ()) -> Result<(), ((), FfiError)> {
             Ok(())
         }
     }

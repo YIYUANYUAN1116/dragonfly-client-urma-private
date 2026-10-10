@@ -13,6 +13,7 @@ mod lane;
 mod read_buffer_pool;
 mod read_child_owner;
 pub(crate) mod read_control;
+pub(crate) mod read_handoff;
 pub(crate) mod read_owner;
 mod read_owners;
 pub(crate) mod read_protocol;

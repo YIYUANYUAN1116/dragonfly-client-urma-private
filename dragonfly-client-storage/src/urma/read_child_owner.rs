@@ -149,7 +149,8 @@ pub(crate) trait ChildResources {
     /// ChildOwner guarantees no outstanding WRs and a closed import.
     fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError>;
     /// Closes a previously extracted lease buffer (unregister + release).
-    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError>;
+    /// Failure returns the still-live lease; the owner must retain it for retry.
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), (Self::Lease, FfiError)>;
 }
 
 /// CPU-visible span of an extracted registered destination buffer. The pointer
@@ -178,8 +179,11 @@ pub(crate) struct NativeChild<K> {
 impl<K> NativeChild<K> {
     /// Returns the registered destination buffer to the pool when it is healthy
     /// and the pool still has retention capacity; closes it otherwise. The
-    /// buffer is consumed either way.
-    fn release_local(&mut self, mut buffer: SegmentHandle) -> Result<(), FfiError> {
+    /// On close failure the caller receives the still-live buffer for retry.
+    fn release_local(
+        &mut self,
+        mut buffer: SegmentHandle,
+    ) -> Result<(), (SegmentHandle, FfiError)> {
         if !self.buffer_uncertain {
             match self.pool.borrow_mut().put(buffer, self.allocation_bytes) {
                 Ok(()) => return Ok(()),
@@ -190,7 +194,10 @@ impl<K> NativeChild<K> {
             length = self.allocation_bytes,
             "urma READ pool bypass; unregistering destination"
         );
-        buffer.close()
+        match buffer.close() {
+            Ok(()) => Ok(()),
+            Err(error) => Err((buffer, error)),
+        }
     }
 }
 impl<K> NativeChild<K> {
@@ -290,10 +297,13 @@ impl<K> NativeChild<K> {
                 let local = owner.local.take().expect("created local buffer");
                 match owner.release_local(local) {
                     Ok(()) => ChildCreation::Rejected(error),
-                    Err(cleanup_error) => ChildCreation::Uncertain {
-                        resources: owner,
-                        error: cleanup_error,
-                    },
+                    Err((local, cleanup_error)) => {
+                        owner.local = Some(local);
+                        ChildCreation::Uncertain {
+                            resources: owner,
+                            error: cleanup_error,
+                        }
+                    }
                 }
             }
         }
@@ -346,7 +356,13 @@ impl<K> ChildResources for NativeChild<K> {
     }
     fn close_buffer(&mut self) -> Result<(), FfiError> {
         match self.local.take() {
-            Some(local) => self.release_local(local),
+            Some(local) => match self.release_local(local) {
+                Ok(()) => Ok(()),
+                Err((local, error)) => {
+                    self.local = Some(local);
+                    Err(error)
+                }
+            },
             None => Ok(()),
         }
     }
@@ -356,14 +372,20 @@ impl<K> ChildResources for NativeChild<K> {
             .take()
             .ok_or(FfiError::Contract("READ lease already extracted"))?;
         // SAFETY: Unique wrapper; the CPU span stays registered until close.
-        let (data, length) = local.data()?;
+        let (data, length) = match local.data() {
+            Ok(span) => span,
+            Err(error) => {
+                self.local = Some(local);
+                return Err(error);
+            }
+        };
         let span = LeaseSpan {
             data: data.as_ptr(),
             length,
         };
         Ok((local, span))
     }
-    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), FfiError> {
+    fn close_lease(&mut self, lease: Self::Lease) -> Result<(), (Self::Lease, FfiError)> {
         self.release_local(lease)
     }
 }
@@ -647,7 +669,10 @@ impl<R: ChildResources> ChildOwner<R> {
     /// budget. Call only after consumer workers joined.
     pub(crate) fn recycle_lease(&mut self) -> Result<ReapDecision, FfiError> {
         if let Some(lease) = self.published.take() {
-            self.resources.close_lease(lease)?;
+            if let Err((lease, error)) = self.resources.close_lease(lease) {
+                self.published = Some(lease);
+                return Err(error);
+            }
         }
         self.reap()
     }
@@ -721,8 +746,12 @@ mod tests {
                 },
             ))
         }
-        fn close_lease(&mut self, (): ()) -> Result<(), FfiError> {
-            self.0.borrow_mut().events.push("lease-close");
+        fn close_lease(&mut self, (): ()) -> Result<(), ((), FfiError)> {
+            let mut t = self.0.borrow_mut();
+            t.events.push("lease-close");
+            if std::mem::take(&mut t.fail_close) {
+                return Err(((), FfiError::Status(-4)));
+            }
             Ok(())
         }
     }
@@ -1036,5 +1065,23 @@ mod tests {
             trace.borrow().events,
             ["post", "complete", "unimport", "buffer-close", "drop"]
         );
+    }
+    #[test]
+    fn failed_lease_close_preserves_owner_and_budget_until_retry() {
+        let (mut registry, id, trace) = setup();
+        let owner = registry.active_owner(id).unwrap();
+        let a = owner.post(4).unwrap();
+        let b = owner.post(4).unwrap();
+        owner.complete(completion(id, a, true)).unwrap();
+        owner.complete(completion(id, b, true)).unwrap();
+        owner.drain_for_lease().unwrap();
+        owner.publish_lease().unwrap();
+        registry.retire(id).unwrap();
+        trace.borrow_mut().fail_close = true;
+        assert!(registry.reap_with(id, |o| o.recycle_lease()).is_err());
+        assert_eq!(registry.reap_with(id, |o| o.reap()), Ok(false));
+        assert_eq!(registry.usage().bytes, 8);
+        assert_eq!(registry.reap_with(id, |o| o.recycle_lease()), Ok(true));
+        assert!(registry.drained());
     }
 }
