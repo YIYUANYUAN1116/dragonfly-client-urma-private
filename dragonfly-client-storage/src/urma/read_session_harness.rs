@@ -14,7 +14,7 @@
 //!  rm_read_memory_to_memory_session -- --ignored --nocapture`
 
 use super::{
-    fabric::{PeerTargetConfig, UrmaFabric},
+    fabric::UrmaFabric,
     ffi::read::{
         source::{ReadBacking, ReadSourceMemory},
         ReadToken,
@@ -73,10 +73,7 @@ fn read_budget() -> ReadRuntimeConfig {
 }
 
 fn harness_fabric(device: &str, eid_index: u32) -> Result<UrmaFabricHandle> {
-    let config = RuntimeConfig::new(device, eid_index)
-        .with_registered_budget(4 * 1024 * 1024, 2 * 1024 * 1024)?
-        .with_tp_type(TpType::Ctp)
-        .with_read_only(read_budget());
+    let config = RuntimeConfig::new(device, eid_index, read_budget()).with_tp_type(TpType::Ctp);
     UrmaFabric::start(config)
 }
 
@@ -99,7 +96,7 @@ fn source_bytes() -> Vec<u8> {
 
 async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
     let fabric = harness_fabric(device, eid_index)?;
-    let (lane_id, descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
+    let (lane_id, descriptor) = fabric.create_lane().await?;
     let capability = lane_capability(&fabric);
     let session_generation = next_session_generation()?;
     let mut stream = TcpStream::connect(address)
@@ -253,7 +250,7 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
     let (session_generation, _, _) = connect
         .validate_connect(&capability)
         .map_err(|error| Error::Protocol(format!("Parent Connect rejected: {error}")))?;
-    let (lane_id, parent_descriptor) = fabric.create_lane(PeerTargetConfig::default()).await?;
+    let (lane_id, parent_descriptor) = fabric.create_lane().await?;
     write_handshake(
         &mut stream,
         &ReadHandshake::Connected {

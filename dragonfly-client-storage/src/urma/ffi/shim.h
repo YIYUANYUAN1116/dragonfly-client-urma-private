@@ -175,40 +175,21 @@ typedef struct dfurma_completion {
     int32_t status;
     uint32_t opcode;
     uint64_t user_ctx;
-    uint64_t imm_data;
     uint32_t completion_len;
     uint32_t local_id;
-    uint8_t remote_eid[DFURMA_EID_SIZE];
-    uint32_t remote_uasid;
-    uint32_t remote_jetty_id;
     uint8_t is_recv;
     uint8_t is_jetty;
     uint8_t user_ctx_valid;
-    uint8_t imm_data_valid;
-    uint8_t remote_id_valid;
     uint8_t event_kind;
     uint8_t reserved[2];
 } dfurma_completion_t;
 
-/* Stable receive CQE opcode values, checked against UMDK by shim.c. */
-#define DFURMA_CR_OPC_SEND_WITH_IMM 1U
 
 enum dfurma_completion_event_kind {
     DFURMA_COMPLETION_WR = 0,
     DFURMA_COMPLETION_WR_SUSPEND_DONE = 1,
     DFURMA_COMPLETION_WR_FLUSH_ERR_DONE = 2,
 };
-
-/* One pointer-free element in a linked WR post list. */
-typedef struct dfurma_post_entry {
-    uint64_t offset;
-    uint32_t length;
-    uint64_t user_ctx;
-    uint64_t imm_data;
-} dfurma_post_entry_t;
-
-/* Bounds shim stack storage and the maximum native doorbell batch. */
-#define DFURMA_MAX_POST_LIST 64
 
 /*
  * Opens the smallest process-global chain: urma_init -> device -> context.
@@ -232,8 +213,6 @@ int dfurma_jfc_delete(dfurma_jfc_t *jfc);
 /* Error with non-NULL out retains uncertain registration and backing. */
 int dfurma_read_buffer_create(dfurma_runtime_t *runtime, uint64_t length,
                              uint64_t alignment, dfurma_segment_t **out);
-int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
-                          uint64_t alignment, dfurma_segment_t **out);
 
 /* Unregisters the Segment before releasing its backing allocation. */
 int dfurma_segment_delete(dfurma_segment_t *segment);
@@ -264,46 +243,9 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
                         const uint8_t *opaque_data, uint32_t opaque_len,
                         uint32_t token, dfurma_target_t **out,
                         dfurma_import_diagnostics_t *diagnostics);
-int dfurma_target_remote_id(dfurma_target_t *target,
-                            uint8_t eid[DFURMA_EID_SIZE], uint32_t *uasid,
-                            uint32_t *jetty_id);
 int dfurma_target_unimport(dfurma_target_t *target);
 int dfurma_jetty_delete(dfurma_jetty_t *jetty);
 
-/*
- * These functions build bitfield/union-bearing UMDK WR/SGE objects in C.
- * The returned owner must remain alive until its CQE is consumed.
- */
-int dfurma_post_send(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                     dfurma_segment_t *segment, uint64_t offset,
-                     uint32_t length, uint64_t user_ctx,
-                     dfurma_wr_t **out);
-int dfurma_post_send_imm(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                         dfurma_segment_t *segment, uint64_t offset,
-                         uint32_t length, uint64_t user_ctx,
-                         uint64_t imm_data, dfurma_wr_t **out);
-int dfurma_post_recv(dfurma_jetty_t *jetty,
-                     dfurma_segment_t *segment, uint64_t offset,
-                     uint32_t length, uint64_t user_ctx,
-                     dfurma_wr_t **out);
-/*
- * Posts an ordered linked list. `posted` is always the successfully submitted
- * prefix, including when the provider returns an error and `bad_wr` identifies
- * the first unsubmitted entry. Only out[0..*posted] contain owned WR handles.
- */
-int dfurma_post_send_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                          dfurma_segment_t *segment,
-                          const dfurma_post_entry_t *entries, uint32_t count,
-                          dfurma_wr_t **out, uint32_t *posted);
-int dfurma_post_send_imm_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                              dfurma_segment_t *segment,
-                              const dfurma_post_entry_t *entries,
-                              uint32_t count, dfurma_wr_t **out,
-                              uint32_t *posted);
-int dfurma_post_recv_list(dfurma_jetty_t *jetty,
-                          dfurma_segment_t *segment,
-                          const dfurma_post_entry_t *entries, uint32_t count,
-                          dfurma_wr_t **out, uint32_t *posted);
 void dfurma_wr_complete(dfurma_wr_t *wr);
 
 /* Non-blocking poll. Returns a count in [0, capacity], or a negative error. */

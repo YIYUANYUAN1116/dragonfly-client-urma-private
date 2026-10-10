@@ -273,32 +273,8 @@ fn default_storage_server_urma_eid_index() -> u32 {
     0
 }
 
-fn default_storage_server_urma_max_registered_bytes() -> ByteSize {
-    ByteSize::mib(40)
-}
-
-fn default_storage_server_urma_tx_registered_bytes() -> ByteSize {
-    ByteSize::mib(8)
-}
-
-fn default_storage_server_urma_pipeline_depth() -> u32 {
-    2
-}
-
-fn default_storage_server_urma_max_inflight_chunks() -> u32 {
-    512
-}
-
-fn default_storage_server_urma_post_list_size() -> u32 {
-    1
-}
-
 fn default_storage_server_urma_max_concurrent_transfers() -> u32 {
     64
-}
-
-fn default_storage_server_urma_peer_guaranteed_rx_credits() -> u32 {
-    0
 }
 
 fn default_storage_server_urma_transfer_timeout() -> Duration {
@@ -1057,39 +1033,13 @@ pub struct UrmaServer {
     #[validate(length(min = 1))]
     pub fabric_tag: Option<String>,
 
-    #[serde(
-        with = "bytesize_serde",
-        default = "default_storage_server_urma_max_registered_bytes"
-    )]
-    pub max_registered_bytes: ByteSize,
-
-    #[serde(
-        with = "bytesize_serde",
-        default = "default_storage_server_urma_tx_registered_bytes"
-    )]
-    pub tx_registered_bytes: ByteSize,
-
-    #[serde(default = "default_storage_server_urma_max_inflight_chunks")]
-    #[validate(range(min = 1, max = 4096))]
-    pub max_inflight_chunks: u32,
-
-    #[serde(default = "default_storage_server_urma_post_list_size")]
-    #[validate(range(min = 1, max = 64))]
-    pub post_list_size: u32,
-
-    #[serde(default = "default_storage_server_urma_pipeline_depth")]
-    #[validate(range(min = 1, max = 2))]
-    pub pipeline_depth: u32,
+    /// Recognized SEND/RECV options from older configurations, ignored by RM READ.
+    #[serde(flatten)]
+    pub deprecated: DeprecatedUrmaOptions,
 
     #[serde(default = "default_storage_server_urma_max_concurrent_transfers")]
     #[validate(range(min = 1, max = 65535))]
     pub max_concurrent_transfers: u32,
-
-    /// Process-wide shared-JFR credits reserved for each active download
-    /// PeerTarget. Zero keeps work-conserving admission without static quota.
-    #[serde(default = "default_storage_server_urma_peer_guaranteed_rx_credits")]
-    #[validate(range(max = 4096))]
-    pub peer_guaranteed_rx_credits: u32,
 
     #[serde(
         default = "default_storage_server_urma_transfer_timeout",
@@ -1100,9 +1050,9 @@ pub struct UrmaServer {
     #[serde(default)]
     pub mmap_content: bool,
 
-    /// READ-only data plane configuration. When present, the URMA fabric
-    /// reserves its full effective JFS depth for RM-READ and rejects legacy
-    /// SEND/RECV posts, turning the storage URMA server into a READ parent.
+    /// RM READ configuration. Absence disables URMA bulk transfer.
+    /// Parent publication additionally requires providerRevocationValidated;
+    /// a Child can use READ without enabling local Parent publication.
     #[serde(default)]
     #[validate]
     pub read: Option<UrmaReadServer>,
@@ -1270,9 +1220,6 @@ fn validate_urma_read_server(read: &UrmaReadServer) -> std::result::Result<(), V
 
 const URMA_MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
 const URMA_MAX_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
-const URMA_REGISTERED_SLOT_SIZE: u64 = 64 * 1024;
-const URMA_MAX_REGISTERED_BYTES: u64 = (u16::MAX as u64 + 1) * URMA_REGISTERED_SLOT_SIZE;
-
 fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), ValidationError> {
     if urma.transfer_timeout < URMA_MIN_TRANSFER_TIMEOUT
         || urma.transfer_timeout > URMA_MAX_TRANSFER_TIMEOUT
@@ -1282,20 +1229,6 @@ fn validate_urma_server(urma: &UrmaServer) -> std::result::Result<(), Validation
         ));
     }
 
-    let registered = urma.max_registered_bytes.as_u64();
-    let tx_registered = urma.tx_registered_bytes.as_u64();
-    if !(2 * URMA_REGISTERED_SLOT_SIZE..=URMA_MAX_REGISTERED_BYTES).contains(&registered) {
-        return Err(ValidationError::new(
-            "maxRegisteredBytes must be between 128KiB and 4GiB",
-        ));
-    }
-    if tx_registered < URMA_REGISTERED_SLOT_SIZE
-        || tx_registered > registered.saturating_sub(URMA_REGISTERED_SLOT_SIZE)
-    {
-        return Err(ValidationError::new(
-            "txRegisteredBytes must leave at least one 64KiB slot for both TX and RX",
-        ));
-    }
     Ok(())
 }
 
@@ -1309,17 +1242,34 @@ impl Default for UrmaServer {
             device: None,
             eid_index: default_storage_server_urma_eid_index(),
             fabric_tag: None,
-            max_registered_bytes: default_storage_server_urma_max_registered_bytes(),
-            tx_registered_bytes: default_storage_server_urma_tx_registered_bytes(),
-            max_inflight_chunks: default_storage_server_urma_max_inflight_chunks(),
-            post_list_size: default_storage_server_urma_post_list_size(),
-            pipeline_depth: default_storage_server_urma_pipeline_depth(),
+            deprecated: DeprecatedUrmaOptions::default(),
             max_concurrent_transfers: default_storage_server_urma_max_concurrent_transfers(),
-            peer_guaranteed_rx_credits: default_storage_server_urma_peer_guaranteed_rx_credits(),
             transfer_timeout: default_storage_server_urma_transfer_timeout(),
             mmap_content: false,
             read: None,
         }
+    }
+}
+
+/// Deprecated SEND/RECV settings are accepted for config migration only.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeprecatedUrmaOptions {
+    pub max_registered_bytes: Option<serde_yaml::Value>,
+    pub tx_registered_bytes: Option<serde_yaml::Value>,
+    pub max_inflight_chunks: Option<serde_yaml::Value>,
+    pub post_list_size: Option<serde_yaml::Value>,
+    pub pipeline_depth: Option<serde_yaml::Value>,
+    pub peer_guaranteed_rx_credits: Option<serde_yaml::Value>,
+}
+impl DeprecatedUrmaOptions {
+    pub fn configured(&self) -> bool {
+        self.max_registered_bytes.is_some()
+            || self.tx_registered_bytes.is_some()
+            || self.max_inflight_chunks.is_some()
+            || self.post_list_size.is_some()
+            || self.pipeline_depth.is_some()
+            || self.peer_guaranteed_rx_credits.is_some()
     }
 }
 
@@ -2865,13 +2815,8 @@ mod urma_config_tests {
         assert_eq!(urma.tp_type, UrmaTpType::Ctp);
         assert_eq!(urma.port, 4008);
         assert!(urma.device.is_none());
-        assert_eq!(urma.max_registered_bytes, ByteSize::mib(40));
-        assert_eq!(urma.tx_registered_bytes, ByteSize::mib(8));
-        assert_eq!(urma.max_inflight_chunks, 512);
-        assert_eq!(urma.post_list_size, 1);
-        assert_eq!(urma.pipeline_depth, 2);
         assert_eq!(urma.max_concurrent_transfers, 64);
-        assert_eq!(urma.peer_guaranteed_rx_credits, 0);
+        assert!(urma.read.is_none());
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
         let read = UrmaReadServer::default();
         assert!(!read.provider_revocation_validated);
@@ -2885,7 +2830,6 @@ mod urma_config_tests {
                 .unwrap();
         assert_eq!(urma.transport_mode, UrmaTransportMode::Rm);
         assert_eq!(urma.tp_type, UrmaTpType::Ctp);
-        assert_eq!(urma.peer_guaranteed_rx_credits, 8);
     }
 
     #[test]
@@ -2903,60 +2847,22 @@ mod urma_config_tests {
     }
 
     #[test]
-    fn reject_rc_mode_on_rm_only_branch() {
-        assert!(serde_yaml::from_str::<UrmaServer>("transportMode: rc").is_err());
-    }
-
-    #[test]
-    fn reject_invalid_urma_registered_budget_split() {
-        for urma in [
-            UrmaServer {
-                max_registered_bytes: ByteSize::kib(64),
-                ..Default::default()
-            },
-            UrmaServer {
-                tx_registered_bytes: ByteSize::b(0),
-                ..Default::default()
-            },
-            UrmaServer {
-                max_registered_bytes: ByteSize::mib(1),
-                tx_registered_bytes: ByteSize::mib(1),
-                ..Default::default()
-            },
-        ] {
-            assert!(urma.validate().is_err());
-        }
-    }
-
-    #[test]
-    fn reject_invalid_urma_limits() {
-        for pipeline_depth in [0, 3] {
-            assert!(UrmaServer {
-                pipeline_depth,
-                ..Default::default()
-            }
-            .validate()
-            .is_err());
-        }
-        for post_list_size in [0, 65] {
-            assert!(UrmaServer {
-                post_list_size,
-                ..Default::default()
-            }
-            .validate()
-            .is_err());
-        }
+    fn deprecated_send_recv_options_do_not_gate_read_or_enable_it() {
+        let urma: UrmaServer = serde_yaml::from_str("maxRegisteredBytes: 0B\ntxRegisteredBytes: 0B\nmaxInflightChunks: 0\npostListSize: 0\npipelineDepth: 0\npeerGuaranteedRxCredits: 999999").unwrap();
+        assert!(urma.deprecated.configured());
+        assert!(urma.validate().is_ok());
+        assert!(urma.read.is_none());
+        assert!(!UrmaReadServer::default().provider_revocation_validated);
         assert!(UrmaServer {
             max_concurrent_transfers: 0,
             ..Default::default()
         }
         .validate()
         .is_err());
-        assert!(UrmaServer {
-            peer_guaranteed_rx_credits: 4097,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
+    }
+
+    #[test]
+    fn reject_rc_mode_on_rm_only_branch() {
+        assert!(serde_yaml::from_str::<UrmaServer>("transportMode: rc").is_err());
     }
 }

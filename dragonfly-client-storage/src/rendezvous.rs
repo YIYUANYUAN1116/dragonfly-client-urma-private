@@ -8,15 +8,10 @@ use dragonfly_client_core::{Error, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub(crate) const HEADER_LENGTH: usize = 10;
-pub(crate) const MAX_TASK_ID_LENGTH: usize = 4096;
 pub(crate) const MAX_STRING_LENGTH: usize = 4096;
 pub(crate) const MAX_PAYLOAD_LENGTH: usize = 128 * 1024;
 
 pub const ERROR_CODE_INCOMPATIBLE: u32 = 1;
-pub const ERROR_CODE_NOT_FOUND: u32 = 2;
-pub const ERROR_CODE_INTERNAL: u32 = 3;
-pub const ERROR_CODE_TOO_LARGE: u32 = 4;
-pub const ERROR_CODE_BUSY: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceKind {
@@ -45,104 +40,6 @@ impl From<PieceKind> for u8 {
             PieceKind::PersistentPiece => 1,
             PieceKind::PersistentCachePiece => 2,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PieceRequest {
-    pub kind: PieceKind,
-    pub task_id: String,
-    pub piece_number: u32,
-    pub chunk_size: u64,
-    pub max_inflight_chunks: u32,
-}
-
-impl PieceRequest {
-    #[cfg(feature = "urma")]
-    pub(crate) fn encode(&self, payload: &mut Vec<u8>) {
-        payload.push(self.kind.into());
-        put_bytes(payload, self.task_id.as_bytes());
-        payload.extend_from_slice(&self.piece_number.to_be_bytes());
-        payload.extend_from_slice(&self.chunk_size.to_be_bytes());
-        payload.extend_from_slice(&self.max_inflight_chunks.to_be_bytes());
-    }
-
-    #[cfg(feature = "urma")]
-    pub(crate) fn decode(reader: &mut PayloadReader<'_>) -> Result<Self> {
-        Ok(Self {
-            kind: reader.u8()?.try_into()?,
-            task_id: reader.string(MAX_TASK_ID_LENGTH)?,
-            piece_number: reader.u32()?,
-            chunk_size: reader.u64()?,
-            max_inflight_chunks: reader.u32()?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PieceMetadata {
-    pub offset: u64,
-    pub length: u64,
-    pub digest: String,
-    pub chunk_size: u64,
-    pub max_inflight_chunks: u32,
-}
-
-impl PieceMetadata {
-    #[cfg(feature = "urma")]
-    pub(crate) fn encode(&self, payload: &mut Vec<u8>) {
-        payload.extend_from_slice(&self.offset.to_be_bytes());
-        payload.extend_from_slice(&self.length.to_be_bytes());
-        put_bytes(payload, self.digest.as_bytes());
-        payload.extend_from_slice(&self.chunk_size.to_be_bytes());
-        payload.extend_from_slice(&self.max_inflight_chunks.to_be_bytes());
-    }
-
-    #[cfg(feature = "urma")]
-    pub(crate) fn decode(reader: &mut PayloadReader<'_>) -> Result<Self> {
-        Ok(Self {
-            offset: reader.u64()?,
-            length: reader.u64()?,
-            digest: reader.string(MAX_STRING_LENGTH)?,
-            chunk_size: reader.u64()?,
-            max_inflight_chunks: reader.u32()?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveWindow {
-    pub start_chunk: u64,
-    pub chunk_count: u32,
-}
-
-impl ReceiveWindow {
-    pub(crate) fn encode(self, payload: &mut Vec<u8>) {
-        payload.extend_from_slice(&self.start_chunk.to_be_bytes());
-        payload.extend_from_slice(&self.chunk_count.to_be_bytes());
-    }
-
-    pub(crate) fn decode(reader: &mut PayloadReader<'_>) -> Result<Self> {
-        Ok(Self {
-            start_chunk: reader.u64()?,
-            chunk_count: reader.u32()?,
-        })
-    }
-
-    pub(crate) fn validate(self, expected_start: u64, remaining_chunks: u64) -> Result<()> {
-        if self.start_chunk != expected_start || self.chunk_count == 0 {
-            return Err(Error::Unknown(format!(
-                "invalid receive window: expected start {expected_start}, got start {} count {}",
-                self.start_chunk, self.chunk_count
-            )));
-        }
-        if u64::from(self.chunk_count) > remaining_chunks {
-            return Err(Error::Unknown(format!(
-                "receive window count {} exceeds {remaining_chunks} remaining chunks",
-                self.chunk_count
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -291,28 +188,6 @@ pub(crate) async fn read_envelope<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn receive_window_is_contiguous_and_bounded() {
-        assert!(ReceiveWindow {
-            start_chunk: 4,
-            chunk_count: 3
-        }
-        .validate(4, 3)
-        .is_ok());
-        assert!(ReceiveWindow {
-            start_chunk: 5,
-            chunk_count: 1
-        }
-        .validate(4, 3)
-        .is_err());
-        assert!(ReceiveWindow {
-            start_chunk: 4,
-            chunk_count: 4
-        }
-        .validate(4, 3)
-        .is_err());
-    }
 
     #[tokio::test]
     async fn envelope_round_trip() {

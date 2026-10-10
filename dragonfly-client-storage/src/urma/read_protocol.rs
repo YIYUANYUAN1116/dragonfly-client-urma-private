@@ -126,6 +126,7 @@ impl ReadCapability {
         payload.extend_from_slice(&self.descriptor_version.to_be_bytes());
     }
 
+    #[cfg(test)]
     fn decode(reader: &mut WireReader<'_>) -> Result<Self> {
         let capability = Self {
             max_read_size: reader.u32()?,

@@ -17,7 +17,7 @@
 pub mod quic;
 pub mod tcp;
 #[cfg(feature = "urma")]
-pub mod urma;
+pub mod urma_discovery;
 #[cfg(feature = "urma")]
 pub mod urma_read;
 

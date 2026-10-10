@@ -29,10 +29,6 @@
 
 #include <urma_api.h>
 
-_Static_assert(URMA_CR_OPC_SEND == 0,
-               "URMA SEND completion opcode changed");
-_Static_assert(URMA_CR_OPC_SEND_WITH_IMM == DFURMA_CR_OPC_SEND_WITH_IMM,
-               "URMA SEND_WITH_IMM completion opcode changed");
 _Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
                "URMA EID size changed");
 _Static_assert(URMA_RTP == DFURMA_TP_RTP, "URMA RTP value changed");
@@ -138,7 +134,6 @@ struct dfurma_wr {
     urma_sge_t remote_sge;
     urma_sge_t sge;
     urma_jfs_wr_t send_wr;
-    urma_jfr_wr_t recv_wr;
     dfurma_wr_t *next_free;
 };
 
@@ -338,8 +333,8 @@ int dfurma_jfc_delete(dfurma_jfc_t *jfc)
     return 0;
 }
 
-static int dfurma_segment_create_impl(dfurma_runtime_t *runtime, uint64_t length,
-                            uint64_t alignment, dfurma_segment_t **out, int retain_failure)
+int dfurma_read_buffer_create(dfurma_runtime_t *runtime, uint64_t length,
+                            uint64_t alignment, dfurma_segment_t **out)
 {
     urma_seg_cfg_t cfg = {0};
     dfurma_segment_t *segment;
@@ -365,7 +360,7 @@ static int dfurma_segment_create_impl(dfurma_runtime_t *runtime, uint64_t length
 
     /*
      * Confirm page/alignment and pinning behavior on every supported provider.
-     * Dragonfly requests only local access for the two-sided data path.
+     * The READ destination grants local access only.
      */
     cfg.va = (uint64_t)(uintptr_t)segment->memory;
     cfg.len = length;
@@ -378,16 +373,11 @@ static int dfurma_segment_create_impl(dfurma_runtime_t *runtime, uint64_t length
     segment->segment = urma_register_seg(runtime->context, &cfg);
     if (segment->segment == NULL) {
         int error = dfurma_pointer_error(-EIO);
-        if (retain_failure) {
-            /* No proof that failed registration rolled back all pinning. */
-            segment->runtime = runtime;
-            segment->length = length;
-            runtime->segment_count++;
-            *out = segment;
-            return error;
-        }
-        free(segment->memory);
-        free(segment);
+        /* No proof that failed registration rolled back all pinning. */
+        segment->runtime = runtime;
+        segment->length = length;
+        runtime->segment_count++;
+        *out = segment;
         return error;
     }
 
@@ -396,18 +386,6 @@ static int dfurma_segment_create_impl(dfurma_runtime_t *runtime, uint64_t length
     runtime->segment_count++;
     *out = segment;
     return 0;
-}
-
-int dfurma_segment_create(dfurma_runtime_t *runtime, uint64_t length,
-                            uint64_t alignment, dfurma_segment_t **out)
-{
-    return dfurma_segment_create_impl(runtime, length, alignment, out, 0);
-}
-
-int dfurma_read_buffer_create(dfurma_runtime_t *runtime, uint64_t length,
-                            uint64_t alignment, dfurma_segment_t **out)
-{
-    return dfurma_segment_create_impl(runtime, length, alignment, out, 1);
 }
 
 int dfurma_segment_delete(dfurma_segment_t *segment)
@@ -829,20 +807,6 @@ int dfurma_target_unimport(dfurma_target_t *target)
     target->target = NULL;
     target->jetty = NULL;
     free(target);
-    return 0;
-}
-
-int dfurma_target_remote_id(dfurma_target_t *target,
-                            uint8_t eid[DFURMA_EID_SIZE], uint32_t *uasid,
-                            uint32_t *jetty_id)
-{
-    if (target == NULL || target->target == NULL || eid == NULL ||
-        uasid == NULL || jetty_id == NULL) {
-        return -EINVAL;
-    }
-    (void)memcpy(eid, target->target->id.eid.raw, DFURMA_EID_SIZE);
-    *uasid = target->target->id.uasid;
-    *jetty_id = target->target->id.id;
     return 0;
 }
 
@@ -1352,265 +1316,6 @@ int dfurma_post_read(dfurma_jetty_t *jetty, dfurma_target_t *target,
     return (int)status;
 }
 
-static int dfurma_post_send_common(dfurma_jetty_t *jetty,
-                                   dfurma_target_t *target,
-                                   dfurma_segment_t *segment,
-                                   uint64_t offset, uint32_t length,
-                                   uint64_t user_ctx, uint64_t imm_data,
-                                   uint8_t with_imm, dfurma_wr_t **out)
-{
-    dfurma_wr_t *wr;
-    urma_jfs_wr_t *bad_wr = NULL;
-    urma_status_t status;
-    int create_status;
-
-    if (jetty == NULL || target == NULL || target->target == NULL ||
-        target->jetty != jetty) {
-        return -ENOTCONN;
-    }
-    create_status = dfurma_wr_acquire(jetty, segment, offset, length, &wr);
-    if (create_status != 0) {
-        return create_status;
-    }
-    wr->send_wr.opcode = with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
-    wr->send_wr.flag.value = 0;
-    wr->send_wr.flag.bs.complete_enable = 1;
-    wr->target = target;
-    wr->send_wr.tjetty = target->target;
-    wr->send_wr.user_ctx = user_ctx;
-    wr->send_wr.send.src.sge = &wr->sge;
-    wr->send_wr.send.src.num_sge = 1;
-    wr->send_wr.send.imm_data = imm_data;
-    wr->send_wr.next = NULL;
-    status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
-    if (status != URMA_SUCCESS) {
-        dfurma_wr_return(wr);
-        return (int)status;
-    }
-    dfurma_wr_posted(wr);
-    *out = wr;
-    return 0;
-}
-
-int dfurma_post_send(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                     dfurma_segment_t *segment, uint64_t offset,
-                     uint32_t length, uint64_t user_ctx,
-                     dfurma_wr_t **out)
-{
-    return dfurma_post_send_common(jetty, target, segment, offset, length, user_ctx,
-                                   0, 0, out);
-}
-
-int dfurma_post_send_imm(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                         dfurma_segment_t *segment, uint64_t offset,
-                         uint32_t length, uint64_t user_ctx,
-                         uint64_t imm_data, dfurma_wr_t **out)
-{
-    return dfurma_post_send_common(jetty, target, segment, offset, length, user_ctx,
-                                   imm_data, 1, out);
-}
-
-int dfurma_post_recv(dfurma_jetty_t *jetty,
-                       dfurma_segment_t *segment, uint64_t offset,
-                       uint32_t length, uint64_t user_ctx,
-                       dfurma_wr_t **out)
-{
-    dfurma_wr_t *wr;
-    urma_jfr_wr_t *bad_wr = NULL;
-    urma_status_t status;
-    int create_status = dfurma_wr_acquire(jetty, segment, offset, length, &wr);
-
-    if (create_status != 0) {
-        return create_status;
-    }
-    wr->recv_wr.src.sge = &wr->sge;
-    wr->recv_wr.src.num_sge = 1;
-    wr->recv_wr.user_ctx = user_ctx;
-    wr->recv_wr.next = NULL;
-    status = urma_post_jetty_recv_wr(jetty->jetty, &wr->recv_wr, &bad_wr);
-    if (status != URMA_SUCCESS) {
-        dfurma_wr_return(wr);
-        return (int)status;
-    }
-    dfurma_wr_posted(wr);
-    *out = wr;
-    return 0;
-}
-
-static void dfurma_wr_return_range(dfurma_wr_t **wr_list, uint32_t begin,
-                                   uint32_t end)
-{
-    uint32_t i;
-
-    for (i = begin; i < end; ++i) {
-        dfurma_wr_return(wr_list[i]);
-    }
-}
-
-static int dfurma_post_list_prepare(dfurma_jetty_t *jetty,
-                                    dfurma_segment_t *segment,
-                                    const dfurma_post_entry_t *entries,
-                                    uint32_t count, dfurma_wr_t **wr_list,
-                                    dfurma_wr_t **out, uint32_t *posted)
-{
-    uint32_t i;
-    int status;
-
-    if (jetty == NULL || segment == NULL || entries == NULL || out == NULL ||
-        posted == NULL || count == 0 || count > DFURMA_MAX_POST_LIST) {
-        return -EINVAL;
-    }
-    *posted = 0;
-    for (i = 0; i < count; ++i) {
-        out[i] = NULL;
-        status = dfurma_wr_acquire(jetty, segment, entries[i].offset,
-                                   entries[i].length, &wr_list[i]);
-        if (status != 0) {
-            dfurma_wr_return_range(wr_list, 0, i);
-            return status;
-        }
-    }
-    return 0;
-}
-
-static int dfurma_post_send_list_common(dfurma_jetty_t *jetty,
-                                        dfurma_target_t *target,
-                                        dfurma_segment_t *segment,
-                                        const dfurma_post_entry_t *entries,
-                                        uint32_t count, uint8_t with_imm,
-                                        dfurma_wr_t **out, uint32_t *posted)
-{
-    dfurma_wr_t *wr_list[DFURMA_MAX_POST_LIST];
-    urma_jfs_wr_t *bad_wr = NULL;
-    urma_status_t status;
-    int result_status;
-    uint32_t prefix = 0;
-    uint32_t i;
-    int prepare_status;
-
-    if (jetty == NULL || target == NULL || target->target == NULL ||
-        target->jetty != jetty) {
-        return -ENOTCONN;
-    }
-    prepare_status = dfurma_post_list_prepare(jetty, segment, entries, count,
-                                              wr_list, out, posted);
-    if (prepare_status != 0) {
-        return prepare_status;
-    }
-    for (i = 0; i < count; ++i) {
-        dfurma_wr_t *wr = wr_list[i];
-        wr->send_wr.opcode =
-            with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
-        wr->send_wr.flag.value = 0;
-        wr->send_wr.flag.bs.complete_enable = 1;
-        wr->target = target;
-        wr->send_wr.tjetty = target->target;
-        wr->send_wr.user_ctx = entries[i].user_ctx;
-        wr->send_wr.send.src.sge = &wr->sge;
-        wr->send_wr.send.src.num_sge = 1;
-        wr->send_wr.send.imm_data =
-            with_imm != 0 ? entries[i].imm_data : 0;
-        wr->send_wr.next = i + 1 < count ? &wr_list[i + 1]->send_wr : NULL;
-    }
-
-    status = urma_post_jetty_send_wr(jetty->jetty, &wr_list[0]->send_wr,
-                                     &bad_wr);
-    result_status = (int)status;
-    if (status == URMA_SUCCESS) {
-        prefix = count;
-    } else {
-        for (i = 0; i < count; ++i) {
-            if (bad_wr == &wr_list[i]->send_wr) {
-                prefix = i;
-                break;
-            }
-        }
-        if (bad_wr == NULL || i == count) {
-            /* Ownership is ambiguous on a broken provider contract. Retain
-             * every WR as outstanding so teardown cannot free live metadata. */
-            prefix = count;
-            result_status = -EPROTO;
-        }
-    }
-    for (i = 0; i < prefix; ++i) {
-        dfurma_wr_posted(wr_list[i]);
-        out[i] = wr_list[i];
-    }
-    dfurma_wr_return_range(wr_list, prefix, count);
-    *posted = prefix;
-    return result_status;
-}
-
-int dfurma_post_send_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                          dfurma_segment_t *segment,
-                          const dfurma_post_entry_t *entries, uint32_t count,
-                          dfurma_wr_t **out, uint32_t *posted)
-{
-    return dfurma_post_send_list_common(jetty, target, segment, entries, count, 0,
-                                        out, posted);
-}
-
-int dfurma_post_send_imm_list(dfurma_jetty_t *jetty, dfurma_target_t *target,
-                              dfurma_segment_t *segment,
-                              const dfurma_post_entry_t *entries,
-                              uint32_t count, dfurma_wr_t **out,
-                              uint32_t *posted)
-{
-    return dfurma_post_send_list_common(jetty, target, segment, entries, count, 1,
-                                        out, posted);
-}
-
-int dfurma_post_recv_list(dfurma_jetty_t *jetty,
-                          dfurma_segment_t *segment,
-                          const dfurma_post_entry_t *entries, uint32_t count,
-                          dfurma_wr_t **out, uint32_t *posted)
-{
-    dfurma_wr_t *wr_list[DFURMA_MAX_POST_LIST];
-    urma_jfr_wr_t *bad_wr = NULL;
-    urma_status_t status;
-    int result_status;
-    uint32_t prefix = 0;
-    uint32_t i;
-    int prepare_status = dfurma_post_list_prepare(
-        jetty, segment, entries, count, wr_list, out, posted);
-
-    if (prepare_status != 0) {
-        return prepare_status;
-    }
-    for (i = 0; i < count; ++i) {
-        dfurma_wr_t *wr = wr_list[i];
-        wr->recv_wr.src.sge = &wr->sge;
-        wr->recv_wr.src.num_sge = 1;
-        wr->recv_wr.user_ctx = entries[i].user_ctx;
-        wr->recv_wr.next = i + 1 < count ? &wr_list[i + 1]->recv_wr : NULL;
-    }
-
-    status = urma_post_jetty_recv_wr(jetty->jetty, &wr_list[0]->recv_wr,
-                                     &bad_wr);
-    result_status = (int)status;
-    if (status == URMA_SUCCESS) {
-        prefix = count;
-    } else {
-        for (i = 0; i < count; ++i) {
-            if (bad_wr == &wr_list[i]->recv_wr) {
-                prefix = i;
-                break;
-            }
-        }
-        if (bad_wr == NULL || i == count) {
-            prefix = count;
-            result_status = -EPROTO;
-        }
-    }
-    for (i = 0; i < prefix; ++i) {
-        dfurma_wr_posted(wr_list[i]);
-        out[i] = wr_list[i];
-    }
-    dfurma_wr_return_range(wr_list, prefix, count);
-    *posted = prefix;
-    return result_status;
-}
-
 void dfurma_wr_complete(dfurma_wr_t *wr)
 {
     if (wr == NULL) {
@@ -1654,23 +1359,13 @@ int dfurma_jfc_poll(dfurma_jfc_t *jfc, uint32_t capacity,
         out[i].status = (int32_t)cr[i].status;
         out[i].opcode = (uint32_t)cr[i].opcode;
         out[i].user_ctx = cr[i].user_ctx;
-        out[i].imm_data = cr[i].imm_data;
         out[i].completion_len = cr[i].completion_len;
         out[i].local_id = cr[i].local_id;
-        memcpy(out[i].remote_eid, cr[i].remote_id.eid.raw,
-               DFURMA_EID_SIZE);
-        out[i].remote_uasid = cr[i].remote_id.uasid;
-        out[i].remote_jetty_id = cr[i].remote_id.id;
         out[i].is_recv = cr[i].flag.bs.s_r;
         out[i].is_jetty = cr[i].flag.bs.jetty;
         out[i].user_ctx_valid =
             (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
              cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
-        out[i].imm_data_valid =
-            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0 &&
-             cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM);
-        out[i].remote_id_valid =
-            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0);
         if (cr[i].status == URMA_CR_WR_SUSPEND_DONE) {
             out[i].event_kind = DFURMA_COMPLETION_WR_SUSPEND_DONE;
         } else if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {

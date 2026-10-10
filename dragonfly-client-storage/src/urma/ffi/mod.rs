@@ -7,8 +7,8 @@ use std::{
     rc::Rc,
 };
 
-// Native READ building blocks remain disconnected from production dispatch.
-#[allow(dead_code)]
+// Native READ ownership and posting primitives.
+
 pub(crate) mod read;
 
 mod sys {
@@ -23,7 +23,6 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
 }
 
-pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::DFURMA_CR_OPC_SEND_WITH_IMM;
 pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
 pub(crate) const TP_RTP: u32 = sys::DFURMA_TP_RTP;
 pub(crate) const TP_CTP: u32 = sys::DFURMA_TP_CTP;
@@ -60,34 +59,12 @@ pub(crate) struct JettyConfig {
     pub tp_type: u32,
 }
 
-pub(crate) const MAX_POST_LIST: u32 = sys::DFURMA_MAX_POST_LIST;
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PostEntry {
-    pub(crate) offset: u64,
-    pub(crate) length: u32,
-    pub(crate) user_ctx: u64,
-    pub(crate) imm_data: Option<u64>,
-}
-
-pub(crate) struct PostBatch {
-    pub(crate) handles: Vec<WrHandle>,
-    pub(crate) error: Option<FfiError>,
-}
-
 pub(crate) struct JettyDescriptorData {
     pub transport_type: u32,
     pub tp_type: u32,
     pub eid_index: u32,
     pub jetty_id: u32,
     pub opaque_data: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RemoteJettyId {
-    pub eid: [u8; EID_SIZE],
-    pub uasid: u32,
-    pub id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -98,14 +75,11 @@ pub(crate) struct CompletionRecord {
     pub status: i32,
     pub opcode: u32,
     pub user_ctx: u64,
-    pub imm_data: u64,
     pub completion_len: u32,
     pub local_id: u32,
-    pub remote_id: Option<RemoteJettyId>,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
-    pub imm_data_valid: bool,
     pub event_kind: CompletionEventKind,
 }
 
@@ -141,7 +115,7 @@ pub(crate) struct ImportFailure {
 /// Unique Rust owner of the opaque C shim runtime.
 ///
 /// All raw pointers and unsafe calls terminate in this type. The `Rc` marker
-/// prevents the handle from crossing threads during Phase 0.
+/// keeps endpoint handles on their owner thread.
 pub(crate) struct NativeRuntime {
     raw: Option<NonNull<sys::dfurma_runtime_t>>,
     _not_send_sync: PhantomData<Rc<()>>,
@@ -294,18 +268,11 @@ impl JfcHandle {
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
-                imm_data: record.imm_data,
                 completion_len: record.completion_len,
                 local_id: record.local_id,
-                remote_id: (record.remote_id_valid != 0).then_some(RemoteJettyId {
-                    eid: record.remote_eid,
-                    uasid: record.remote_uasid,
-                    id: record.remote_jetty_id,
-                }),
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
-                imm_data_valid: record.imm_data_valid != 0,
                 event_kind: match record.event_kind {
                     0 => CompletionEventKind::WorkRequest,
                     1 => CompletionEventKind::SuspendDone,
@@ -336,27 +303,6 @@ impl SegmentHandle {
             raw: None,
             _not_send_sync: PhantomData,
         }
-    }
-
-    pub(crate) fn create(
-        runtime: &mut NativeRuntime,
-        length: u64,
-        alignment: u64,
-    ) -> Result<Self, FfiError> {
-        let raw_runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: The runtime pointer is live and `raw` is a valid out pointer.
-        let status = unsafe {
-            sys::dfurma_segment_create(raw_runtime.as_ptr(), length, alignment, &mut raw)
-        };
-        if status != 0 {
-            return Err(FfiError::Status(status));
-        }
-        let raw = NonNull::new(raw).ok_or(FfiError::NullHandle)?;
-        Ok(Self {
-            raw: Some(raw),
-            _not_send_sync: PhantomData,
-        })
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
@@ -531,48 +477,6 @@ impl JettyHandle {
         status_result(unsafe { sys::dfurma_jetty_mark_error(jetty.as_ptr()) })
     }
 
-    #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
-    pub(crate) fn post_send(
-        &mut self,
-        target: &TargetHandle,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-    ) -> Result<WrHandle, FfiError> {
-        self.post(Some(target), segment, offset, length, user_ctx, true, None)
-    }
-
-    pub(crate) fn post_send_imm(
-        &mut self,
-        target: &TargetHandle,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-        imm_data: u64,
-    ) -> Result<WrHandle, FfiError> {
-        self.post(
-            Some(target),
-            segment,
-            offset,
-            length,
-            user_ctx,
-            true,
-            Some(imm_data),
-        )
-    }
-
-    pub(crate) fn post_recv(
-        &mut self,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-    ) -> Result<WrHandle, FfiError> {
-        self.post(None, segment, offset, length, user_ctx, false, None)
-    }
-
     pub(crate) fn local_ids(&self) -> Result<(u32, u32), FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let mut jetty_id = 0;
@@ -582,182 +486,6 @@ impl JettyHandle {
             sys::dfurma_jetty_local_ids(jetty.as_ptr(), &mut jetty_id, &mut jfr_id)
         })?;
         Ok((jetty_id, jfr_id))
-    }
-
-    #[allow(dead_code)] // Retained as the plain-SEND shim path for compatibility probes.
-    pub(crate) fn post_send_list(
-        &mut self,
-        target: &TargetHandle,
-        segment: &SegmentHandle,
-        entries: &[PostEntry],
-    ) -> Result<PostBatch, FfiError> {
-        self.post_list(Some(target), segment, entries, true, false)
-    }
-
-    pub(crate) fn post_send_imm_list(
-        &mut self,
-        target: &TargetHandle,
-        segment: &SegmentHandle,
-        entries: &[PostEntry],
-    ) -> Result<PostBatch, FfiError> {
-        if entries.iter().any(|entry| entry.imm_data.is_none()) {
-            return Err(FfiError::Contract(
-                "SEND_IMM post-list entry lacks immediate data",
-            ));
-        }
-        self.post_list(Some(target), segment, entries, true, true)
-    }
-
-    pub(crate) fn post_recv_list(
-        &mut self,
-        segment: &SegmentHandle,
-        entries: &[PostEntry],
-    ) -> Result<PostBatch, FfiError> {
-        self.post_list(None, segment, entries, false, false)
-    }
-
-    fn post_list(
-        &mut self,
-        target: Option<&TargetHandle>,
-        segment: &SegmentHandle,
-        entries: &[PostEntry],
-        send: bool,
-        with_imm: bool,
-    ) -> Result<PostBatch, FfiError> {
-        if entries.is_empty() || entries.len() > sys::DFURMA_MAX_POST_LIST as usize {
-            return Err(FfiError::Contract("invalid linked WR post-list length"));
-        }
-        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
-        let target = target.and_then(|target| target.raw);
-        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
-        let raw_entries: Vec<sys::dfurma_post_entry_t> = entries
-            .iter()
-            .map(|entry| sys::dfurma_post_entry_t {
-                offset: entry.offset,
-                length: entry.length,
-                user_ctx: entry.user_ctx,
-                imm_data: entry.imm_data.unwrap_or_default(),
-            })
-            .collect();
-        let mut raw_handles = vec![std::ptr::null_mut(); entries.len()];
-        let mut posted = 0u32;
-        // SAFETY: All input/output slices remain live for the synchronous shim
-        // call. The shim validates every segment range before posting the list.
-        let status = unsafe {
-            if with_imm {
-                sys::dfurma_post_send_imm_list(
-                    jetty.as_ptr(),
-                    target
-                        .ok_or(FfiError::Contract("SEND requires a target"))?
-                        .as_ptr(),
-                    segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
-                    raw_handles.as_mut_ptr(),
-                    &mut posted,
-                )
-            } else if send {
-                sys::dfurma_post_send_list(
-                    jetty.as_ptr(),
-                    target
-                        .ok_or(FfiError::Contract("SEND requires a target"))?
-                        .as_ptr(),
-                    segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
-                    raw_handles.as_mut_ptr(),
-                    &mut posted,
-                )
-            } else {
-                sys::dfurma_post_recv_list(
-                    jetty.as_ptr(),
-                    segment.as_ptr(),
-                    raw_entries.as_ptr(),
-                    raw_entries.len() as u32,
-                    raw_handles.as_mut_ptr(),
-                    &mut posted,
-                )
-            }
-        };
-        let posted = usize::try_from(posted)
-            .map_err(|_| FfiError::Contract("posted WR prefix does not fit usize"))?;
-        if posted > entries.len() || (status == 0 && posted != entries.len()) {
-            return Err(FfiError::Contract("invalid posted WR prefix from shim"));
-        }
-        let mut handles = Vec::with_capacity(posted);
-        for raw in raw_handles.into_iter().take(posted) {
-            handles.push(WrHandle {
-                raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
-                _not_send_sync: PhantomData,
-            });
-        }
-        Ok(PostBatch {
-            handles,
-            error: (status != 0).then_some(FfiError::Status(status)),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn post(
-        &mut self,
-        target: Option<&TargetHandle>,
-        segment: &SegmentHandle,
-        offset: u64,
-        length: u32,
-        user_ctx: u64,
-        send: bool,
-        imm_data: Option<u64>,
-    ) -> Result<WrHandle, FfiError> {
-        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
-        let target = target.and_then(|target| target.raw);
-        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: Jetty and Segment are live, range validation is repeated by
-        // the shim, and raw is a valid out pointer.
-        let status = unsafe {
-            if let Some(imm_data) = imm_data {
-                sys::dfurma_post_send_imm(
-                    jetty.as_ptr(),
-                    target
-                        .ok_or(FfiError::Contract("SEND requires a target"))?
-                        .as_ptr(),
-                    segment.as_ptr(),
-                    offset,
-                    length,
-                    user_ctx,
-                    imm_data,
-                    &mut raw,
-                )
-            } else if send {
-                sys::dfurma_post_send(
-                    jetty.as_ptr(),
-                    target
-                        .ok_or(FfiError::Contract("SEND requires a target"))?
-                        .as_ptr(),
-                    segment.as_ptr(),
-                    offset,
-                    length,
-                    user_ctx,
-                    &mut raw,
-                )
-            } else {
-                sys::dfurma_post_recv(
-                    jetty.as_ptr(),
-                    segment.as_ptr(),
-                    offset,
-                    length,
-                    user_ctx,
-                    &mut raw,
-                )
-            }
-        };
-        if status != 0 {
-            return Err(FfiError::Status(status));
-        }
-        Ok(WrHandle {
-            raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
-            _not_send_sync: PhantomData,
-        })
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
@@ -784,15 +512,6 @@ impl WrHandle {
         if let Some(raw) = self.raw.take() {
             // SAFETY: Completion routing guarantees one call for the unique WR.
             unsafe { sys::dfurma_wr_complete(raw.as_ptr()) };
-        }
-    }
-
-    /// Test-only handle that owns no native WR; `complete` is a no-op.
-    #[cfg(test)]
-    pub(crate) fn without_native() -> Self {
-        Self {
-            raw: None,
-            _not_send_sync: PhantomData,
         }
     }
 }
@@ -823,18 +542,6 @@ impl TargetHandle {
             raw: None,
             _not_send_sync: PhantomData,
         }
-    }
-
-    pub(crate) fn remote_id(&self) -> Result<RemoteJettyId, FfiError> {
-        let target = self.raw.ok_or(FfiError::Contract("target is closed"))?;
-        let mut eid = [0u8; EID_SIZE];
-        let mut uasid = 0;
-        let mut id = 0;
-        // SAFETY: all outputs are writable and target is a live imported handle.
-        status_result(unsafe {
-            sys::dfurma_target_remote_id(target.as_ptr(), eid.as_mut_ptr(), &mut uasid, &mut id)
-        })?;
-        Ok(RemoteJettyId { eid, uasid, id })
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {

@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
-use tracing::{debug, error, info, instrument, warn, Span};
+#[cfg(feature = "urma")]
+use tracing::info;
+use tracing::{debug, error, instrument, warn, Span};
 
 /// The minimum piece length.
 pub use dragonfly_client_config::MIN_PIECE_LENGTH;
@@ -48,14 +50,6 @@ pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "urma")]
 use dragonfly_client_storage::urma::rendezvous::PieceKind;
-
-#[cfg(feature = "urma")]
-#[derive(Clone, Copy, Debug)]
-enum UrmaPieceKind {
-    Piece,
-    PersistentPiece,
-    PersistentCachePiece,
-}
 
 /// Sets the optimization strategy of piece length.
 pub enum PieceLengthStrategy {
@@ -80,7 +74,7 @@ pub struct Piece {
     /// The QUIC piece downloader.
     quic_downloader: Arc<dyn piece_downloader::Downloader>,
 
-    /// URMA downloader retaining the registered-window stream path.
+    /// URMA downloader retaining the READ lane and destination lease path.
     #[cfg(feature = "urma")]
     urma_direct_downloader: Option<Arc<piece_downloader::urma::URMADownloader>>,
 
@@ -437,7 +431,7 @@ impl Piece {
                 let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
                 match self
                     .download_piece_from_parent_over_urma(
-                        UrmaPieceKind::Piece,
+                        PieceKind::Piece,
                         piece_id,
                         task_id,
                         number,
@@ -542,15 +536,14 @@ impl Piece {
         }
     }
 
-    /// Downloads one of Dragonfly's three Piece kinds through the B3 URMA
-    /// registered-window path. On failure the piece claim and metadata are
+    /// Downloads one of Dragonfly's three Piece kinds into an RM READ lease. On failure the piece claim and metadata are
     /// kept, so the caller's TCP fallback rewrites the whole piece range.
     #[cfg(feature = "urma")]
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all)]
     async fn download_piece_from_parent_over_urma(
         &self,
-        kind: UrmaPieceKind,
+        kind: PieceKind,
         piece_id: &str,
         task_id: &str,
         number: u32,
@@ -563,152 +556,59 @@ impl Piece {
             return Err(Error::Unknown("urma downloader is disabled".to_string()));
         };
 
-        // RM-READ first: when the daemon configures the READ data plane, one
-        // published lease per Piece replaces the window stream. The Parent's
-        // advertisement decides availability, so an Unsupported error here
-        // falls through to the legacy lane below without touching reputation.
-        if self.config.storage.server.urma.read.is_some() {
-            let read_kind = match kind {
-                UrmaPieceKind::Piece => PieceKind::Piece,
-                UrmaPieceKind::PersistentPiece => PieceKind::PersistentPiece,
-                UrmaPieceKind::PersistentCachePiece => PieceKind::PersistentCachePiece,
-            };
-            info!(
-                task_id,
-                piece_id,
-                piece_kind = ?kind,
-                piece_number = number,
-                length,
-                "starting dragonfly urma READ piece attempt"
-            );
-            let read_download_start = Instant::now();
-            match downloader
-                .download_piece_lease(tcp_addr, read_kind, number, task_id, length)
-                .await
-            {
-                Ok((lease, piece_offset, digest)) => {
-                    let read_download_ns = read_download_start.elapsed().as_nanos() as u64;
-                    let read_finish_start = Instant::now();
-                    let finished = self
-                        .storage
-                        .download_piece_from_parent_finished_urma_read_lease(
-                            piece_id,
-                            task_id,
-                            read_kind,
-                            piece_offset,
-                            length,
-                            digest.as_str(),
-                            parent_id,
-                            lease,
-                        )
-                        .await;
-                    let read_finish_ns = read_finish_start.elapsed().as_nanos() as u64;
-                    debug!(
-                        task_id,
-                        piece_id,
-                        piece_kind = ?kind,
-                        length,
-                        success = finished.is_ok(),
-                        read_download_ns,
-                        read_finish_ns,
-                        child_piece_e2e_ns =
-                            child_piece_e2e_start.elapsed().as_nanos() as u64,
-                        "finished dragonfly urma READ piece attempt"
-                    );
-                    return finished;
-                }
-                Err(error) => {
-                    // The READ-enabled fabric reserves its depth for READ and
-                    // rejects legacy SEND/RECV posts, so a READ failure cannot
-                    // be retried on the legacy lane. The caller's TCP fallback
-                    // rewrites the whole piece range at `offset`.
-                    warn!(%error, "urma READ download failed; falling back to tcp downloader");
-                    return Err(error);
-                }
-            }
+        if self.config.storage.server.urma.read.is_none() {
+            return Err(Error::Unsupported("URMA READ is not configured".into()));
         }
-
-        let (mut reader, offset, digest) = match kind {
-            UrmaPieceKind::Piece => {
-                downloader
-                    .download_piece_stream(tcp_addr, number, task_id)
-                    .await?
-            }
-            UrmaPieceKind::PersistentPiece => {
-                downloader
-                    .download_persistent_piece_stream(tcp_addr, number, task_id)
-                    .await?
-            }
-            UrmaPieceKind::PersistentCachePiece => {
-                downloader
-                    .download_persistent_cache_piece_stream(tcp_addr, number, task_id)
-                    .await?
-            }
-        };
-
-        let finished = match kind {
-            UrmaPieceKind::Piece => {
-                self.storage
-                    .download_piece_from_parent_finished_urma(
-                        piece_id,
-                        task_id,
-                        offset,
-                        length,
-                        digest.as_str(),
-                        parent_id,
-                        &mut reader,
-                        self.config.storage.write_piece_timeout,
-                    )
-                    .await
-            }
-            UrmaPieceKind::PersistentPiece => {
-                self.storage
-                    .download_persistent_piece_from_parent_finished_urma(
-                        piece_id,
-                        task_id,
-                        offset,
-                        length,
-                        digest.as_str(),
-                        parent_id,
-                        &mut reader,
-                        self.config.storage.write_piece_timeout,
-                    )
-                    .await
-            }
-            UrmaPieceKind::PersistentCachePiece => {
-                self.storage
-                    .download_persistent_cache_piece_from_parent_finished_urma(
-                        piece_id,
-                        task_id,
-                        offset,
-                        length,
-                        digest.as_str(),
-                        parent_id,
-                        &mut reader,
-                        self.config.storage.write_piece_timeout,
-                    )
-                    .await
-            }
-        };
-
-        // On a URMA attempt failure, keep the piece claim and metadata held by
-        // the current download thread. The caller falls back to TCP, which
-        // rewrites the whole piece range at `offset` and verifies the digest,
-        // so partial URMA writes are fully covered and need no reset here.
-        // Resetting via download_*_failed + download_*_started would release
-        // the piece notifier claim and let a concurrent requester steal the
-        // ownership before the TCP fallback starts. If the TCP fallback also
-        // fails, the caller's scopeguard runs the final download_*_failed().
-        let result = finished;
-        debug!(
+        info!(
+            task_id,
             piece_id,
             piece_kind = ?kind,
+            piece_number = number,
             length,
-            success = result.is_ok(),
-            child_piece_e2e_ns = child_piece_e2e_start.elapsed().as_nanos() as u64,
-            "finished dragonfly urma piece attempt"
+            "starting dragonfly urma READ piece attempt"
         );
-        result
+        let read_download_start = Instant::now();
+        match downloader
+            .download_piece_lease(tcp_addr, kind, number, task_id, length)
+            .await
+        {
+            Ok((lease, piece_offset, digest)) => {
+                let read_download_ns = read_download_start.elapsed().as_nanos() as u64;
+                let read_finish_start = Instant::now();
+                let finished = self
+                    .storage
+                    .download_piece_from_parent_finished_urma_read_lease(
+                        piece_id,
+                        task_id,
+                        kind,
+                        piece_offset,
+                        length,
+                        digest.as_str(),
+                        parent_id,
+                        lease,
+                    )
+                    .await;
+                let read_finish_ns = read_finish_start.elapsed().as_nanos() as u64;
+                debug!(
+                    task_id,
+                    piece_id,
+                    piece_kind = ?kind,
+                    length,
+                    success = finished.is_ok(),
+                    read_download_ns,
+                    read_finish_ns,
+                    child_piece_e2e_ns =
+                        child_piece_e2e_start.elapsed().as_nanos() as u64,
+                    "finished dragonfly urma READ piece attempt"
+                );
+                finished
+            }
+            Err(error) => {
+                // The caller's TCP fallback rewrites the whole Piece range.
+                warn!(%error, "urma READ download failed; falling back to tcp downloader");
+                Err(error)
+            }
+        }
     }
 
     /// Downloads a single piece from the source.
@@ -1005,7 +905,7 @@ impl Piece {
                 let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
                 match self
                     .download_piece_from_parent_over_urma(
-                        UrmaPieceKind::PersistentPiece,
+                        PieceKind::PersistentPiece,
                         piece_id,
                         task_id,
                         number,
@@ -1401,7 +1301,7 @@ impl Piece {
                 let addr = format_socket_addr(IpAddr::from_str(ip)?, port as u16);
                 match self
                     .download_piece_from_parent_over_urma(
-                        UrmaPieceKind::PersistentCachePiece,
+                        PieceKind::PersistentCachePiece,
                         piece_id,
                         task_id,
                         number,

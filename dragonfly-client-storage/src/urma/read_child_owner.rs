@@ -1,5 +1,4 @@
-//! Child ownership foundation with context-routed CQE retirement. Production
-//! READ commands and Storage publication remain gated.
+//! Child ownership with context-routed CQE retirement and Storage publication.
 use super::{
     ffi::{
         read::{
@@ -17,9 +16,7 @@ use std::{
     time::Instant,
 };
 
-// Existing SEND/RECV WrToken values always carry operation 1 or 2 in bits
-// 32..40. Reserve an invalid operation byte for READ so a stale or unknown
-// READ CQE can never be decoded as an ordinary SEND/RECV completion.
+// Preserve the reserved READ context namespace across owner generations.
 const READ_CONTEXT_PREFIX: u64 = 0xffff_ff52_0000_0000;
 const READ_CONTEXT_MASK: u64 = 0xffff_ffff_0000_0000;
 static NEXT_READ_CONTEXT: AtomicU32 = AtomicU32::new(1);
@@ -60,7 +57,6 @@ impl ReadRetired {
             observed_at: None,
         }
     }
-
     pub(crate) fn context(&self) -> u64 {
         self.context
     }
@@ -180,33 +176,6 @@ pub(crate) struct NativeChild<K> {
     _keepalive: K,
 }
 impl<K> NativeChild<K> {
-    /// # Safety
-    /// Caller reserved actual allocation bytes before creating local/import, owns
-    /// the exact Piece buffer exclusively, and validated descriptor identity and
-    /// bounds. No CPU consumer or other DMA may access local while this owns it.
-    /// Shared JFS/per-peer permits must cover every post until its completion.
-    pub(crate) unsafe fn new(
-        jetty: std::rc::Rc<std::cell::RefCell<JettyHandle>>,
-        target: std::rc::Rc<TargetHandle>,
-        local: SegmentHandle,
-        remote: ImportedReadSegment,
-        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
-        allocation_bytes: u64,
-        keepalive: K,
-    ) -> Self {
-        Self {
-            jetty,
-            target,
-            local: Some(local),
-            remote: Some(remote),
-            import_uncertain: false,
-            pool,
-            allocation_bytes,
-            buffer_uncertain: false,
-            _keepalive: keepalive,
-        }
-    }
-
     /// Returns the registered destination buffer to the pool when it is healthy
     /// and the pool still has retention capacity; closes it otherwise. The
     /// buffer is consumed either way.
@@ -473,6 +442,7 @@ impl<R: ChildResources> ChildOwner<R> {
             .saturating_add(admission_ns);
         self.timing.post_queue_wait_ns = self.timing.post_queue_wait_ns.saturating_add(queue_ns);
     }
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.pending.len()
     }
@@ -498,6 +468,7 @@ impl<R: ChildResources> ChildOwner<R> {
             read_succeeded: self.read_succeeded(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn post(&mut self, length: u32) -> Result<u64, FfiError> {
         match self.post_routed(length) {
             ChildPostOutcome::Posted(context) => Ok(context),

@@ -1,5 +1,7 @@
 /* Offline tests of the real shim against deterministic provider-call doubles.
  * No device/context is opened. This is not evidence of hardware READ semantics. */
+#define urma_delete_context test_delete_context
+#define urma_uninit test_uninit
 #define urma_query_device test_query_device
 #define urma_import_seg test_import_seg
 #define urma_unimport_seg test_unimport_seg
@@ -32,6 +34,17 @@ static unsigned int token_frees;
 static unsigned int unregister_calls;
 static unsigned int context_frees;
 static int context_mode;
+
+urma_status_t test_delete_context(urma_context_t *ctx)
+{
+    assert(ctx != NULL);
+    return URMA_SUCCESS;
+}
+
+urma_status_t test_uninit(void)
+{
+    return URMA_SUCCESS;
+}
 
 urma_token_id_t *test_alloc_token(urma_context_t *ctx)
 {
@@ -399,13 +412,12 @@ static void test_source_to_read_roundtrip_and_separate_release(void)
     /* Unregister did NOT release token, runtime dependency, or caller backing. */
     assert(token_frees == 0 && f.runtime.segment_count == 2 && source[0] == 0x5a);
     assert(dfurma_read_source_descriptor(exported, &f.descriptor) == -ESHUTDOWN);
-    fail_token_free = 1;
-    assert(dfurma_read_source_release_after_revoke(exported) == URMA_FAIL);
-    assert(f.runtime.segment_count == 2 && token_frees == 0);
-    fail_token_free = 0;
-    /* Simulated independent revocation proof exists only for this test double. */
+    /* Source release drops its shared-token reference; Runtime retains the id. */
     assert(dfurma_read_source_release_after_revoke(exported) == 0);
-    assert(f.runtime.segment_count == 1 && token_frees == 1 && source[0] == 0x5a);
+    assert(f.runtime.segment_count == 1 && token_frees == 0 && source[0] == 0x5a);
+    assert(f.runtime.read_token_id_refs == 0 && f.runtime.read_token_id != NULL);
+    assert(test_free_token(f.runtime.read_token_id) == URMA_SUCCESS);
+
 }
 
 static void test_source_export_rejects_unrepresented_context(void)
@@ -422,6 +434,8 @@ static void test_source_export_rejects_unrepresented_context(void)
     assert(context_frees == 7);
     assert(dfurma_read_source_unregister(exported) == 0);
     assert(dfurma_read_source_release_after_revoke(exported) == 0);
+    assert(f.runtime.read_token_id_refs == 0);
+    assert(test_free_token(f.runtime.read_token_id) == URMA_SUCCESS);
 }
 
 static void test_source_unregister_failure_keeps_token_and_blocks_export(void)
@@ -439,7 +453,8 @@ static void test_source_unregister_failure_keeps_token_and_blocks_export(void)
     fail_unregister = 0;
     assert(dfurma_read_source_unregister(exported) == 0);
     assert(dfurma_read_source_release_after_revoke(exported) == 0);
-    assert(unregister_calls == 2 && token_frees == 1);
+    assert(unregister_calls == 2 && token_frees == 0 && f.runtime.read_token_id_refs == 0);
+    assert(test_free_token(f.runtime.read_token_id) == URMA_SUCCESS);
 }
 
 static void test_registration_failure_retains_uncertain_grants(void)
@@ -463,7 +478,8 @@ static void test_registration_failure_retains_uncertain_grants(void)
     assert(dfurma_read_source_descriptor(exported, &f.descriptor) == -ESHUTDOWN);
     /* An actual provider would require independent rollback/revocation evidence. */
     assert(dfurma_read_source_release_after_revoke(exported) == 0);
-    assert(token_frees == 1 && f.runtime.segment_count == 1);
+    assert(token_frees == 0 && f.runtime.segment_count == 1 && f.runtime.read_token_id_refs == 0);
+    assert(test_free_token(f.runtime.read_token_id) == URMA_SUCCESS);
 }
 
 static void test_read_buffer_failure_retains_memory_and_runtime(void)
@@ -536,7 +552,37 @@ static void test_source_register_stage_timings(void)
     /* Diagnostics never disturb the lifecycle staged below. */
     assert(dfurma_read_source_unregister(exported) == 0);
     assert(dfurma_read_source_release_after_revoke(exported) == 0);
-    assert(f.runtime.segment_count == 1 && token_frees == 1);
+    assert(f.runtime.segment_count == 1 && token_frees == 0 && f.runtime.read_token_id_refs == 0);
+    assert(test_free_token(f.runtime.read_token_id) == URMA_SUCCESS);
+}
+
+static void test_shared_token_lives_until_retryable_runtime_close(void)
+{
+    struct fixture f;
+    dfurma_read_source_t *first = NULL, *second = NULL;
+    dfurma_runtime_t *runtime = calloc(1, sizeof(*runtime));
+    setup(&f);
+    assert(runtime != NULL);
+    runtime->device = &f.device;
+    runtime->context = &f.context;
+    assert(dfurma_read_source_register(runtime, source, sizeof(source), 0x12345678, &first) == 0);
+    assert(dfurma_read_source_register(runtime, source, sizeof(source), 0x12345678, &second) == 0);
+    assert(token_allocations == 1 && runtime->read_token_id_refs == 2);
+    assert(first->token_id == second->token_id);
+    assert(dfurma_runtime_close(runtime) == -EBUSY);
+    assert(dfurma_read_source_unregister(first) == 0);
+    assert(dfurma_read_source_release_after_revoke(first) == 0);
+    assert(runtime->read_token_id_refs == 1 && token_frees == 0);
+    assert(dfurma_runtime_close(runtime) == -EBUSY);
+    assert(dfurma_read_source_unregister(second) == 0);
+    assert(dfurma_read_source_release_after_revoke(second) == 0);
+    assert(runtime->read_token_id_refs == 0 && token_frees == 0);
+    fail_token_free = 1;
+    assert(dfurma_runtime_close(runtime) == URMA_FAIL);
+    assert(runtime->read_token_id != NULL && runtime->context != NULL && token_frees == 0);
+    fail_token_free = 0;
+    assert(dfurma_runtime_close(runtime) == 0);
+    assert(token_frees == 1);
 }
 
 int main(void)
@@ -552,6 +598,7 @@ int main(void)
     test_read_buffer_failure_retains_memory_and_runtime();
     test_allocated_read_buffer_full_lifecycle();
     test_source_register_stage_timings();
-    puts("PASS: 11 groups covering source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
+    test_shared_token_lives_until_retryable_runtime_close();
+    puts("PASS: 12 groups covering source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
     return 0;
 }

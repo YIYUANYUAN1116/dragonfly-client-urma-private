@@ -1,16 +1,10 @@
-//! URMA control-plane wire contract built on the shared Piece rendezvous schema.
-//!
-//! TCP carries reliable control frames; only chunk bytes use the negotiated
-//! RM Jetty. The sender may not post a SEND until a validated
-//! `RecvPosted` window has granted matching remote receive credits.
+//! DFUR v4 discovery over TCP. Bulk transfer uses the separate v5 READ lane.
 
 use super::lane::{TpType, TransportMode};
 pub use crate::rendezvous::PieceKind;
+pub(crate) use crate::rendezvous::RendezvousError;
 use crate::rendezvous::{
     put_bytes, read_envelope, write_envelope, PayloadReader, MAX_PAYLOAD_LENGTH, MAX_STRING_LENGTH,
-};
-pub(crate) use crate::rendezvous::{
-    PieceMetadata, PieceRequest as CommonPieceRequest, ReceiveWindow, RendezvousError,
 };
 use dragonfly_client_core::{Error, Result};
 use std::sync::{Arc, RwLock};
@@ -24,7 +18,6 @@ pub(crate) const MAGIC: u32 = 0x4446_5552;
 // Version 3 explicitly identifies RM and rejects RC peers on this branch.
 // Version 4 negotiates RTP versus CTP before provider import.
 pub(crate) const VERSION: u8 = 4;
-const MAX_DESCRIPTOR_LENGTH: usize = 64 * 1024;
 
 pub(crate) type TransferId = u32;
 pub(crate) const SESSION_TRANSFER_ID: TransferId = 0;
@@ -97,8 +90,8 @@ pub struct UrmaAdvertisement {
     pub capability: UrmaCapability,
     pub port: u16,
     /// Rendezvous port serving the RM-READ data plane (DFUR version 5). Zero
-    /// means the parent has no READ capability; READ and legacy lanes share
-    /// the same listener when both are served, so this usually equals `port`.
+    /// means the parent has no READ capability. A READ-only parent sets
+    /// this to its READ listener port.
     pub read_port: u16,
 }
 
@@ -124,35 +117,7 @@ impl CapabilityRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaneConnect {
-    pub(crate) capability: UrmaCapability,
-    pub(crate) client_descriptor: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaneConnected {
-    pub(crate) server_descriptor: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Frame {
-    Connect(LaneConnect),
-    Connected(LaneConnected),
-    Request {
-        transfer_id: TransferId,
-        request: CommonPieceRequest,
-    },
-    Ready {
-        transfer_id: TransferId,
-        metadata: PieceMetadata,
-    },
-    RecvPosted {
-        transfer_id: TransferId,
-        window: ReceiveWindow,
-    },
-    Done {
-        transfer_id: TransferId,
-    },
     Error {
         transfer_id: TransferId,
         error: RendezvousError,
@@ -162,25 +127,8 @@ pub(crate) enum Frame {
 }
 
 impl Frame {
-    pub(crate) fn transfer_id(&self) -> Option<TransferId> {
-        match self {
-            Self::Request { transfer_id, .. }
-            | Self::Ready { transfer_id, .. }
-            | Self::RecvPosted { transfer_id, .. }
-            | Self::Done { transfer_id }
-            | Self::Error { transfer_id, .. } => Some(*transfer_id),
-            Self::Connect(_) | Self::Connected(_) | Self::Discover | Self::Capability(_) => None,
-        }
-    }
-
     fn frame_type(&self) -> u8 {
         match self {
-            Self::Connect(_) => 1,
-            Self::Connected(_) => 2,
-            Self::Request { .. } => 3,
-            Self::Ready { .. } => 4,
-            Self::RecvPosted { .. } => 5,
-            Self::Done { .. } => 6,
             Self::Error { .. } => 7,
             Self::Discover => 8,
             Self::Capability(_) => 9,
@@ -200,35 +148,6 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
             payload.extend_from_slice(&advertisement.port.to_be_bytes());
             payload.extend_from_slice(&advertisement.read_port.to_be_bytes());
         }
-        Frame::Connect(connect) => {
-            connect.capability.encode(&mut payload);
-            put_bytes(&mut payload, &connect.client_descriptor);
-        }
-        Frame::Connected(connected) => {
-            put_bytes(&mut payload, &connected.server_descriptor);
-        }
-        Frame::Request {
-            transfer_id,
-            request,
-        } => {
-            payload.extend_from_slice(&transfer_id.to_be_bytes());
-            request.encode(&mut payload);
-        }
-        Frame::Ready {
-            transfer_id,
-            metadata,
-        } => {
-            payload.extend_from_slice(&transfer_id.to_be_bytes());
-            metadata.encode(&mut payload);
-        }
-        Frame::RecvPosted {
-            transfer_id,
-            window,
-        } => {
-            payload.extend_from_slice(&transfer_id.to_be_bytes());
-            window.encode(&mut payload);
-        }
-        Frame::Done { transfer_id } => payload.extend_from_slice(&transfer_id.to_be_bytes()),
         Frame::Error { transfer_id, error } => {
             payload.extend_from_slice(&transfer_id.to_be_bytes());
             error.encode(&mut payload);
@@ -249,33 +168,6 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<F
     let (frame_type, payload) = read_envelope(reader, MAGIC, VERSION, MAX_PAYLOAD_LENGTH).await?;
     let mut reader = PayloadReader::new(&payload);
     let frame = match frame_type {
-        1 => Frame::Connect(LaneConnect {
-            capability: UrmaCapability::decode(&mut reader)?,
-            client_descriptor: reader.bytes(MAX_DESCRIPTOR_LENGTH)?,
-        }),
-        2 => Frame::Connected(LaneConnected {
-            server_descriptor: reader.bytes(MAX_DESCRIPTOR_LENGTH)?,
-        }),
-        3 => Frame::Request {
-            transfer_id: reader.u32()?,
-            request: CommonPieceRequest::decode(&mut reader)?,
-        },
-        4 => Frame::Ready {
-            transfer_id: reader.u32()?,
-            metadata: PieceMetadata::decode(&mut reader)?,
-        },
-        5 => {
-            let transfer_id = reader.u32()?;
-            let window = ReceiveWindow::decode(&mut reader)?;
-            window.validate(window.start_chunk, u64::MAX)?;
-            Frame::RecvPosted {
-                transfer_id,
-                window,
-            }
-        }
-        6 => Frame::Done {
-            transfer_id: reader.u32()?,
-        },
         7 => Frame::Error {
             transfer_id: reader.u32()?,
             error: RendezvousError::decode(&mut reader)?,
@@ -301,7 +193,6 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rendezvous::PieceKind;
 
     async fn round_trip(frame: Frame) -> Frame {
         let (mut writer, mut reader) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
@@ -335,117 +226,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_trips_urma_frames() {
-        let connect = Frame::Connect(LaneConnect {
+    async fn discovery_wire_keeps_v4_types_and_ports() {
+        assert_eq!(VERSION, 4);
+        assert_eq!(Frame::Discover.frame_type(), 8);
+        let advertisement = Frame::Capability(UrmaAdvertisement {
             capability: capability(),
-            client_descriptor: vec![1, 2, 3],
+            port: 4008,
+            read_port: 4008,
         });
-        assert_eq!(round_trip(connect.clone()).await, connect);
-
-        let connected = Frame::Connected(LaneConnected {
-            server_descriptor: vec![4, 5, 6],
-        });
-        assert_eq!(round_trip(connected.clone()).await, connected);
-
-        let request = Frame::Request {
-            transfer_id: 17,
-            request: CommonPieceRequest {
-                kind: PieceKind::PersistentPiece,
-                task_id: "task-a".into(),
-                piece_number: 7,
-                chunk_size: 64 * 1024,
-                max_inflight_chunks: 8,
-            },
-        };
-        assert_eq!(round_trip(request.clone()).await, request);
-
-        let ready = Frame::Ready {
-            transfer_id: 17,
-            metadata: PieceMetadata {
-                offset: 11,
-                length: 1024,
-                digest: "crc32:42".into(),
-                chunk_size: 512,
-                max_inflight_chunks: 2,
-            },
-        };
-        assert_eq!(round_trip(ready.clone()).await, ready);
-
-        let posted = Frame::RecvPosted {
-            transfer_id: 17,
-            window: ReceiveWindow {
-                start_chunk: 0,
-                chunk_count: 2,
-            },
-        };
-        assert_eq!(round_trip(posted.clone()).await, posted);
+        assert_eq!(advertisement.frame_type(), 9);
+        assert_eq!(round_trip(advertisement.clone()).await, advertisement);
+        assert_eq!(round_trip(Frame::Discover).await, Frame::Discover);
     }
 
     #[tokio::test]
-    async fn one_lane_can_carry_multiple_piece_requests() {
-        let (mut client, mut server) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
-        let first = Frame::Request {
-            transfer_id: 1,
-            request: CommonPieceRequest {
-                kind: PieceKind::Piece,
-                task_id: "task-a".into(),
-                piece_number: 1,
-                chunk_size: 4096,
-                max_inflight_chunks: 2,
-            },
-        };
-        let second = Frame::Request {
-            transfer_id: 2,
-            request: CommonPieceRequest {
-                kind: PieceKind::Piece,
-                task_id: "task-a".into(),
-                piece_number: 2,
-                chunk_size: 4096,
-                max_inflight_chunks: 2,
-            },
-        };
-
-        write_frame(&mut client, &first).await.unwrap();
-        write_frame(&mut client, &Frame::Done { transfer_id: 1 })
+    async fn older_v4_advertisement_has_no_read_plane() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut payload = Vec::new();
+        capability().encode(&mut payload);
+        payload.extend_from_slice(&4008u16.to_be_bytes());
+        write_envelope(&mut writer, MAGIC, VERSION, 9, &payload, MAX_PAYLOAD_LENGTH)
             .await
             .unwrap();
-        write_frame(&mut client, &second).await.unwrap();
-
-        assert_eq!(read_frame(&mut server).await.unwrap(), first);
-        assert_eq!(
-            read_frame(&mut server).await.unwrap(),
-            Frame::Done { transfer_id: 1 }
-        );
-        assert_eq!(read_frame(&mut server).await.unwrap(), second);
+        let Frame::Capability(advertisement) = read_frame(&mut reader).await.unwrap() else {
+            panic!("expected capability");
+        };
+        assert_eq!(advertisement.port, 4008);
+        assert_eq!(advertisement.read_port, 0);
     }
 
     #[tokio::test]
-    async fn transfer_ids_preserve_interleaved_piece_identity() {
-        let (mut client, mut server) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
-        let frames = [
-            Frame::Done { transfer_id: 2 },
-            Frame::RecvPosted {
-                transfer_id: 1,
-                window: ReceiveWindow {
-                    start_chunk: 4,
-                    chunk_count: 2,
-                },
-            },
-            Frame::Error {
-                transfer_id: 2,
-                error: RendezvousError {
-                    code: 9,
-                    message: "piece-local failure".into(),
-                },
-            },
-        ];
-
-        for frame in &frames {
-            write_frame(&mut client, frame).await.unwrap();
-        }
-        for expected in frames {
-            assert_eq!(read_frame(&mut server).await.unwrap(), expected);
-        }
+    async fn v4_send_recv_connect_is_rejected() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        write_envelope(&mut writer, MAGIC, VERSION, 1, &[], MAX_PAYLOAD_LENGTH)
+            .await
+            .unwrap();
+        assert!(read_frame(&mut reader).await.is_err());
     }
 
     #[test]

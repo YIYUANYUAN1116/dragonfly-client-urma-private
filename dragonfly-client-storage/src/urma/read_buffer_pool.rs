@@ -135,6 +135,7 @@ impl ReadBufferPool {
         );
         Ok(())
     }
+    #[cfg(test)]
 
     fn should_retain(&self, length: u64) -> bool {
         self.retained_after(length).is_some()
@@ -145,6 +146,7 @@ impl ReadBufferPool {
             .checked_add(length)
             .filter(|retained| *retained <= self.max_retained_bytes)
     }
+    #[cfg(test)]
 
     pub(crate) fn retained_bytes(&self) -> u64 {
         self.retained_bytes

@@ -8,12 +8,6 @@
 //! UMDK handle.
 
 use super::{
-    buffer::{LeaseRecycle, LeaseRecycleNotifier, RegisteredRxWindowLease, TxWindowLease},
-    completion::{
-        RegisteredRxCompletion, RegisteredRxCompletionTx, RegisteredTxCompletion,
-        RegisteredTxCompletionTx,
-    },
-    credit::{PeerCreditAdmission, PeerCreditPermit},
     lane::{JettyDescriptor, TransportMode},
     runtime::{
         ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadChildUpdate,
@@ -25,7 +19,6 @@ use super::{
 use std::thread::{self, JoinHandle};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         mpsc::{self as std_mpsc, RecvTimeoutError},
         Arc, Mutex, OnceLock, Weak,
     },
@@ -39,7 +32,7 @@ const DEFAULT_COMMAND_CAPACITY: usize = 16;
 /// Bounds command latency while completions are actively being polled.
 const MAX_COMMANDS_PER_TICK: usize = 16;
 
-/// Pure polling is required because Phase A deliberately has no JFCE. Keep the
+/// Pure polling is used because this runtime has no JFCE. Keep the
 /// idle interval short without allowing an outstanding WR to consume one CPU.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 
@@ -48,91 +41,8 @@ const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 /// the process-wide Fabric registry forever.
 const FABRIC_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-type StartupProbe = (u32, u32, u64, u32, u32);
+type StartupProbe = (u32, u32, u64);
 type StartupResult = Result<StartupProbe>;
-
-#[derive(Clone, Default)]
-struct RequiredRxWaiters(Arc<AtomicUsize>);
-
-impl RequiredRxWaiters {
-    fn enter(&self) -> RequiredRxWaiter {
-        self.0.fetch_add(1, Ordering::AcqRel);
-        RequiredRxWaiter(Arc::clone(&self.0))
-    }
-
-    fn has_waiters(&self) -> bool {
-        self.0.load(Ordering::Acquire) != 0
-    }
-}
-
-struct RequiredRxWaiter(Arc<AtomicUsize>);
-
-impl Drop for RequiredRxWaiter {
-    fn drop(&mut self) {
-        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
-        debug_assert_ne!(previous, 0, "required RX waiter count underflow");
-    }
-}
-
-fn try_acquire_optional_rx_permit(
-    required_waiters: &RequiredRxWaiters,
-    admission: &PeerCreditAdmission,
-    peer_id: u16,
-    requested: u32,
-) -> Result<PeerCreditPermit> {
-    if required_waiters.has_waiters() {
-        return Err(Error::BufferUnavailable {
-            kind: "shared RX optional",
-            requested: requested as usize,
-            available: 0,
-        });
-    }
-    let permit = admission.try_acquire(peer_id, requested)?;
-    // Close the check/acquire race as far as the async facade can: if a
-    // required first window appeared while the non-blocking acquire ran,
-    // immediately return the borrowed surplus. The later Fabric post gate
-    // performs the same check before submitting native work.
-    if required_waiters.has_waiters() {
-        drop(permit);
-        return Err(Error::BufferUnavailable {
-            kind: "shared RX optional",
-            requested: requested as usize,
-            available: 0,
-        });
-    }
-    Ok(permit)
-}
-
-#[derive(Default)]
-struct SharedDepthAdmission {
-    endpoint: Option<(u32, Arc<Semaphore>)>,
-}
-
-impl SharedDepthAdmission {
-    fn permits(&mut self, depth: u32, direction: &'static str) -> Result<Arc<Semaphore>> {
-        if depth == 0 {
-            return Err(Error::InvalidConfiguration(format!(
-                "shared RM {direction} depth must be non-zero"
-            )));
-        }
-        if let Some((active_depth, permits)) = &self.endpoint {
-            if *active_depth != depth {
-                return Err(Error::InvalidConfiguration(format!(
-                    "shared RM {direction} admission depth differs: active={active_depth} requested={depth}"
-                )));
-            }
-            return Ok(Arc::clone(permits));
-        }
-        let permits = Arc::new(Semaphore::new(depth as usize));
-        self.endpoint = Some((depth, Arc::clone(&permits)));
-        Ok(permits)
-    }
-}
-
-fn window_chunks_for_slots(slots: usize, pipeline_depth: u32) -> u32 {
-    let depth = usize::try_from(pipeline_depth).unwrap_or(usize::MAX).max(1);
-    u32::try_from((slots / depth).max(1)).unwrap_or(u32::MAX)
-}
 
 /// Process-wide weak registry used by dfdaemon's server and downloader adapters. Native UMDK
 /// permits one Runtime owner in this implementation, so independently starting both adapters
@@ -154,50 +64,12 @@ fn validate_shared_config(active: &RuntimeConfig, requested: &RuntimeConfig) -> 
     )))
 }
 
-/// Dragonfly-facing PeerTarget batching and Piece pipeline policy. Native
-/// endpoint sizing, tokens, and handles remain private to the owner thread.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PeerTargetConfig {
-    pub post_list_size: u32,
-    pub pipeline_depth: u32,
-    pub guaranteed_rx_credits: u32,
-}
-
-impl Default for PeerTargetConfig {
-    fn default() -> Self {
-        Self {
-            post_list_size: 1,
-            pipeline_depth: 2,
-            guaranteed_rx_credits: 0,
-        }
-    }
-}
-
-impl PeerTargetConfig {
-    fn validate(self) -> Result<()> {
-        if self.post_list_size == 0 || self.post_list_size > crate::urma::ffi::MAX_POST_LIST {
-            return Err(Error::InvalidConfiguration(format!(
-                "RM PeerTarget post_list_size={} is outside 1..={}",
-                self.post_list_size,
-                crate::urma::ffi::MAX_POST_LIST
-            )));
-        }
-        if !(1..=2).contains(&self.pipeline_depth) {
-            return Err(Error::InvalidConfiguration(format!(
-                "RM PeerTarget pipeline_depth={} is outside 1..=2",
-                self.pipeline_depth
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// Observable process-level fabric state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FabricReadiness {
     /// The owner thread has started but native initialization is incomplete.
     Starting,
-    /// Runtime, JFCs, shared JFR, and registered memory are ready.
+    /// Runtime and JFCs are ready to admit READ owners.
     Ready,
     /// Native initialization, progress, or shutdown failed.
     Failed(String),
@@ -216,77 +88,15 @@ impl UrmaFabric {
         Self::start_with_capacity(config, DEFAULT_COMMAND_CAPACITY)
     }
 
-    /// Returns the ready process Fabric for an identical runtime configuration, or starts it.
-    /// The weak registry does not extend the native lifetime; the last handle still owns shutdown.
-    pub fn get_or_start(
-        device_name: impl Into<String>,
-        eid_index: u32,
-    ) -> Result<UrmaFabricHandle> {
-        Self::get_or_start_config(RuntimeConfig::new(device_name, eid_index))
-    }
-
-    pub fn get_or_start_with_budget(
-        device_name: impl Into<String>,
-        eid_index: u32,
-        max_registered_bytes: u64,
-        tx_registered_bytes: u64,
-    ) -> Result<UrmaFabricHandle> {
-        let config = RuntimeConfig::new(device_name, eid_index)
-            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?;
-        Self::get_or_start_config(config)
-    }
-
-    /// Returns the process Fabric for the requested RM transport-path type.
-    /// RTP remains the default of the older constructors.
-    pub fn get_or_start_with_budget_and_tp_type(
-        device_name: impl Into<String>,
-        eid_index: u32,
-        max_registered_bytes: u64,
-        tx_registered_bytes: u64,
-        tp_type: crate::urma::TpType,
-    ) -> Result<UrmaFabricHandle> {
-        let config = RuntimeConfig::new(device_name, eid_index)
-            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?
-            .with_tp_type(tp_type);
-        Self::get_or_start_config(config)
-    }
-
-    /// Returns the process Fabric with the READ-only data plane enabled. The
-    /// full effective JFS depth is reserved for READ; legacy SEND/RECV posts
-    /// are rejected by the runtime.
-    pub(crate) fn get_or_start_with_budget_tp_and_read(
-        device_name: impl Into<String>,
-        eid_index: u32,
-        max_registered_bytes: u64,
-        tx_registered_bytes: u64,
-        tp_type: crate::urma::TpType,
-        read: super::runtime::ReadRuntimeConfig,
-    ) -> Result<UrmaFabricHandle> {
-        let config = RuntimeConfig::new(device_name, eid_index)
-            .with_registered_budget(max_registered_bytes, tx_registered_bytes)?
-            .with_tp_type(tp_type)
-            .with_read_only(read);
-        Self::get_or_start_config(config)
-    }
-
-    /// Public READ-only startup entry shared by the storage server and the
-    /// downloader side. The READ budget is derived from the dfdaemon config.
     pub fn get_or_start_with_read_config(
         device_name: impl Into<String>,
         eid_index: u32,
-        max_registered_bytes: u64,
-        tx_registered_bytes: u64,
         tp_type: crate::urma::TpType,
         read: &dragonfly_client_config::dfdaemon::UrmaReadServer,
     ) -> Result<UrmaFabricHandle> {
         let read = super::runtime::ReadRuntimeConfig::try_from_config(read)?;
-        Self::get_or_start_with_budget_tp_and_read(
-            device_name,
-            eid_index,
-            max_registered_bytes,
-            tx_registered_bytes,
-            tp_type,
-            read,
+        Self::get_or_start_config(
+            RuntimeConfig::new(device_name, eid_index, read).with_tp_type(tp_type),
         )
     }
 
@@ -331,52 +141,27 @@ impl UrmaFabric {
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
 
         let runtime_config = config.clone();
-        let recycle_command_tx = command_tx.clone();
         let join = thread::Builder::new()
             .name("dragonfly-urma-fabric".to_string())
-            .spawn(move || {
-                run_owner(
-                    config,
-                    command_rx,
-                    recycle_command_tx,
-                    readiness_tx,
-                    startup_tx,
-                )
-            })
+            .spawn(move || run_owner(config, command_rx, readiness_tx, startup_tx))
             .map_err(|error| {
                 Error::InvalidConfiguration(format!("failed to spawn URMA owner thread: {error}"))
             })?;
 
         match startup_rx.recv_timeout(FABRIC_STARTUP_TIMEOUT) {
-            Ok(Ok((
-                transport_type,
-                transport_modes,
-                max_message_size,
-                max_jfr_depth,
-                max_jfs_depth,
-            ))) => {
-                let shared_rx_depth = runtime_config.recv_jfc_depth.min(max_jfr_depth).min(
-                    u32::try_from(runtime_config.buffer_pool.rx_slot_count).unwrap_or(u32::MAX),
-                );
-                Ok(UrmaFabricHandle {
-                    inner: Arc::new(FabricInner {
-                        command_tx: Mutex::new(Some(command_tx)),
-                        command_slots,
-                        readiness: readiness_rx,
-                        runtime_config,
-                        transport_type,
-                        transport_modes,
-                        max_message_size,
-                        max_jfr_depth,
-                        max_jfs_depth,
-                        required_rx_waiters: RequiredRxWaiters::default(),
-                        shared_rx_admission: PeerCreditAdmission::new(shared_rx_depth)?,
-                        shared_tx_admission: Mutex::new(SharedDepthAdmission::default()),
-                        shutdown: AsyncMutex::new(()),
-                        join: Mutex::new(Some(join)),
-                    }),
-                })
-            }
+            Ok(Ok((transport_type, transport_modes, max_message_size))) => Ok(UrmaFabricHandle {
+                inner: Arc::new(FabricInner {
+                    command_tx: Mutex::new(Some(command_tx)),
+                    command_slots,
+                    readiness: readiness_rx,
+                    runtime_config,
+                    transport_type,
+                    transport_modes,
+                    max_message_size,
+                    shutdown: AsyncMutex::new(()),
+                    join: Mutex::new(Some(join)),
+                }),
+            }),
             Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error)
@@ -406,50 +191,6 @@ pub struct UrmaFabricHandle {
     inner: Arc<FabricInner>,
 }
 
-pub(crate) struct UrmaRegisteredRxOpHandle {
-    sequence: u64,
-    completion: oneshot::Receiver<Result<RegisteredRxCompletion>>,
-    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
-}
-
-pub(crate) struct UrmaRegisteredTxOpHandle {
-    sequence: u64,
-    completion: oneshot::Receiver<Result<RegisteredTxCompletion>>,
-    abort: Option<(mpsc::UnboundedSender<CommandEnvelope>, u16)>,
-}
-
-impl UrmaRegisteredTxOpHandle {
-    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredTxCompletion> {
-        match tokio::time::timeout(timeout, self.completion).await {
-            Ok(result) => result.map_err(|_| fabric_stopped())?,
-            Err(_) => {
-                if let Some((command_tx, lane_id)) = self.abort {
-                    abort_lane(command_tx, lane_id).await?;
-                }
-                Err(Error::OperationTimeout {
-                    sequence: Some(self.sequence),
-                })
-            }
-        }
-    }
-}
-
-impl UrmaRegisteredRxOpHandle {
-    pub(crate) async fn wait_timeout(self, timeout: Duration) -> Result<RegisteredRxCompletion> {
-        match tokio::time::timeout(timeout, self.completion).await {
-            Ok(result) => result.map_err(|_| fabric_stopped())?,
-            Err(_) => {
-                if let Some((command_tx, lane_id)) = self.abort {
-                    abort_lane(command_tx, lane_id).await?;
-                }
-                Err(Error::OperationTimeout {
-                    sequence: Some(self.sequence),
-                })
-            }
-        }
-    }
-}
-
 impl UrmaFabricHandle {
     /// Returns a receiver for readiness and terminal-state changes.
     pub(crate) fn subscribe_readiness(&self) -> watch::Receiver<FabricReadiness> {
@@ -472,63 +213,9 @@ impl UrmaFabricHandle {
     }
 
     /// max_message_size returns the effective single-message payload limit: the
-    /// smaller of the device capability and one registered buffer slot.
+    /// reported by the device.
     pub fn max_message_size(&self) -> u64 {
         self.inner.max_message_size
-    }
-
-    pub fn registered_bytes(&self) -> u64 {
-        u64::try_from(
-            self.inner
-                .runtime_config
-                .buffer_pool
-                .total_len()
-                .unwrap_or_default(),
-        )
-        .unwrap_or(u64::MAX)
-    }
-
-    pub fn tx_registered_bytes(&self) -> u64 {
-        let pool = &self.inner.runtime_config.buffer_pool;
-        u64::try_from(pool.slot_size.saturating_mul(pool.tx_slot_count)).unwrap_or(u64::MAX)
-    }
-
-    pub fn rx_registered_bytes(&self) -> u64 {
-        let pool = &self.inner.runtime_config.buffer_pool;
-        u64::try_from(pool.slot_size.saturating_mul(pool.rx_slot_count)).unwrap_or(u64::MAX)
-    }
-
-    /// Maximum logical SEND window after dividing the TX reserve across the
-    /// configured per-Piece pipeline. A one-slot pool still supports depth one.
-    pub(crate) fn max_tx_window_chunks(&self, pipeline_depth: u32) -> u32 {
-        let slots = self.inner.runtime_config.buffer_pool.tx_slot_count;
-        window_chunks_for_slots(slots, pipeline_depth)
-    }
-
-    /// Maximum number of native RECV WRs the process-wide shared JFR can keep
-    /// outstanding, bounded by provider capability and registered RX slots.
-    pub(crate) fn max_native_receive_depth(&self) -> u32 {
-        self.inner
-            .runtime_config
-            .recv_jfc_depth
-            .min(self.inner.max_jfr_depth)
-            .min(
-                u32::try_from(self.inner.runtime_config.buffer_pool.rx_slot_count)
-                    .unwrap_or(u32::MAX),
-            )
-    }
-
-    /// Maximum number of native SEND WRs the process-wide shared JFS can keep
-    /// outstanding, bounded by provider capability and registered TX slots.
-    pub(crate) fn max_native_send_depth(&self) -> u32 {
-        self.inner
-            .runtime_config
-            .send_jfc_depth
-            .min(self.inner.max_jfs_depth)
-            .min(
-                u32::try_from(self.inner.runtime_config.buffer_pool.tx_slot_count)
-                    .unwrap_or(u32::MAX),
-            )
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -539,9 +226,8 @@ impl UrmaFabricHandle {
 
     /// Creates a local lane and returns its stable id plus the serialized local
     /// Jetty descriptor for the existing Dragonfly control plane.
-    pub(crate) async fn create_lane(&self, config: PeerTargetConfig) -> Result<(u16, Vec<u8>)> {
-        config.validate()?;
-        self.submit(|reply| FabricCommand::CreateLane { config, reply })
+    pub(crate) async fn create_lane(&self) -> Result<(u16, Vec<u8>)> {
+        self.submit(|reply| FabricCommand::CreateLane { reply })
             .await
     }
 
@@ -558,7 +244,6 @@ impl UrmaFabricHandle {
     /// # Safety
     /// The caller must authenticate and generation-bind the READ descriptor and
     /// token, and guarantee exclusive ownership of the destination Piece.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async unsafe fn create_read_child(
         &self,
         request: ReadChildRequest,
@@ -567,7 +252,6 @@ impl UrmaFabricHandle {
             .await
     }
 
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn post_read_child_batch(
         &self,
         id: ReadChildId,
@@ -592,13 +276,11 @@ impl UrmaFabricHandle {
             .await
     }
 
-    #[allow(dead_code)] // Used by the gated READ session adapter.
     pub(crate) async fn read_child_progress(&self, id: ReadChildId) -> Result<ReadChildProgress> {
         self.submit(|reply| FabricCommand::ReadChildProgress { id, reply })
             .await
     }
 
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn retire_read_child_for_cleanup(&self, id: ReadChildId) -> Result<bool> {
         self.submit_urgent(|reply| FabricCommand::RetireReadChild { id, reply })
             .await
@@ -606,7 +288,6 @@ impl UrmaFabricHandle {
 
     /// First lease stage: stop posting and close the native import while
     /// keeping the registered destination buffer and the full budget charge.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn drain_read_child_for_lease(&self, id: ReadChildId) -> Result<()> {
         self.submit(|reply| FabricCommand::DrainReadChildForLease { id, reply })
             .await
@@ -614,17 +295,8 @@ impl UrmaFabricHandle {
 
     /// Extracts the CPU span of the fully read registered destination buffer
     /// for Storage. The lease itself stays on the owner thread until recycle.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn publish_read_child_lease(&self, id: ReadChildId) -> Result<ReadLeaseSpan> {
         self.submit(|reply| FabricCommand::PublishReadChildLease { id, reply })
-            .await
-    }
-
-    /// Final lease stage: close the published lease and finish the reap.
-    /// Requires a retired (or quarantined) Child and joined consumer workers.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
-    pub(crate) async fn recycle_read_child_lease(&self, id: ReadChildId) -> Result<bool> {
-        self.submit_urgent(|reply| FabricCommand::RecycleReadChildLease { id, reply })
             .await
     }
 
@@ -633,7 +305,6 @@ impl UrmaFabricHandle {
     /// consumers have joined and the published span will never be dereferenced
     /// again. `Ok(true)` proves the full release; `Ok(false)` or an error
     /// keeps the owner retained for a later cleanup pass.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn recycle_published_child_lease(&self, id: ReadChildId) -> Result<bool> {
         // Retire is a state transition the recycle stage requires; a repeated
         // retire of an already retiring owner is harmless.
@@ -646,7 +317,6 @@ impl UrmaFabricHandle {
     /// # Safety
     /// The caller must hold immutable exact-Piece backing and authenticate and
     /// generation-bind this source to the requesting peer and transfer.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async unsafe fn register_read_source(
         &self,
         request: ReadSourceRequest,
@@ -655,7 +325,6 @@ impl UrmaFabricHandle {
             .await
     }
 
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async fn retire_read_source(&self, id: ReadSourceId) -> Result<()> {
         self.submit_urgent(|reply| FabricCommand::RetireReadSource { id, reply })
             .await
@@ -663,7 +332,6 @@ impl UrmaFabricHandle {
 
     /// # Safety
     /// The caller must hold the provider drain proof for this exact source.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async unsafe fn unregister_read_source(&self, id: ReadSourceId) -> Result<bool> {
         self.submit_urgent(|reply| FabricCommand::UnregisterReadSource { id, reply })
             .await
@@ -672,7 +340,6 @@ impl UrmaFabricHandle {
     /// # Safety
     /// The caller must independently prove that remote access to this source has
     /// ceased and cannot resume, including access through stale tokens.
-    #[allow(dead_code)] // Used by the gated READ session state machine.
     pub(crate) async unsafe fn release_read_source_after_revoke(
         &self,
         id: ReadSourceId,
@@ -681,231 +348,11 @@ impl UrmaFabricHandle {
             .await
     }
 
-    pub(crate) async fn post_receive_window_registered(
-        &self,
-        lane_id: u16,
-        sequences: Vec<u64>,
-    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
-        self.post_receive_window_registered_with_admission(lane_id, sequences, false)
-            .await
-    }
-
-    pub(crate) fn required_rx_waiter(&self) -> impl Drop {
-        self.inner.required_rx_waiters.enter()
-    }
-
-    pub(crate) fn register_rx_peer(&self, peer_id: u16, guaranteed_credits: u32) -> Result<()> {
-        self.inner
-            .shared_rx_admission
-            .register_peer(peer_id, guaranteed_credits)
-    }
-
-    pub(crate) fn retire_rx_peer(&self, peer_id: u16) -> Result<()> {
-        self.inner.shared_rx_admission.retire_peer(peer_id)
-    }
-
-    pub(crate) async fn acquire_required_rx_permit(
-        &self,
-        peer_id: u16,
-        requested: u32,
-    ) -> Result<PeerCreditPermit> {
-        self.inner
-            .shared_rx_admission
-            .acquire(peer_id, requested)
-            .await
-    }
-
-    pub(crate) fn shared_rx_available(&self) -> usize {
-        self.inner.shared_rx_admission.available_permits()
-    }
-
-    /// Returns the one process-wide TX admission semaphore. PeerTargets share
-    /// the same RM JFS and registered TX arena, so per-peer semaphores would
-    /// multiply logical capacity beyond the native endpoint depth.
-    pub(crate) fn shared_tx_permits(&self, depth: u32) -> Result<Arc<Semaphore>> {
-        self.inner
-            .shared_tx_admission
-            .lock()
-            .unwrap()
-            .permits(depth, "send")
-    }
-
-    pub(crate) fn try_acquire_optional_rx_permit(
-        &self,
-        peer_id: u16,
-        requested: u32,
-    ) -> Result<PeerCreditPermit> {
-        try_acquire_optional_rx_permit(
-            &self.inner.required_rx_waiters,
-            &self.inner.shared_rx_admission,
-            peer_id,
-            requested,
-        )
-    }
-
-    pub(crate) async fn try_post_receive_window_registered(
-        &self,
-        lane_id: u16,
-        sequences: Vec<u64>,
-    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
-        self.post_receive_window_registered_with_admission(lane_id, sequences, true)
-            .await
-    }
-
-    async fn post_receive_window_registered_with_admission(
-        &self,
-        lane_id: u16,
-        sequences: Vec<u64>,
-        try_admission: bool,
-    ) -> Result<Vec<UrmaRegisteredRxOpHandle>> {
-        if sequences.is_empty() {
-            return Err(Error::InvalidConfiguration(
-                "registered RX window cannot be empty".into(),
-            ));
-        }
-        if try_admission && self.inner.required_rx_waiters.has_waiters() {
-            return Err(Error::BufferUnavailable {
-                kind: "RX",
-                requested: sequences.len(),
-                available: 0,
-            });
-        }
-        let command_tx = self.command_sender()?;
-        let mut completion_txs: Vec<RegisteredRxCompletionTx> = Vec::with_capacity(sequences.len());
-        let mut handles = Vec::with_capacity(sequences.len());
-        for &sequence in &sequences {
-            let (completion_tx, completion_rx) = oneshot::channel();
-            completion_txs.push(completion_tx);
-            handles.push(UrmaRegisteredRxOpHandle {
-                sequence,
-                completion: completion_rx,
-                abort: Some((command_tx.clone(), lane_id)),
-            });
-        }
-        if try_admission {
-            self.try_submit(|reply| FabricCommand::PostReceiveWindowRegistered {
-                lane_id,
-                sequences,
-                completion_txs,
-                reply,
-            })
-            .await?;
-        } else {
-            self.submit(|reply| FabricCommand::PostReceiveWindowRegistered {
-                lane_id,
-                sequences,
-                completion_txs,
-                reply,
-            })
-            .await?;
-        }
-        Ok(handles)
-    }
-
-    /// Applies a validated peer RecvPosted window to the lane. Window ordering
-    /// remains a Piece-session responsibility; the Fabric owns only the count.
-    pub(crate) async fn grant_send_credit(&self, lane_id: u16, count: u32) -> Result<()> {
-        self.submit(|reply| FabricCommand::GrantSendCredit {
-            lane_id,
-            count,
-            reply,
-        })
-        .await
-    }
-
-    #[allow(dead_code)] // B1 ownership API, consumed by B4.
-    pub(crate) async fn acquire_tx_window(&self, length: usize) -> Result<TxWindowLease> {
-        self.submit(|reply| FabricCommand::AcquireTxWindow { length, reply })
-            .await
-    }
-
-    pub(crate) async fn acquire_tx_window_chunks(
-        &self,
-        chunk_lengths: Vec<usize>,
-    ) -> Result<TxWindowLease> {
-        self.submit(|reply| FabricCommand::AcquireTxWindowChunks {
-            chunk_lengths,
-            reply,
-        })
-        .await
-    }
-
-    #[allow(dead_code)] // B1 ownership API, consumed by B4.
-    pub(crate) async fn recycle_tx_window(&self, lease: TxWindowLease) -> Result<usize> {
-        self.submit_urgent(|reply| FabricCommand::RecycleTxWindow { lease, reply })
-            .await
-    }
-
-    /// Non-blocking admission variant used while a Piece already owns its
-    /// first TX window. This prevents a full command queue from turning an
-    /// optional overlap window into a circular resource wait.
-    pub(crate) async fn try_acquire_tx_window_chunks(
-        &self,
-        chunk_lengths: Vec<usize>,
-    ) -> Result<TxWindowLease> {
-        self.try_submit(|reply| FabricCommand::AcquireTxWindowChunks {
-            chunk_lengths,
-            reply,
-        })
-        .await
-    }
-
-    #[allow(dead_code)] // B1 ownership API, consumed by B2/B3.
-    pub(crate) async fn recycle_rx_window(&self, lease: RegisteredRxWindowLease) -> Result<usize> {
-        self.submit_urgent(|reply| FabricCommand::RecycleRxWindow { lease, reply })
-            .await
-    }
-
-    pub(crate) async fn send_registered_window(
-        &self,
-        lane_id: u16,
-        lease: TxWindowLease,
-        sequences: Vec<u64>,
-    ) -> Result<UrmaRegisteredTxOpHandle> {
-        let sequence = sequences.first().copied().ok_or_else(|| {
-            Error::InvalidConfiguration("registered TX sequence window is empty".into())
-        })?;
-        let command_tx = self.command_sender()?;
-        let (completion_tx, completion_rx) = oneshot::channel();
-        self.submit(|reply| FabricCommand::SendRegisteredWindow {
-            lane_id,
-            lease,
-            sequences,
-            completion: completion_tx,
-            reply,
-        })
-        .await?;
-        Ok(UrmaRegisteredTxOpHandle {
-            sequence,
-            completion: completion_rx,
-            abort: Some((command_tx, lane_id)),
-        })
-    }
-
     /// Starts provider-backed retirement. The owner keeps the native lane
     /// until every WR and the shared-JFC flush sentinel have been consumed.
     pub(crate) async fn close_lane(&self, lane_id: u16) -> Result<()> {
         self.submit(|reply| FabricCommand::CloseLane { lane_id, reply })
             .await
-    }
-
-    pub(crate) async fn abort_lane(&self, lane_id: u16) -> Result<()> {
-        let command_tx = self.command_sender()?;
-        abort_lane(command_tx, lane_id).await
-    }
-
-    /// Cancellation hook for Drop paths that cannot await. Lifecycle commands
-    /// bypass normal command admission so a full business queue cannot lose an
-    /// abort request.
-    pub(crate) fn try_abort_lane(&self, lane_id: u16) -> Result<()> {
-        let command_tx = self.command_sender()?;
-        let (reply, _ignored) = oneshot::channel();
-        command_tx
-            .send(CommandEnvelope::urgent(FabricCommand::AbortLane {
-                lane_id,
-                reply,
-            }))
-            .map_err(|_| fabric_stopped())
     }
 
     async fn submit<T>(
@@ -927,30 +374,6 @@ impl UrmaFabricHandle {
         reply_rx.await.map_err(|_| fabric_stopped())?
     }
 
-    async fn try_submit<T>(
-        &self,
-        make_command: impl FnOnce(oneshot::Sender<Result<T>>) -> FabricCommand,
-    ) -> Result<T> {
-        let command_tx = self.command_sender()?;
-        let available = self.inner.command_slots.available_permits();
-        let permit = self
-            .inner
-            .command_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::BufferUnavailable {
-                kind: "fabric command",
-                requested: 1,
-                available,
-            })?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        command_tx
-            .send(CommandEnvelope::admitted(make_command(reply_tx), permit))
-            .map_err(|_| fabric_stopped())?;
-        reply_rx.await.map_err(|_| fabric_stopped())?
-    }
-
-    #[allow(dead_code)] // Called by the B1 lease APIs once B2/B4 select them.
     async fn submit_urgent<T>(
         &self,
         make_command: impl FnOnce(oneshot::Sender<Result<T>>) -> FabricCommand,
@@ -1009,11 +432,6 @@ struct FabricInner {
     transport_type: u32,
     transport_modes: u32,
     max_message_size: u64,
-    max_jfr_depth: u32,
-    max_jfs_depth: u32,
-    required_rx_waiters: RequiredRxWaiters,
-    shared_rx_admission: PeerCreditAdmission,
-    shared_tx_admission: Mutex<SharedDepthAdmission>,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1034,7 +452,6 @@ impl Drop for FabricInner {
 
 enum FabricCommand {
     CreateLane {
-        config: PeerTargetConfig,
         reply: oneshot::Sender<Result<(u16, Vec<u8>)>>,
     },
     ConnectLane {
@@ -1042,12 +459,12 @@ enum FabricCommand {
         descriptor: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     CreateReadChild {
         request: ReadChildRequest,
         reply: oneshot::Sender<Result<ReadChildAdmission>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     PostReadChildBatch {
         admission_wait_ns: u64,
         enqueued_at: std::time::Instant,
@@ -1055,7 +472,7 @@ enum FabricCommand {
         lengths: Vec<u32>,
         reply: oneshot::Sender<Result<usize>>,
     },
-    #[allow(dead_code)] // Gated until the READ session adapter is connected.
+
     ReadChildProgress {
         id: ReadChildId,
         reply: oneshot::Sender<Result<ReadChildProgress>>,
@@ -1064,94 +481,52 @@ enum FabricCommand {
         id: ReadChildId,
         reply: oneshot::Sender<Result<watch::Receiver<ReadChildUpdate>>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     RetireReadChild {
         id: ReadChildId,
         reply: oneshot::Sender<Result<bool>>,
     },
-    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+
     DrainReadChildForLease {
         id: ReadChildId,
         reply: oneshot::Sender<Result<()>>,
     },
-    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+
     PublishReadChildLease {
         id: ReadChildId,
         reply: oneshot::Sender<Result<ReadLeaseSpan>>,
     },
-    #[allow(dead_code)] // Gated until the READ session lease flow is connected.
+
     RecycleReadChildLease {
         id: ReadChildId,
         reply: oneshot::Sender<Result<bool>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     RegisterReadSource {
         request: ReadSourceRequest,
         reply: oneshot::Sender<Result<ReadSourceAdmission>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     RetireReadSource {
         id: ReadSourceId,
         reply: oneshot::Sender<Result<()>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     UnregisterReadSource {
         id: ReadSourceId,
         reply: oneshot::Sender<Result<bool>>,
     },
-    #[allow(dead_code)] // Gated until the READ wire/session state machine is connected.
+
     ReleaseReadSourceAfterRevoke {
         id: ReadSourceId,
         reply: oneshot::Sender<Result<bool>>,
     },
-    PostReceiveWindowRegistered {
-        lane_id: u16,
-        sequences: Vec<u64>,
-        completion_txs: Vec<RegisteredRxCompletionTx>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    GrantSendCredit {
-        lane_id: u16,
-        count: u32,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    #[allow(dead_code)] // B1 foundation, selected by B4.
-    AcquireTxWindow {
-        length: usize,
-        reply: oneshot::Sender<Result<TxWindowLease>>,
-    },
-    AcquireTxWindowChunks {
-        chunk_lengths: Vec<usize>,
-        reply: oneshot::Sender<Result<TxWindowLease>>,
-    },
-    #[allow(dead_code)] // B1 foundation, selected by B4.
-    RecycleTxWindow {
-        lease: TxWindowLease,
-        reply: oneshot::Sender<Result<usize>>,
-    },
-    #[allow(dead_code)] // B1 foundation, selected by B2/B3.
-    RecycleRxWindow {
-        lease: RegisteredRxWindowLease,
-        reply: oneshot::Sender<Result<usize>>,
-    },
-    SendRegisteredWindow {
-        lane_id: u16,
-        lease: TxWindowLease,
-        sequences: Vec<u64>,
-        completion: RegisteredTxCompletionTx,
-        reply: oneshot::Sender<Result<()>>,
-    },
+
     CloseLane {
         lane_id: u16,
         reply: oneshot::Sender<Result<()>>,
     },
-    AbortLane {
-        lane_id: u16,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    RecycleLease {
-        recycle: LeaseRecycle,
-    },
+
     Shutdown {
         reply: Option<oneshot::Sender<Result<()>>>,
     },
@@ -1181,17 +556,11 @@ impl CommandEnvelope {
 fn run_owner(
     config: RuntimeConfig,
     mut command_rx: mpsc::UnboundedReceiver<CommandEnvelope>,
-    recycle_command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     readiness_tx: watch::Sender<FabricReadiness>,
     startup_tx: std_mpsc::SyncSender<StartupResult>,
 ) {
-    let recycle_notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
-        let _ = recycle_command_tx.send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
-            recycle,
-        }));
-    });
-    let source_workers = config.read.as_ref().map_or(0, |read| read.source_workers);
-    let mut runtime = match UrmaRuntime::start(config, recycle_notifier) {
+    let source_workers = config.read.source_workers;
+    let mut runtime = match UrmaRuntime::start(config) {
         Ok(runtime) => runtime,
         Err(error) => {
             readiness_tx.send_replace(FabricReadiness::Failed(error.to_string()));
@@ -1210,8 +579,6 @@ fn run_owner(
         runtime.transport_type(),
         runtime.transport_modes(),
         runtime.max_message_size(),
-        runtime.max_jfr_depth(),
-        runtime.max_jfs_depth(),
     );
     readiness_tx.send_replace(FabricReadiness::Ready);
     if startup_tx.send(Ok(probe)).is_err() {
@@ -1290,9 +657,9 @@ fn handle_command(
     poisoned: Option<&str>,
 ) -> OwnerControl {
     match command {
-        FabricCommand::CreateLane { config, reply } => {
+        FabricCommand::CreateLane { reply } => {
             let result = reject_if_poisoned(poisoned).and_then(|()| {
-                let (lane_id, descriptor) = runtime.create_peer_target(config.post_list_size)?;
+                let (lane_id, descriptor) = runtime.create_peer_target()?;
                 match descriptor.serialize() {
                     Ok(descriptor) => Ok((lane_id, descriptor)),
                     Err(error) => {
@@ -1398,78 +765,12 @@ fn handle_command(
             unsafe { runtime.submit_source_cleanup(id, true, reply) };
             OwnerControl::Continue
         }
-        FabricCommand::PostReceiveWindowRegistered {
-            lane_id,
-            sequences,
-            completion_txs,
-            reply,
-        } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
-                runtime.post_receive_window_registered(lane_id, sequences, completion_txs)
-            });
-            let _ = reply.send(result);
-            OwnerControl::Continue
-        }
-        FabricCommand::GrantSendCredit {
-            lane_id,
-            count,
-            reply,
-        } => {
-            let result = reject_if_poisoned(poisoned)
-                .and_then(|()| runtime.grant_send_credit(lane_id, count));
-            let _ = reply.send(result);
-            OwnerControl::Continue
-        }
-        FabricCommand::AcquireTxWindow { length, reply } => {
-            let result =
-                reject_if_poisoned(poisoned).and_then(|()| runtime.acquire_tx_window(length));
-            let _ = reply.send(result);
-            OwnerControl::Continue
-        }
-        FabricCommand::AcquireTxWindowChunks {
-            chunk_lengths,
-            reply,
-        } => {
-            let result = reject_if_poisoned(poisoned)
-                .and_then(|()| runtime.acquire_tx_window_chunks(&chunk_lengths));
-            let _ = reply.send(result);
-            OwnerControl::Continue
-        }
-        FabricCommand::RecycleTxWindow { lease, reply } => {
-            let _ = reply.send(runtime.recycle_tx_window(lease));
-            OwnerControl::Continue
-        }
-        FabricCommand::RecycleRxWindow { lease, reply } => {
-            let _ = reply.send(runtime.recycle_rx_window(lease));
-            OwnerControl::Continue
-        }
-        FabricCommand::SendRegisteredWindow {
-            lane_id,
-            lease,
-            sequences,
-            completion,
-            reply,
-        } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
-                runtime.send_registered_window(lane_id, lease, sequences, completion)
-            });
-            let _ = reply.send(result);
-            OwnerControl::Continue
-        }
+
         FabricCommand::CloseLane { lane_id, reply } => {
             let _ = reply.send(runtime.close_peer_target(lane_id));
             OwnerControl::Continue
         }
-        FabricCommand::AbortLane { lane_id, reply } => {
-            let _ = reply.send(runtime.abort_peer_target(lane_id));
-            OwnerControl::Continue
-        }
-        FabricCommand::RecycleLease { recycle } => {
-            if let Err(error) = runtime.recycle_dropped_lease(recycle) {
-                tracing::error!(%error, "failed to recycle dropped URMA registered lease");
-            }
-            OwnerControl::Continue
-        }
+
         FabricCommand::Shutdown { reply } => OwnerControl::Shutdown(reply),
     }
 }
@@ -1498,20 +799,6 @@ fn fabric_stopped() -> Error {
     Error::Shutdown {
         failures: vec!["URMA owner thread is stopped".into()],
     }
-}
-
-async fn abort_lane(
-    command_tx: mpsc::UnboundedSender<CommandEnvelope>,
-    lane_id: u16,
-) -> Result<()> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    command_tx
-        .send(CommandEnvelope::urgent(FabricCommand::AbortLane {
-            lane_id,
-            reply: reply_tx,
-        }))
-        .map_err(|_| fabric_stopped())?;
-    reply_rx.await.map_err(|_| fabric_stopped())?
 }
 
 fn finish_owner(
@@ -1553,125 +840,69 @@ fn join_owner(join: &Mutex<Option<JoinHandle<()>>>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::urma::buffer::{LeaseBook, LeaseKind, SlotId};
 
     #[test]
     fn zero_command_capacity_is_rejected_before_spawning() {
-        let result = UrmaFabric::start_with_capacity(RuntimeConfig::new("urma0", 0), 0);
+        let result = UrmaFabric::start_with_capacity(
+            RuntimeConfig::new(
+                "urma0",
+                0,
+                super::super::runtime::ReadRuntimeConfig::try_from_config(
+                    &dragonfly_client_config::dfdaemon::UrmaReadServer::default(),
+                )
+                .unwrap(),
+            ),
+            0,
+        );
         assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
     }
 
     #[test]
-    fn required_rx_waiter_is_counted_and_released_on_drop() {
-        let waiters = RequiredRxWaiters::default();
-        assert!(!waiters.has_waiters());
-
-        let first = waiters.enter();
-        let second = waiters.enter();
-        assert!(waiters.has_waiters());
-
-        drop(first);
-        assert!(waiters.has_waiters());
-        drop(second);
-        assert!(!waiters.has_waiters());
-    }
-
-    #[test]
-    fn optional_rx_borrow_yields_to_required_waiters_and_capacity() {
-        let waiters = RequiredRxWaiters::default();
-        let admission = PeerCreditAdmission::new(2).unwrap();
-        admission.register_peer(1, 0).unwrap();
-
-        let borrowed = try_acquire_optional_rx_permit(&waiters, &admission, 1, 2).unwrap();
-        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_err());
-        drop(borrowed);
-
-        let required = waiters.enter();
-        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_err());
-        assert_eq!(admission.available_permits(), 2);
-        drop(required);
-
-        assert!(try_acquire_optional_rx_permit(&waiters, &admission, 1, 1).is_ok());
-    }
-
-    #[test]
-    fn shared_depth_admission_reuses_one_global_semaphore_and_rejects_depth_changes() {
-        let mut admission = SharedDepthAdmission::default();
-        let first = admission.permits(8, "send").unwrap();
-        let second = admission.permits(8, "send").unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        let permit = first.clone().try_acquire_many_owned(8).unwrap();
-        assert!(second.clone().try_acquire_owned().is_err());
-        drop(permit);
-        assert!(second.try_acquire_owned().is_ok());
-        assert!(admission.permits(7, "receive").is_err());
-        assert!(SharedDepthAdmission::default().permits(0, "send").is_err());
-    }
-
-    #[test]
-    fn dropped_registered_lease_uses_urgent_owner_command() {
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let notifier: LeaseRecycleNotifier = Arc::new(move |recycle| {
-            command_tx
-                .send(CommandEnvelope::urgent(FabricCommand::RecycleLease {
-                    recycle,
-                }))
-                .unwrap();
-        });
-        let mut leases = LeaseBook::new();
-        let recycle = leases
-            .issue(LeaseKind::Rx, vec![SlotId::new(7, 3).unwrap()])
-            .unwrap();
-        let lease =
-            RegisteredRxWindowLease::from_test_parts(vec![vec![1, 2, 3]], recycle, notifier);
-
-        drop(lease);
-        let envelope = command_rx.try_recv().unwrap();
-        assert!(envelope._permit.is_none());
-        assert!(matches!(
-            envelope.command,
-            FabricCommand::RecycleLease { recycle: actual } if actual == recycle
-        ));
-    }
-
-    #[test]
     fn shared_fabric_requires_identical_runtime_configuration() {
-        let active = RuntimeConfig::new("urma0", 2);
+        let active = RuntimeConfig::new(
+            "urma0",
+            2,
+            super::super::runtime::ReadRuntimeConfig::try_from_config(
+                &dragonfly_client_config::dfdaemon::UrmaReadServer::default(),
+            )
+            .unwrap(),
+        );
         assert!(validate_shared_config(&active, &active).is_ok());
-        assert!(validate_shared_config(&active, &RuntimeConfig::new("urma1", 2)).is_err());
-        assert!(validate_shared_config(&active, &RuntimeConfig::new("urma0", 3)).is_err());
+        assert!(validate_shared_config(
+            &active,
+            &RuntimeConfig::new(
+                "urma1",
+                2,
+                super::super::runtime::ReadRuntimeConfig::try_from_config(
+                    &dragonfly_client_config::dfdaemon::UrmaReadServer::default()
+                )
+                .unwrap()
+            )
+        )
+        .is_err());
+        assert!(validate_shared_config(
+            &active,
+            &RuntimeConfig::new(
+                "urma0",
+                3,
+                super::super::runtime::ReadRuntimeConfig::try_from_config(
+                    &dragonfly_client_config::dfdaemon::UrmaReadServer::default()
+                )
+                .unwrap()
+            )
+        )
+        .is_err());
+        let mut workers_changed = active.clone();
+        workers_changed.read.source_workers = 1;
+        assert!(validate_shared_config(&active, &workers_changed).is_err());
+        let mut budget_changed = active.clone();
+        budget_changed.read.budget.source.bytes -= 64 * 1024;
+        assert!(validate_shared_config(&active, &budget_changed).is_err());
     }
-
     #[test]
     fn handle_is_safe_to_move_between_tokio_tasks() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<UrmaFabricHandle>();
-    }
-
-    #[test]
-    fn peer_target_config_contains_only_peer_local_pipeline_policy() {
-        let config = PeerTargetConfig {
-            post_list_size: 5,
-            pipeline_depth: 2,
-            guaranteed_rx_credits: 3,
-        };
-        assert_eq!(config.post_list_size, 5);
-        assert_eq!(config.pipeline_depth, 2);
-        assert_eq!(config.guaranteed_rx_credits, 3);
-        assert!(config.validate().is_ok());
-        assert!(PeerTargetConfig {
-            pipeline_depth: 0,
-            ..config
-        }
-        .validate()
-        .is_err());
-    }
-
-    #[test]
-    fn pipeline_depth_reserves_slots_for_each_window() {
-        assert_eq!(window_chunks_for_slots(128, 1), 128);
-        assert_eq!(window_chunks_for_slots(128, 2), 64);
-        assert_eq!(window_chunks_for_slots(1, 2), 1);
     }
 
     #[test]

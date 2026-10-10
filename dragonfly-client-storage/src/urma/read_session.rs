@@ -769,33 +769,6 @@ pub(crate) struct ParentTransportFailure {
 }
 
 impl ParentSourceSession {
-    pub(crate) fn new(
-        fabric: UrmaFabricHandle,
-        lane_id: u16,
-        control: ReadTransferControl,
-        identity: ReadTransferIdentity,
-        piece_length: u64,
-        piece_offset: u64,
-        digest: String,
-        effective_max_read_size: u32,
-    ) -> Result<Self> {
-        if control.identity() != identity || effective_max_read_size == 0 {
-            return Err(protocol("invalid Parent READ session configuration"));
-        }
-        Ok(Self {
-            fabric,
-            lane_id,
-            control,
-            state: ParentReadState::new(identity, piece_length)?,
-            identity,
-            piece_offset,
-            digest,
-            effective_max_read_size,
-            published_source: None,
-            awaiting_buffer_ready: true,
-        })
-    }
-
     /// Builds the session from a dynamically admitted transfer: the
     /// dispatcher hands over the initiating BufferReady, so the accepted
     /// length defines the Piece length and the state machine starts past the

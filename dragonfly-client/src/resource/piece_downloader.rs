@@ -68,7 +68,7 @@ pub trait Downloader: Send + Sync {
 #[cfg(feature = "urma")]
 pub mod urma {
     use super::*;
-    use dragonfly_client_storage::client::urma::{discover, UrmaClient, UrmaStreamReader};
+    use dragonfly_client_storage::client::urma_discovery::discover;
     use dragonfly_client_storage::client::urma_read::{UrmaReadClient, UrmaReadPieceLease};
     use dragonfly_client_storage::urma::fabric::{UrmaFabric, UrmaFabricHandle};
     use dragonfly_client_storage::urma::rendezvous::{
@@ -77,7 +77,8 @@ pub mod urma {
     use dragonfly_client_storage::urma::{TpType, TransportMode, PEER_SESSION_IDLE_TIMEOUT};
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::Ordering;
     use std::sync::Weak;
     use std::time::Instant;
     use tracing::{debug, info, warn};
@@ -151,21 +152,6 @@ pub mod urma {
         Ready(UrmaFabricHandle, UrmaCapability),
     }
 
-    /// CachedClient identifies the exact client generation stored for one parent. Transfer
-    /// failures retire only the generation that performed the failed operation, so a stale
-    /// request cannot remove a newer replacement client.
-    struct CachedClient {
-        last_used: Instant,
-        generation: u64,
-        client: UrmaClient,
-    }
-
-    /// ClientHandle carries cache identity alongside the clone used by one Piece request.
-    struct ClientHandle {
-        generation: u64,
-        client: UrmaClient,
-    }
-
     /// CachedReadClient keeps one persistent READ lane slot per parent. Any
     /// transfer failure retires the cached lane; the next request rebuilds it.
     struct CachedReadClient {
@@ -191,10 +177,6 @@ pub mod urma {
         /// trip. Transfer failures evict the entry immediately.
         capable_parents: std::sync::Mutex<HashMap<String, (Instant, UrmaAdvertisement)>>,
 
-        /// clients keeps one persistent Session slot per parent. A client
-        /// serializes Piece transfers on its lane and reconnects after failure.
-        clients: tokio::sync::Mutex<HashMap<String, CachedClient>>,
-
         /// read_clients keeps one persistent READ lane slot per parent, used
         /// only when the daemon configures the RM-READ data plane.
         read_clients: tokio::sync::Mutex<HashMap<String, CachedReadClient>>,
@@ -203,9 +185,6 @@ pub mod urma {
         /// an entry after no request is checking or constructing that parent's client, while
         /// separate parents never wait on each other's discovery or setup.
         client_init_gates: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-
-        /// next_client_generation gives cache replacements a stable identity for compare/remove.
-        next_client_generation: AtomicU64,
     }
 
     /// URMADownloader implements the downloader over the UMDK/URMA transport.
@@ -217,10 +196,8 @@ pub mod urma {
                 fabric: tokio::sync::Mutex::new(FabricState::Uninitialized),
                 unhealthy_parents: std::sync::Mutex::new(HashMap::new()),
                 capable_parents: std::sync::Mutex::new(HashMap::new()),
-                clients: tokio::sync::Mutex::new(HashMap::new()),
                 read_clients: tokio::sync::Mutex::new(HashMap::new()),
                 client_init_gates: std::sync::Mutex::new(HashMap::new()),
-                next_client_generation: AtomicU64::new(1),
             }
         }
 
@@ -246,6 +223,10 @@ pub mod urma {
             }
 
             let urma_config = &self.config.storage.server.urma;
+            if urma_config.deprecated.configured() {
+                warn!("URMA SEND/RECV settings are deprecated and ignored; use storage.server.urma.read budgets and limits");
+            }
+
             let Some(device) = urma_config.device.as_deref().filter(|d| !d.is_empty()) else {
                 *state = FabricState::Failed(Instant::now());
                 return Err(Error::Unsupported(
@@ -266,32 +247,12 @@ pub mod urma {
             };
             let device = device.to_string();
             let eid_index = urma_config.eid_index;
-            let max_registered_bytes = urma_config.max_registered_bytes.as_u64();
-            let tx_registered_bytes = urma_config.tx_registered_bytes.as_u64();
-            // The same-process dfdaemon server starts the shared fabric with
-            // the READ-only data plane when configured, so the downloader must
-            // request the identical runtime configuration or the shared
-            // registry rejects it.
-            let read_config = urma_config.read.clone();
+            let read_config = urma_config
+                .read
+                .clone()
+                .ok_or_else(|| Error::Unsupported("URMA READ is not configured".into()))?;
             let startup = tokio::task::spawn_blocking(move || {
-                if let Some(read) = &read_config {
-                    UrmaFabric::get_or_start_with_read_config(
-                        device,
-                        eid_index,
-                        max_registered_bytes,
-                        tx_registered_bytes,
-                        tp_type,
-                        read,
-                    )
-                } else {
-                    UrmaFabric::get_or_start_with_budget_and_tp_type(
-                        device,
-                        eid_index,
-                        max_registered_bytes,
-                        tx_registered_bytes,
-                        tp_type,
-                    )
-                }
+                UrmaFabric::get_or_start_with_read_config(device, eid_index, tp_type, &read_config)
             })
             .await;
             let startup = match startup {
@@ -313,10 +274,6 @@ pub mod urma {
                             "URMA device does not advertise {transport_mode:?} mode"
                         )));
                     }
-                    dragonfly_client_metric::collect_urma_registered_bytes_metrics(
-                        fabric.tx_registered_bytes(),
-                        fabric.rx_registered_bytes(),
-                    );
                     let capability = UrmaCapability {
                         transport_type: fabric.transport_type(),
                         transport_mode,
@@ -327,9 +284,6 @@ pub mod urma {
                     info!(
                         transport_mode = ?transport_mode,
                         tp_type = ?tp_type,
-                        registered_bytes = fabric.registered_bytes(),
-                        tx_registered_bytes = fabric.tx_registered_bytes(),
-                        rx_registered_bytes = fabric.rx_registered_bytes(),
                         "urma downloader ready: transport type {}, fabric tag {}",
                         capability.transport_type,
                         capability.fabric_tag
@@ -358,7 +312,6 @@ pub mod urma {
             }
             drop(state);
             if retired {
-                self.clients.lock().await.clear();
                 self.read_clients.lock().await.clear();
             }
         }
@@ -376,19 +329,6 @@ pub mod urma {
             let gate = Arc::new(tokio::sync::Mutex::new(()));
             gates.insert(addr.to_string(), Arc::downgrade(&gate));
             gate
-        }
-
-        /// retire_client removes only the client generation that observed the failure. A request
-        /// using an older clone must not evict a healthy replacement installed in the meantime.
-        async fn retire_client(&self, addr: &str, generation: u64) -> bool {
-            let mut clients = self.clients.lock().await;
-            let current = clients
-                .get(addr)
-                .is_some_and(|client| client.generation == generation);
-            if current {
-                clients.remove(addr);
-            }
-            current
         }
 
         /// check_parent errors fast for parents that are still serving a penalty.
@@ -463,158 +403,10 @@ pub mod urma {
             Ok(advertisement)
         }
 
-        /// client builds a UrmaClient for one parent address.
-        async fn client(&self, addr: &str) -> Result<ClientHandle> {
-            self.check_parent(addr)?;
-            let init_gate = self.client_init_gate(addr);
-            let _init = init_gate.lock().await;
-
-            // A concurrent request may have recorded a failure while this one waited for the
-            // parent gate. Re-check before reusing or constructing anything.
-            self.check_parent(addr)?;
-            let cached = {
-                let mut clients = self.clients.lock().await;
-                match clients.get_mut(addr) {
-                    Some(cached) if cached.last_used.elapsed() < PEER_SESSION_IDLE_TIMEOUT => {
-                        cached.last_used = Instant::now();
-                        Some(ClientHandle {
-                            generation: cached.generation,
-                            client: cached.client.clone(),
-                        })
-                    }
-                    Some(_) => {
-                        debug!(parent_addr = addr, "retiring idle cached urma client");
-                        clients.remove(addr);
-                        None
-                    }
-                    None => None,
-                }
-            };
-            if let Some(handle) = cached {
-                if !handle.client.fabric_failed() {
-                    match handle.client.take_transfer_outcome() {
-                        Some(true) => self.record_success(addr),
-                        Some(false) => {
-                            self.retire_client(addr, handle.generation).await;
-                            self.record_failure(addr, Failure::Transport);
-                            return Err(Error::Unsupported(format!(
-                                "parent {addr} failed its previous urma transfer"
-                            )));
-                        }
-                        None => {}
-                    }
-                    debug!(parent_addr = addr, "reusing cached urma client");
-                    return Ok(handle);
-                }
-                warn!(
-                    parent_addr = addr,
-                    "retiring cached urma client after fabric failure"
-                );
-                self.retire_client(addr, handle.generation).await;
-            }
-            let (fabric, capability) = self.fabric().await?;
-            // advertisement records its own failures, since only it can tell an unreachable parent
-            // apart from one that answered and is incompatible.
-            let advertisement = self.advertisement(addr, &capability).await?;
-            let mut rendezvous_addr: SocketAddr = addr.parse().map_err(|err| {
-                Error::Unsupported(format!("invalid parent piece address {addr}: {err}"))
-            })?;
-            rendezvous_addr.set_port(advertisement.port);
-
-            let client = UrmaClient::new(
-                self.config.clone(),
-                fabric,
-                capability,
-                advertisement.capability,
-                rendezvous_addr.to_string(),
-            );
-            info!(
-                parent_addr = addr,
-                rendezvous_addr = %rendezvous_addr,
-                "created cached urma client"
-            );
-            let generation = self.next_client_generation.fetch_add(1, Ordering::Relaxed);
-            self.clients.lock().await.insert(
-                addr.to_string(),
-                CachedClient {
-                    last_used: Instant::now(),
-                    generation,
-                    client: client.clone(),
-                },
-            );
-            Ok(ClientHandle { generation, client })
-        }
-
-        async fn handle_stream_result(
-            &self,
-            addr: &str,
-            handle: ClientHandle,
-            result: dragonfly_client_core::Result<(UrmaStreamReader, u64, String)>,
-        ) -> Result<(UrmaStreamReader, u64, String)> {
-            match result {
-                Ok(downloaded) => Ok(downloaded),
-                Err(err) if is_transient_busy(&err) => Err(err),
-                Err(err) => {
-                    let fabric_failed = handle.client.fabric_failed();
-                    if fabric_failed {
-                        self.retire_failed_fabric().await;
-                    }
-                    let retired = self.retire_client(addr, handle.generation).await;
-                    if retired || fabric_failed {
-                        self.record_failure(addr, classify_failure(&err));
-                    }
-                    Err(err)
-                }
-            }
-        }
-
-        /// Returns a normal Piece as registered RX windows for the B3 Storage path.
-        pub async fn download_piece_stream(
-            &self,
-            addr: &str,
-            number: u32,
-            task_id: &str,
-        ) -> Result<(UrmaStreamReader, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle.client.download_piece_stream(number, task_id).await;
-            self.handle_stream_result(addr, handle, result).await
-        }
-
-        /// Returns a persistent Piece as registered RX windows.
-        pub async fn download_persistent_piece_stream(
-            &self,
-            addr: &str,
-            number: u32,
-            task_id: &str,
-        ) -> Result<(UrmaStreamReader, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle
-                .client
-                .download_persistent_piece_stream(number, task_id)
-                .await;
-            self.handle_stream_result(addr, handle, result).await
-        }
-
-        /// Returns a persistent-cache Piece as registered RX windows.
-        pub async fn download_persistent_cache_piece_stream(
-            &self,
-            addr: &str,
-            number: u32,
-            task_id: &str,
-        ) -> Result<(UrmaStreamReader, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle
-                .client
-                .download_persistent_cache_piece_stream(number, task_id)
-                .await;
-            self.handle_stream_result(addr, handle, result).await
-        }
-
         /// read_client returns the cached persistent READ lane client for one
         /// parent, discovering the parent's READ rendezvous port on first use.
         /// `Ok(None)` means the parent does not advertise the READ data plane:
-        /// no failure is recorded, so its legacy lane and TCP fallback stay
-        /// fully usable. Other errors follow the shared failure policy.
+        /// the Piece caller uses TCP fallback. Other errors follow the shared failure policy.
         async fn read_client(&self, addr: &str) -> Result<Option<UrmaReadClient>> {
             self.check_parent(addr)?;
             let init_gate = self.client_init_gate(addr);
@@ -650,8 +442,7 @@ pub mod urma {
                 }
             }
             let (fabric, capability) = self.fabric().await?;
-            // advertisement records its own failures and shares the discovery
-            // cache with the legacy lane.
+            // Advertisement lookup records failures and caches discovery results.
             let advertisement = self.advertisement(addr, &capability).await?;
             if advertisement.read_port == 0 {
                 return Ok(None);
@@ -716,86 +507,6 @@ pub mod urma {
                     Err(err)
                 }
             }
-        }
-
-        /// Applies the shared failure policy for non-stream downloads: BUSY is
-        /// transient (keep the cached client and parent reputation), anything
-        /// else still retires the client and records a failure.
-        async fn handle_piece_result<T>(
-            &self,
-            addr: &str,
-            handle: ClientHandle,
-            result: dragonfly_client_core::Result<T>,
-        ) -> dragonfly_client_core::Result<T> {
-            match result {
-                Ok(downloaded) => Ok(downloaded),
-                Err(err) if is_transient_busy(&err) => Err(err),
-                Err(err) => {
-                    let fabric_failed = handle.client.fabric_failed();
-                    if fabric_failed {
-                        self.retire_failed_fabric().await;
-                    }
-                    let retired = self.retire_client(addr, handle.generation).await;
-                    if retired || fabric_failed {
-                        self.record_failure(addr, classify_failure(&err));
-                    }
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    /// URMADownloader implements the Downloader trait.
-    #[async_trait]
-    impl Downloader for URMADownloader {
-        /// download_piece downloads a piece from the other peer over the URMA transport.
-        #[instrument(skip_all)]
-        async fn download_piece(
-            &self,
-            addr: &str,
-            number: u32,
-            _host_id: &str,
-            task_id: &str,
-        ) -> Result<(PieceContentStream, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle.client.download_piece(number, task_id).await;
-            self.handle_piece_result(addr, handle, result).await
-        }
-
-        /// download_persistent_piece downloads a persistent piece from the other peer over the
-        /// URMA transport.
-        #[instrument(skip_all)]
-        async fn download_persistent_piece(
-            &self,
-            addr: &str,
-            number: u32,
-            _host_id: &str,
-            task_id: &str,
-        ) -> Result<(PieceContentStream, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle
-                .client
-                .download_persistent_piece(number, task_id)
-                .await;
-            self.handle_piece_result(addr, handle, result).await
-        }
-
-        /// download_persistent_cache_piece downloads a persistent cache piece from the other peer
-        /// over the URMA transport.
-        #[instrument(skip_all)]
-        async fn download_persistent_cache_piece(
-            &self,
-            addr: &str,
-            number: u32,
-            _host_id: &str,
-            task_id: &str,
-        ) -> Result<(PieceContentStream, u64, String)> {
-            let handle = self.client(addr).await?;
-            let result = handle
-                .client
-                .download_persistent_cache_piece(number, task_id)
-                .await;
-            self.handle_piece_result(addr, handle, result).await
         }
     }
 
@@ -977,8 +688,6 @@ impl DownloaderFactory {
                 DEFAULT_DOWNLOADER_CAPACITY,
                 DEFAULT_DOWNLOADER_IDLE_TIMEOUT,
             )),
-            #[cfg(feature = "urma")]
-            "urma" => Arc::new(urma::URMADownloader::new(config.clone())),
             _ => {
                 error!("unsupported protocol: {}", protocol);
                 return Err(Error::InvalidParameter);

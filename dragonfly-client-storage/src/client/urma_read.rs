@@ -24,7 +24,7 @@
 
 use super::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_RETRIES, DEFAULT_KEEPALIVE_TIME};
 use crate::rendezvous::PieceKind;
-use crate::urma::fabric::{PeerTargetConfig, UrmaFabricHandle};
+use crate::urma::fabric::UrmaFabricHandle;
 use crate::urma::read_control::{
     next_session_generation, read_handshake, write_handshake, ReadHandshake, ReadLaneCapability,
     ReadLaneControl,
@@ -416,19 +416,9 @@ impl UrmaReadClient {
         )?;
 
         let urma_config = &self.config.storage.server.urma;
-        let peer_config = PeerTargetConfig {
-            post_list_size: urma_config.post_list_size,
-            pipeline_depth: urma_config.pipeline_depth,
-            // The READ Child only posts READ; SEND credits are not needed.
-            guaranteed_rx_credits: 0,
-        };
-        let (lane_id, descriptor) =
-            self.fabric
-                .create_lane(peer_config)
-                .await
-                .map_err(|error| {
-                    ClientError::Unknown(format!("urma READ lane create failed: {error}"))
-                })?;
+        let (lane_id, descriptor) = self.fabric.create_lane().await.map_err(|error| {
+            ClientError::Unknown(format!("urma READ lane create failed: {error}"))
+        })?;
         let established = async {
             let session_generation = next_session_generation().map_err(|error| {
                 ClientError::Unknown(format!("urma READ session generation failed: {error}"))

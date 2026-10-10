@@ -394,7 +394,6 @@ async fn main() -> Result<(), anyhow::Error> {
                             config.storage.server.urma.port,
                         ),
                         storage.clone(),
-                        upload_bandwidth_limiter.clone(),
                         shutdown.clone(),
                         shutdown_complete_tx.clone(),
                     )

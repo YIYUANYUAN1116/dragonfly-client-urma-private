@@ -59,7 +59,6 @@ urma = [
   "dep:sha2",
 ]
 # Deterministic real-provider failure injection for validation binaries only.
-urma-test-failpoints = ["urma"]
 
 [build-dependencies]
 bindgen = { version = "0.72.1", optional = true }

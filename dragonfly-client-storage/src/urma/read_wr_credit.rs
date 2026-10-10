@@ -25,6 +25,7 @@ impl ReadWrCredits {
             peers: BTreeMap::new(),
         })))
     }
+    #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
         self.used
     }
@@ -68,7 +69,7 @@ pub(crate) struct CreditedChild<R> {
 }
 impl<R> CreditedChild<R> {
     /// One shared instance must correspond to the actual JFS available depth.
-    /// Production SEND/RECV users must share that capacity if used concurrently.
+    /// All READ peers share this endpoint capacity.
     pub(crate) fn new(resources: R, credits: Rc<RefCell<ReadWrCredits>>, peer: ReadPeer) -> Self {
         Self {
             resources,

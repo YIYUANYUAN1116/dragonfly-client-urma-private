@@ -1,5 +1,5 @@
 //! One budget, peer lifecycle, and CQE route table for both READ directions.
-//! Production command and Storage wiring remain gated.
+//! Shared by Fabric progress, source workers and Storage lease publication.
 use super::{
     ffi::{
         read::{

@@ -96,7 +96,9 @@ impl std::error::Error for OwnerError {}
 pub(crate) enum QuarantineReason {
     RegistrationUncertain,
     PostUncertain,
+    #[cfg(test)]
     DrainTimeout,
+    #[cfg(test)]
     RevokeUncertain,
     CleanupFailed,
     WrongProof,
@@ -385,6 +387,7 @@ impl<T> ReadOwnerRegistry<T> {
     /// Resolve an isolated creation command whose eventual result proves that no
     /// native resource remains. Unlike an ordinary preflight rejection, a timeout
     /// or uncertain reservation requires the same identity-bound proof as an owner.
+    #[cfg(test)]
     pub(crate) fn release_verified_reservation(
         &mut self,
         id: ReadOwnerId,
@@ -475,6 +478,7 @@ impl<T> ReadOwnerRegistry<T> {
 
     /// Bounded by entry admission. Includes unresolved reservations: the owner
     /// loop must resolve their pending creation result before attempting cleanup.
+    #[cfg(test)]
     pub(crate) fn retirement_candidates(&self) -> Vec<ReadOwnerId> {
         self.entries
             .iter()
