@@ -58,6 +58,7 @@ const EXACT_TEST_NAME: &str = "urma::read_session_harness::rm_read_memory_to_mem
 fn read_budget() -> ReadRuntimeConfig {
     let cap = |bytes: u64, entries| ReadCapacity { bytes, entries };
     ReadRuntimeConfig {
+        source_workers: 0,
         budget: ReadBudget {
             total: cap(4 * 1024 * 1024, 8),
             source: cap(2 * 1024 * 1024, 4),

@@ -1121,6 +1121,13 @@ pub struct UrmaReadServer {
     #[serde(default)]
     pub provider_revocation_validated: bool,
 
+    /// Source native workers. Zero preserves the owner-thread baseline; 1–16
+    /// offload registration and cleanup. Requires a provider supporting distinct
+    /// Segment operations concurrently on the same context.
+    #[serde(default)]
+    #[validate(range(min = 0, max = 16))]
+    pub source_workers: u32,
+
     /// Total registered bytes reserved across sources, destinations, and
     /// quarantine.
     #[serde(with = "bytesize_serde", default = "default_urma_read_total_bytes")]
@@ -1178,6 +1185,7 @@ impl Default for UrmaReadServer {
     fn default() -> Self {
         Self {
             provider_revocation_validated: false,
+            source_workers: 0,
             total_bytes: default_urma_read_total_bytes(),
             source_bytes: default_urma_read_source_bytes(),
             destination_bytes: default_urma_read_destination_bytes(),
@@ -2211,6 +2219,19 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::fs;
+
+    #[test]
+    fn urma_source_workers_configuration() {
+        assert_eq!(UrmaReadServer::default().source_workers, 0);
+        for count in [0, 1, 2, 4, 16] {
+            let read: UrmaReadServer =
+                serde_yaml::from_str(&format!("sourceWorkers: {count}")).unwrap();
+            assert_eq!(read.source_workers, count);
+            assert!(read.validate().is_ok());
+        }
+        let read: UrmaReadServer = serde_yaml::from_str("sourceWorkers: 17").unwrap();
+        assert!(read.validate().is_err());
+    }
 
     #[test]
     fn deserialize_server_correctly() {

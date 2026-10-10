@@ -123,6 +123,11 @@ typedef struct dfurma_read_source_stages {
 /* Copies caller bytes into private page-aligned memory before registration.
  * On a registration error with non-NULL *out, native grant cleanup is uncertain
  * and the wrapper retains that private copy. */
+/* Owner-thread acquire; pins context and initializes the shared token before
+ * handing its restricted registration view to a source worker. */
+int dfurma_source_context_acquire(dfurma_runtime_t *runtime);
+void dfurma_source_context_release(dfurma_runtime_t *runtime);
+
 int dfurma_read_source_register(dfurma_runtime_t *runtime, const uint8_t *data,
                                 uint64_t length, uint32_t token,
                                 dfurma_read_source_t **out);

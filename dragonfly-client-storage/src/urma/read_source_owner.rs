@@ -92,6 +92,26 @@ impl<S: SourceResource> SourceCleanup<S> {
 }
 
 impl<K> SourceOwner<K> {
+    pub(crate) fn worker_source(source: ReadSource<K>, uncertain: bool) -> Self {
+        Self {
+            cleanup: SourceCleanup {
+                source,
+                unregistered: uncertain,
+            },
+        }
+    }
+    pub(crate) fn descriptor(&self) -> Result<ReadDescriptor, FfiError> {
+        self.cleanup.source.descriptor()
+    }
+    pub(crate) fn worker_reap(
+        &mut self,
+        id: ReadOwnerId,
+        permit: &UnregisterPermit,
+        revoked: Option<&SourceRevoked>,
+    ) -> Result<ReapDecision, FfiError> {
+        self.cleanup.reap(id, permit, revoked)
+    }
+
     /// Diagnostic-only register sub-phase timings captured during admission.
     pub(crate) fn register_stages(&self) -> Result<ReadSourceStages, FfiError> {
         self.cleanup.source.register_stages()

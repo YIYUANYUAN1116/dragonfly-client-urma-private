@@ -1,8 +1,9 @@
 //! Thread-owned URMA fabric boundary for Dragonfly storage.
 //!
-//! The migrated native wrappers are deliberately `!Send` and `!Sync`. The
-//! fabric creates, uses, and destroys [`UrmaRuntime`] on one OS thread. Async
-//! Dragonfly code communicates with that thread through bounded business
+//! Endpoint native wrappers remain `!Send` and `!Sync`. The fabric creates,
+//! uses, and destroys [`UrmaRuntime`] on one OS thread. Optional source workers
+//! own their native source handles locally and hold restricted context leases.
+//! Async Dragonfly code communicates with that thread through bounded business
 //! admission plus a non-dropping lifecycle path, and never receives a raw
 //! UMDK handle.
 
@@ -1189,7 +1190,8 @@ fn run_owner(
             recycle,
         }));
     });
-    let runtime = match UrmaRuntime::start(config, recycle_notifier) {
+    let source_workers = config.read.as_ref().map_or(0, |read| read.source_workers);
+    let mut runtime = match UrmaRuntime::start(config, recycle_notifier) {
         Ok(runtime) => runtime,
         Err(error) => {
             readiness_tx.send_replace(FabricReadiness::Failed(error.to_string()));
@@ -1198,6 +1200,12 @@ fn run_owner(
         }
     };
 
+    if let Err(error) = runtime.enable_source_workers(source_workers) {
+        readiness_tx.send_replace(FabricReadiness::Failed(error.to_string()));
+        let _ = startup_tx.send(Err(error));
+        let _ = runtime.shutdown();
+        return;
+    }
     let probe = (
         runtime.transport_type(),
         runtime.transport_modes(),
@@ -1214,7 +1222,8 @@ fn run_owner(
     let mut runtime = runtime;
     let mut poisoned = None;
     loop {
-        if runtime.outstanding() == 0 {
+        runtime.poll_source_workers();
+        if runtime.outstanding() == 0 && !runtime.source_work_pending() {
             match command_rx.blocking_recv() {
                 Some(envelope) => {
                     if let OwnerControl::Shutdown(reply) =
@@ -1367,12 +1376,12 @@ fn handle_command(
             OwnerControl::Continue
         }
         FabricCommand::RegisterReadSource { request, reply } => {
-            let result = reject_if_poisoned(poisoned).and_then(|()| {
-                // SAFETY: This command can only be constructed by the unsafe
-                // facade whose caller supplies backing and identity guarantees.
-                unsafe { runtime.register_read_source(request) }
-            });
-            let _ = reply.send(result);
+            match reject_if_poisoned(poisoned) {
+                Ok(()) => unsafe { runtime.submit_source_registration(request, reply) },
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
             OwnerControl::Continue
         }
         FabricCommand::RetireReadSource { id, reply } => {
@@ -1381,14 +1390,12 @@ fn handle_command(
         }
         FabricCommand::UnregisterReadSource { id, reply } => {
             // SAFETY: Construction is restricted to the unsafe facade.
-            let result = unsafe { runtime.unregister_read_source(id) };
-            let _ = reply.send(result);
+            unsafe { runtime.submit_source_cleanup(id, false, reply) };
             OwnerControl::Continue
         }
         FabricCommand::ReleaseReadSourceAfterRevoke { id, reply } => {
             // SAFETY: Construction is restricted to the unsafe facade.
-            let result = unsafe { runtime.release_read_source_after_revoke(id) };
-            let _ = reply.send(result);
+            unsafe { runtime.submit_source_cleanup(id, true, reply) };
             OwnerControl::Continue
         }
         FabricCommand::PostReceiveWindowRegistered {

@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -44,7 +45,7 @@ struct dfurma_runtime {
     urma_context_t *context;
     uint32_t eid_index;
     uint32_t jfc_count;
-    uint32_t segment_count;
+    _Atomic uint32_t segment_count;
     uint32_t jetty_count;
     uint32_t outstanding_wr_count;
     /* Context-scoped token id shared by every READ source Segment.
@@ -59,7 +60,8 @@ struct dfurma_runtime {
     urma_token_id_t *read_token_id;
     /* READ sources holding `read_token_id`, including a source whose
      * registration result is uncertain and can never be released. */
-    uint32_t read_token_id_refs;
+    _Atomic uint32_t read_token_id_refs;
+    _Atomic uint32_t source_worker_refs;
 };
 
 struct dfurma_jfc {
@@ -223,6 +225,10 @@ int dfurma_runtime_open(const char *device_name, uint32_t eid_index,
         (void)urma_uninit();
         return -ENOMEM;
     }
+
+    atomic_init(&runtime->segment_count, 0);
+    atomic_init(&runtime->read_token_id_refs, 0);
+    atomic_init(&runtime->source_worker_refs, 0);
 
     /* liburma currently declares this input as char *, but does not own it. */
     runtime->device = urma_get_device_by_name((char *)device_name);
@@ -952,6 +958,29 @@ static int dfurma_read_token_id_acquire(dfurma_runtime_t *runtime,
     return 0;
 }
 
+/* Acquire only on the owner thread, before workers are started. Workers get
+ * a read-only context/token view; no worker may initialize/free the token.
+ * These refs also prevent runtime_close while a worker is still executing. */
+int dfurma_source_context_acquire(dfurma_runtime_t *runtime)
+{
+    urma_token_id_t *unused;
+    if (runtime == NULL || runtime->context == NULL) {
+        return -EINVAL;
+    }
+    int status = dfurma_read_token_id_acquire(runtime, &unused);
+    if (status != 0) {
+        return status;
+    }
+    runtime->source_worker_refs++;
+    runtime->read_token_id_refs--;
+    return 0;
+}
+
+void dfurma_source_context_release(dfurma_runtime_t *runtime)
+{
+    runtime->source_worker_refs--;
+}
+
 static int dfurma_read_source_register_impl(dfurma_runtime_t *runtime,
                                             const uint8_t *data,
                                             uint64_t length, uint32_t token,
@@ -1662,7 +1691,8 @@ int dfurma_runtime_close(dfurma_runtime_t *runtime)
     }
     if (runtime->jetty_count != 0 || runtime->segment_count != 0 ||
         runtime->outstanding_wr_count != 0 ||
-        runtime->jfc_count != 0 || runtime->read_token_id_refs != 0) {
+        runtime->jfc_count != 0 || runtime->read_token_id_refs != 0 ||
+        runtime->source_worker_refs != 0) {
         return -EBUSY;
     }
 

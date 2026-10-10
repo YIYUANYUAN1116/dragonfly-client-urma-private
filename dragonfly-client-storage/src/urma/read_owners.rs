@@ -33,6 +33,7 @@ struct ReadRoute {
 
 enum ReadBundle<K, R: ChildResources> {
     Source(SourceOwner<K>),
+    WorkerSource(usize),
     Child(ChildOwner<R>),
 }
 impl<K, R: ChildResources> SourceSlot for ReadBundle<K, R> {
@@ -43,7 +44,9 @@ impl<K, R: ChildResources> SourceSlot for ReadBundle<K, R> {
     fn source_mut(&mut self) -> Result<&mut SourceOwner<K>, FfiError> {
         match self {
             Self::Source(source) => Ok(source),
-            Self::Child(_) => Err(FfiError::Contract("expected source owner")),
+            Self::Child(_) | Self::WorkerSource(_) => {
+                Err(FfiError::Contract("expected source owner"))
+            }
         }
     }
 }
@@ -51,7 +54,9 @@ impl<K, R: ChildResources> ReadBundle<K, R> {
     fn child_mut(&mut self) -> Result<&mut ChildOwner<R>, FfiError> {
         match self {
             Self::Child(child) => Ok(child),
-            Self::Source(_) => Err(FfiError::Contract("expected Child owner")),
+            Self::Source(_) | Self::WorkerSource(_) => {
+                Err(FfiError::Contract("expected Child owner"))
+            }
         }
     }
 }
@@ -205,6 +210,58 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .child_mut()?
             .record_post_command_wait(admission_ns, queue_ns);
         Ok(())
+    }
+
+    // Worker sources keep native resources on their worker; the registry owns
+    // identity, peer lifecycle and budget until an exact cleanup result arrives.
+    pub(crate) fn reserve_worker_source(
+        &mut self,
+        peer: ReadPeer,
+        bytes: u64,
+    ) -> Result<ReadOwnerId, OwnerError> {
+        self.registry.reserve(peer, ReadDirection::Source, bytes)
+    }
+    pub(crate) fn reject_worker_source(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
+        self.registry.release_unused_reservation(id)
+    }
+    pub(crate) fn attach_worker_source(
+        &mut self,
+        id: ReadOwnerId,
+        worker: usize,
+        uncertain: bool,
+    ) -> Result<bool, OwnerError> {
+        self.registry
+            .attach(id, ReadBundle::WorkerSource(worker))
+            .map_err(|(error, _)| error)?;
+        if uncertain {
+            self.registry
+                .quarantine(id, QuarantineReason::RegistrationUncertain)?;
+        }
+        Ok(self.registry.state(id)? == super::read_owner::OwnerState::Active)
+    }
+    pub(crate) fn worker_source(&mut self, id: ReadOwnerId) -> Result<usize, OwnerError> {
+        if !matches!(
+            self.registry.state(id)?,
+            super::read_owner::OwnerState::Retiring | super::read_owner::OwnerState::Quarantined(_)
+        ) {
+            return Err(OwnerError::NotRetiring);
+        }
+        match self.registry.retained_owner(id)? {
+            ReadBundle::WorkerSource(worker) => Ok(*worker),
+            _ => Err(OwnerError::OwnerMissing),
+        }
+    }
+    pub(crate) fn complete_worker_cleanup(
+        &mut self,
+        id: ReadOwnerId,
+        result: Result<ReapDecision, FfiError>,
+    ) -> Result<bool, ReapError<FfiError>> {
+        self.registry.reap_with(id, |bundle| match bundle {
+            ReadBundle::WorkerSource(_) => result,
+            _ => Err(FfiError::Contract(
+                "worker cleanup source identity mismatch",
+            )),
+        })
     }
 
     /// # Safety
@@ -572,6 +629,52 @@ mod tests {
         jetty_id: 7,
         max_outstanding: 2,
     };
+    #[test]
+    fn successful_worker_result_after_shutdown_never_reopens_publication() {
+        let mut owners = setup();
+        let source = owners.reserve_worker_source(PEER, 8).unwrap();
+        owners.begin_shutdown();
+        assert!(!owners.attach_worker_source(source, 1, false).unwrap());
+        assert_eq!(owners.usage().source_bytes, 8);
+        assert_eq!(owners.worker_source(source).unwrap(), 1);
+        assert!(owners.reserve_worker_source(PEER, 1).is_err());
+        let proof = unsafe { super::super::read_owner::VerifiedRetirement::new(source) };
+        assert_eq!(
+            owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
+            Ok(true)
+        );
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn worker_reservation_survives_peer_drain_and_releases_only_after_proven_cleanup() {
+        let mut owners = setup();
+        let source = owners.reserve_worker_source(PEER, 8).unwrap();
+        assert_eq!(owners.usage().source_bytes, 8);
+        assert!(owners.reserve_worker_source(PEER, 1).is_err());
+        owners.drain_peer(PEER).unwrap();
+        assert!(!owners.attach_worker_source(source, 0, false).unwrap());
+        assert!(!owners.peer_drained(PEER));
+        assert_eq!(owners.worker_source(source).unwrap(), 0);
+        assert!(owners
+            .complete_worker_cleanup(source, Err(FfiError::Status(-5)))
+            .is_err());
+        assert_eq!(owners.usage().source_bytes, 8);
+        assert_eq!(
+            owners.complete_worker_cleanup(source, Ok(ReapDecision::Pending)),
+            Ok(false)
+        );
+        let other = owners.registry.reserve(PEER, ReadDirection::Source, 1);
+        assert!(other.is_err());
+        let proof = unsafe { super::super::read_owner::VerifiedRetirement::new(source) };
+        assert_eq!(
+            owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
+            Ok(true)
+        );
+        assert!(owners.peer_drained(PEER));
+        assert_eq!(owners.usage().source_bytes, 0);
+    }
+
     fn setup() -> ReadOwners<(), Mock> {
         let cap = |bytes, entries| ReadCapacity { bytes, entries };
         let mut owners = ReadOwners::new(ReadBudget {

@@ -34,6 +34,7 @@ pub(crate) mod read_session;
 mod read_session_harness;
 #[allow(dead_code)]
 mod read_source_owner;
+mod read_source_workers;
 #[allow(dead_code)]
 mod read_wr_credit;
 pub mod rendezvous;

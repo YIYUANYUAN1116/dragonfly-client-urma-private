@@ -56,7 +56,7 @@ pub(crate) struct ReadSourceRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadSourceId(ReadOwnerId);
+pub(crate) struct ReadSourceId(pub(crate) ReadOwnerId);
 
 #[derive(Debug)]
 #[allow(dead_code)] // Consumed by the gated READ session state machine.
@@ -96,6 +96,11 @@ impl ReadRuntimeConfig {
             }
             Ok(ReadCapacity { bytes, entries })
         };
+        if read.source_workers > 16 {
+            return Err(Error::InvalidConfiguration(
+                "sourceWorkers exceeds 16".into(),
+            ));
+        }
         if read.max_outstanding_per_peer == 0 {
             return Err(Error::InvalidConfiguration(
                 "urma read maxOutstandingPerPeer must be positive".into(),
@@ -118,12 +123,14 @@ impl ReadRuntimeConfig {
             },
             max_outstanding_per_peer: read.max_outstanding_per_peer as usize,
             buffer_alignment: 4096,
+            source_workers: read.source_workers as usize,
         })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadRuntimeConfig {
+    pub(crate) source_workers: usize,
     pub(crate) budget: ReadBudget,
     pub(crate) max_outstanding_per_peer: usize,
     pub(crate) buffer_alignment: u64,
@@ -539,6 +546,7 @@ mod native {
         peers: HashMap<u16, PeerTarget>,
         completions: CompletionRouter,
         read: RuntimeReadState,
+        source_workers: Option<super::super::read_source_workers::SourceWorkers>,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -708,6 +716,7 @@ mod native {
                 peers: HashMap::new(),
                 completions: CompletionRouter::new(16)?,
                 read,
+                source_workers: None,
                 _not_send_sync: PhantomData,
             })
         }
@@ -954,7 +963,12 @@ mod native {
         }
 
         pub(crate) fn interrupt_read_waiters(&mut self) {
-            if let RuntimeReadState::Active { owners, .. } = &mut self.read {
+            if self.source_workers.is_some() {
+                // Fabric poisoning must also prevent a pending registration
+                // from publishing its eventual successful result.
+                self.accepting = false;
+                self.read.begin_shutdown();
+            } else if let RuntimeReadState::Active { owners, .. } = &mut self.read {
                 owners.interrupt_waiters();
             }
         }
@@ -1010,6 +1024,238 @@ mod native {
                         native_error("recycle_read_child_lease", error)
                     }
                 })
+        }
+
+        pub(crate) fn enable_source_workers(&mut self, count: usize) -> Result<()> {
+            if count == 0 {
+                return Ok(());
+            }
+            if count > 16 || self.source_workers.is_some() {
+                return Err(Error::InvalidConfiguration(
+                    "invalid source worker count".into(),
+                ));
+            }
+            let native = self
+                .native
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("runtime closed".into()))?;
+            let mut contexts = Vec::with_capacity(count);
+            for _ in 0..count {
+                contexts.push(
+                    super::super::ffi::read::source::SourceContext::acquire(native)
+                        .map_err(|error| native_error("source_context_acquire", error))?,
+                );
+            }
+            self.source_workers = Some(super::super::read_source_workers::SourceWorkers::start(
+                contexts,
+            )?);
+            Ok(())
+        }
+        pub(crate) fn source_work_pending(&self) -> bool {
+            self.source_workers
+                .as_ref()
+                .is_some_and(|workers| workers.pending())
+        }
+        pub(crate) unsafe fn submit_source_registration(
+            &mut self,
+            request: ReadSourceRequest,
+            reply: tokio::sync::oneshot::Sender<Result<ReadSourceAdmission>>,
+        ) {
+            if self.source_workers.is_none() {
+                let _ = reply.send(unsafe { self.register_read_source(request) });
+                return;
+            }
+            let admitted = (|| {
+                if !self.accepting {
+                    return Err(Error::Protocol("source admission stopped".into()));
+                }
+                let peer = self
+                    .peers
+                    .get(&request.peer_id)
+                    .ok_or_else(|| Error::Protocol("unknown source peer".into()))?;
+                if peer.is_draining() {
+                    return Err(Error::Protocol("source peer draining".into()));
+                }
+                let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                    return Err(Error::Protocol("READ disabled".into()));
+                };
+                owners
+                    .reserve_worker_source(
+                        ReadPeer {
+                            id: request.peer_id,
+                            generation: peer.generation(),
+                        },
+                        request.backing.len(),
+                    )
+                    .map_err(read_owner_error)
+            })();
+            let id = match admitted {
+                Ok(id) => id,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            if let Err(super::super::read_source_workers::Reply::Register(reply)) = self
+                .source_workers
+                .as_mut()
+                .unwrap()
+                .register(id, request.backing, request.token, reply)
+            {
+                if let RuntimeReadState::Active { owners, .. } = &mut self.read {
+                    let _ = owners.reject_worker_source(id);
+                }
+                let _ = reply.send(Err(Error::Protocol("source workers unavailable".into())));
+            }
+        }
+        pub(crate) unsafe fn submit_source_cleanup(
+            &mut self,
+            id: ReadSourceId,
+            revoked: bool,
+            reply: tokio::sync::oneshot::Sender<Result<bool>>,
+        ) {
+            if self.source_workers.is_none() {
+                let result = if revoked {
+                    unsafe { self.release_read_source_after_revoke(id) }
+                } else {
+                    unsafe { self.unregister_read_source(id) }
+                };
+                let _ = reply.send(result);
+                return;
+            }
+            let worker = match &mut self.read {
+                RuntimeReadState::Active { owners, .. } => {
+                    owners.worker_source(id.0).map_err(read_owner_error)
+                }
+                _ => Err(Error::Protocol("READ disabled".into())),
+            };
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            // SAFETY: the unsafe Fabric cleanup facade supplied identity-bound
+            // provider facts. Workers receive the same permits as synchronous reap.
+            let permit = unsafe { UnregisterPermit::new(id.0) };
+            let proof = if revoked {
+                Some(unsafe { SourceRevoked::new(id.0) })
+            } else {
+                None
+            };
+            if let Err(super::super::read_source_workers::Reply::Cleanup(reply)) = self
+                .source_workers
+                .as_mut()
+                .unwrap()
+                .cleanup(id.0, worker, permit, proof, reply)
+            {
+                let _ = reply.send(Err(Error::Protocol(
+                    "source cleanup busy or worker unavailable".into(),
+                )));
+            }
+        }
+        pub(crate) fn poll_source_workers(&mut self) {
+            use super::super::read_source_workers::{Outcome, Registration, Reply};
+            let completions = match &mut self.source_workers {
+                Some(workers) => workers.completions(),
+                None => return,
+            };
+            for (completion, reply) in completions {
+                let RuntimeReadState::Active { owners, .. } = &mut self.read else {
+                    continue;
+                };
+                match (completion.outcome, reply) {
+                    (Outcome::Register(registration), Reply::Register(reply)) => {
+                        let known_ready = matches!(&registration, Registration::Ready { .. });
+                        let result = match registration {
+                            Registration::Rejected(error) => {
+                                let _ = owners.reject_worker_source(completion.id);
+                                Err(native_error("register_read_source", error))
+                            }
+                            Registration::Uncertain(error) => {
+                                match owners.attach_worker_source(
+                                    completion.id,
+                                    completion.worker,
+                                    true,
+                                ) {
+                                    Ok(_) => Ok(ReadSourceAdmission::Quarantined {
+                                        id: ReadSourceId(completion.id),
+                                        error: native_error("register_read_source", error),
+                                    }),
+                                    Err(error) => Err(read_owner_error(error)),
+                                }
+                            }
+                            Registration::Ready {
+                                descriptor,
+                                token,
+                                stages,
+                            } => {
+                                match owners.attach_worker_source(
+                                    completion.id,
+                                    completion.worker,
+                                    false,
+                                ) {
+                                    Ok(true) => Ok(ReadSourceAdmission::Ready(ReadSourceOffer {
+                                        id: ReadSourceId(completion.id),
+                                        descriptor,
+                                        token,
+                                        register_stages: stages,
+                                    })),
+                                    Ok(false) => Ok(ReadSourceAdmission::Quarantined {
+                                        id: ReadSourceId(completion.id),
+                                        error: Error::Protocol(
+                                            "source peer retired during registration".into(),
+                                        ),
+                                    }),
+                                    Err(error) => Err(read_owner_error(error)),
+                                }
+                            }
+                        };
+                        if reply.send(result).is_err() && known_ready {
+                            // No offer was delivered: no remote capability was
+                            // published. Retire, then revoke asynchronously; never
+                            // release backing just because the receiver disappeared.
+                            let id = ReadSourceId(completion.id);
+                            let _ = self.retire_read_source(id);
+                            let (reply, _ignored) = tokio::sync::oneshot::channel();
+                            unsafe { self.submit_source_cleanup(id, true, reply) };
+                        }
+                    }
+                    (Outcome::Cleanup(result), Reply::Cleanup(reply)) => {
+                        let result = owners
+                            .complete_worker_cleanup(completion.id, result)
+                            .map_err(|error| match error {
+                                super::super::read_owner::ReapError::Registry(error) => {
+                                    read_owner_error(error)
+                                }
+                                super::super::read_owner::ReapError::Cleanup(error) => {
+                                    native_error("worker_source_cleanup", error)
+                                }
+                            });
+                        let _ = reply.send(result);
+                    }
+                    (Outcome::Lost, Reply::Register(reply)) => {
+                        let _ = owners.attach_worker_source(completion.id, completion.worker, true);
+                        let _ = reply.send(Ok(ReadSourceAdmission::Quarantined {
+                            id: ReadSourceId(completion.id),
+                            error: Error::Protocol(
+                                "source worker lost; budget and backing retained".into(),
+                            ),
+                        }));
+                    }
+                    (Outcome::Lost, Reply::Cleanup(reply)) => {
+                        let _ = owners.complete_worker_cleanup(
+                            completion.id,
+                            Err(ffi::FfiError::Contract("source worker lost")),
+                        );
+                        let _ = reply.send(Err(Error::Protocol(
+                            "source worker lost during cleanup".into(),
+                        )));
+                    }
+                    _ => unreachable!("source worker operation/reply mismatch"),
+                }
+            }
         }
 
         /// Registers one immutable Parent Piece and exports the descriptor on the
@@ -1441,6 +1687,40 @@ mod native {
             self.accepting = false;
             self.read.begin_shutdown();
             let mut failures = Vec::new();
+            // Resolve every dispatched creation before closing the context. A
+            // wedged worker is not joined synchronously: retain the whole Runtime.
+            let source_deadline = deadline_after(Duration::from_secs(5));
+            while self.source_work_pending() && !deadline_expired(source_deadline) {
+                self.poll_source_workers();
+                let _ = self.poll_once();
+                thread::sleep(Duration::from_micros(100));
+            }
+            if self.source_work_pending() {
+                return Err(Error::Shutdown {
+                    failures: vec!["source workers still executing; runtime retained".into()],
+                });
+            }
+            if let Some(workers) = &mut self.source_workers {
+                workers.stop();
+            }
+            while self
+                .source_workers
+                .as_ref()
+                .is_some_and(|workers| !workers.stopped())
+                && !deadline_expired(source_deadline)
+            {
+                thread::sleep(Duration::from_micros(100));
+            }
+            if let Some(workers) = &mut self.source_workers {
+                if !workers.stopped() {
+                    return Err(Error::Shutdown {
+                        failures: vec!["source workers did not stop; runtime retained".into()],
+                    });
+                }
+                if let Err(error) = workers.join() {
+                    failures.push(error.to_string());
+                }
+            }
 
             let peer_ids = self.peers.keys().copied().collect::<Vec<_>>();
             for peer_id in peer_ids {
@@ -1595,6 +1875,11 @@ mod native {
             )));
         }
         if let Some(read) = &config.read {
+            if read.source_workers > 16 {
+                return Err(Error::InvalidConfiguration(
+                    "source worker count exceeds 16".into(),
+                ));
+            }
             if capability.max_read_size == 0 {
                 return Err(Error::InvalidConfiguration(
                     "device does not advertise URMA READ capability".into(),
@@ -1810,6 +2095,7 @@ mod tests {
         use crate::urma::read_owner::{ReadBudget, ReadCapacity};
         let cap = |bytes, entries| ReadCapacity { bytes, entries };
         let read = ReadRuntimeConfig {
+            source_workers: 0,
             budget: ReadBudget {
                 total: cap(64 * 1024 * 1024, 8),
                 source: cap(32 * 1024 * 1024, 4),

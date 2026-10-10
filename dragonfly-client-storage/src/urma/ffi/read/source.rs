@@ -87,6 +87,46 @@ pub(crate) struct ReadSource<K> {
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
+/// Narrow context lease for source operations only. Endpoint handles and the
+/// Runtime never cross threads. Created on the owner before workers start;
+/// dropped after worker-local sources stop executing. C holds an atomic runtime
+/// ref and preinitializes the token. Deployment must support distinct-Segment
+/// register/unregister concurrently with owner operations.
+pub(crate) struct SourceContext {
+    raw: NonNull<sys::dfurma_runtime_t>,
+    _not_sync: PhantomData<std::cell::Cell<()>>,
+}
+// SAFETY: only immutable context/token pointers are shared. Source objects are
+// thread-local; C's shared source/Segment counts are atomic. Runtime close
+// refuses this lease, and NativeRuntime itself remains !Send/!Sync.
+unsafe impl Send for SourceContext {}
+impl SourceContext {
+    pub(crate) fn acquire(runtime: &mut NativeRuntime) -> Result<Self, FfiError> {
+        let raw = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
+        // SAFETY: acquisition/token initialization runs only on the native owner.
+        status_result(unsafe { sys::dfurma_source_context_acquire(raw.as_ptr()) })?;
+        Ok(Self {
+            raw,
+            _not_sync: PhantomData,
+        })
+    }
+    pub(crate) unsafe fn register<K>(
+        &mut self,
+        backing: ReadBacking<K>,
+        token: &ReadToken,
+    ) -> SourceRegistration<K> {
+        // SAFETY: same provider/backing contract as ReadSource::register. The
+        // context lease prevents close throughout this native call.
+        unsafe { ReadSource::register_raw(Some(self.raw), backing, token) }
+    }
+}
+impl Drop for SourceContext {
+    fn drop(&mut self) {
+        // SAFETY: this worker has stopped all native calls using its context.
+        unsafe { sys::dfurma_source_context_release(self.raw.as_ptr()) }
+    }
+}
+
 impl<K> ReadSource<K> {
     /// # Safety
     /// The caller must enforce source byte/Segment admission and immutable Storage
@@ -99,7 +139,15 @@ impl<K> ReadSource<K> {
         backing: ReadBacking<K>,
         token: &ReadToken,
     ) -> SourceRegistration<K> {
-        let Some(runtime) = runtime.raw else {
+        unsafe { Self::register_raw(runtime.raw, backing, token) }
+    }
+
+    unsafe fn register_raw(
+        runtime: Option<NonNull<sys::dfurma_runtime_t>>,
+        backing: ReadBacking<K>,
+        token: &ReadToken,
+    ) -> SourceRegistration<K> {
+        let Some(runtime) = runtime else {
             return SourceRegistration::Rejected {
                 error: FfiError::Contract("runtime is closed"),
                 backing,
