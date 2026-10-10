@@ -9,7 +9,7 @@ use super::{
         },
         FfiError,
     },
-    read_owner::{ReadOwnerId, ReapDecision},
+    read_registry::{ReadOwnerId, ReapDecision},
     read_source_owner::{SourceOwner, SourceRevoked, UnregisterPermit},
     runtime::ReadSourceAdmission,
     Error, Result,
@@ -467,7 +467,7 @@ impl Drop for SourceWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::urma::read_owner::{
+    use crate::urma::read_registry::{
         ReadBudget, ReadCapacity, ReadDirection, ReadOwnerRegistry, ReadPeer, VerifiedRetirement,
     };
     use std::sync::{

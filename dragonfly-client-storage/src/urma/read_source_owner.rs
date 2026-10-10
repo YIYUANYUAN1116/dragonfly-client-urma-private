@@ -9,7 +9,7 @@ use super::{
         },
         FfiError, NativeRuntime,
     },
-    read_owner::{
+    read_registry::{
         OwnerError, QuarantineReason, ReadDirection, ReadOwnerId, ReadOwnerRegistry, ReadPeer,
         ReapDecision, ReapError, VerifiedRetirement,
     },
@@ -250,7 +250,7 @@ impl<T: SourceSlot> ReadOwnerRegistry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::urma::read_owner::{OwnerState, ReadBudget, ReadCapacity};
+    use crate::urma::read_registry::{OwnerState, ReadBudget, ReadCapacity};
     use std::{cell::RefCell, rc::Rc};
 
     fn registry<T>() -> ReadOwnerRegistry<T> {

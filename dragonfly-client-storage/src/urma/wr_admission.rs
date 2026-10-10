@@ -3,7 +3,7 @@
 use super::{
     ffi::{read::ReadRequest, FfiError},
     read_child_owner::{ChildPost, ChildResources, LeaseSpan},
-    read_owner::ReadPeer,
+    read_registry::ReadPeer,
 };
 use std::{cell::RefCell, collections::BTreeMap, mem::ManuallyDrop, rc::Rc};
 

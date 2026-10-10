@@ -26,13 +26,13 @@ use super::{
     read_protocol::{
         ReadCapability, ReadPieceLocator, ReadTransferIdentity, READ_DESCRIPTOR_VERSION,
     },
-    read_session::{ChildTransportSession, ParentSourceSession},
+    read_transfer::{child::ChildTransfer, parent::ParentTransfer},
     runtime::{ReadRuntimeConfig, RuntimeConfig},
     Error, Result,
 };
 use crate::urma::{
     fabric::UrmaFabricHandle,
-    read_owner::{ReadBudget, ReadCapacity},
+    read_registry::{ReadBudget, ReadCapacity},
     TpType,
 };
 use std::{
@@ -133,7 +133,7 @@ async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
     let control = lane.register(identity)?;
     // SAFETY: The version-5 handshake generation-binds the authenticated peer
     // descriptor and this process exclusively owns the destination Piece.
-    let session = ChildTransportSession::new(
+    let transfer = ChildTransfer::new(
         fabric.clone(),
         lane_id,
         control,
@@ -149,7 +149,8 @@ async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
         MAX_OUTSTANDING,
         COMPLETION_TIMEOUT,
     )?;
-    let success = unsafe { session.run_transport_only().await }.map_err(|failure| failure.error)?;
+    let success =
+        unsafe { transfer.run_transport_only().await }.map_err(|failure| failure.error)?;
     let lease = success.lease;
     if lease.span.length as u64 != PIECE_LENGTH {
         return Err(Error::Protocol(
@@ -280,7 +281,7 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
             "Parent accepted a READ transfer with the wrong identity".into(),
         ));
     }
-    let (session, _locator) = ParentSourceSession::accept(
+    let (transfer, _locator) = ParentTransfer::accept(
         fabric.clone(),
         lane_id,
         accepted.control,
@@ -290,7 +291,7 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
         MAX_READ_SIZE,
     )?;
     let (parent, pending) = unsafe {
-        session
+        transfer
             .publish_and_wait_read_done(
                 super::runtime::ReadSourceRequest {
                     peer_id: lane_id,
@@ -305,7 +306,7 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
             .await
     }
     .map_err(|failure| failure.error)?;
-    if pending.terminal != super::read_session::ParentTerminal::Success
+    if pending.terminal != super::read_transfer::parent::ParentTerminal::Success
         || pending.completed_length != PIECE_LENGTH
     {
         return Err(Error::Protocol(

@@ -25,7 +25,7 @@ use crate::urma::read_control::{
 };
 use crate::urma::read_handoff::ResourceGuard;
 use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION};
-use crate::urma::read_session::{ParentSourceSession, SourceState};
+use crate::urma::read_transfer::parent::{ParentTransfer, SourceState};
 use crate::urma::rendezvous::{CapabilityRegistry, UrmaAdvertisement, UrmaCapability};
 use crate::urma::runtime::{ReadSourceId, ReadSourceRequest};
 use crate::urma::server_session_idle_timeout;
@@ -711,7 +711,7 @@ impl UrmaServerHandler {
                 piece.length
             )));
         }
-        let (session, locator) = ParentSourceSession::accept(
+        let (transfer, locator) = ParentTransfer::accept(
             self.fabric.clone(),
             lane_id,
             accepted.control,
@@ -723,7 +723,7 @@ impl UrmaServerHandler {
         .map_err(client_error)?;
         let retained_handler = self.clone();
         let retained_lane = lane.clone();
-        let session = session.on_source_state(move |id, state| {
+        let transfer = transfer.on_source_state(move |id, state| {
             record_source_state(&retained_handler.retained_read_sources, lane_id, id, state);
             if matches!(state, SourceState::Retained) {
                 retained_lane.abort("READ source retained after failure or cancellation");
@@ -765,7 +765,7 @@ impl UrmaServerHandler {
         // SAFETY: The version-5 handshake authenticated this lane and the
         // accepted length was proven to match the immutable Storage Piece.
         let (parent, pending) = match unsafe {
-            session.publish_and_wait_read_done(
+            transfer.publish_and_wait_read_done(
                 ReadSourceRequest {
                     peer_id: lane_id,
                     backing: ReadBacking::new(memory, ()),
@@ -948,7 +948,7 @@ mod tests {
         ReadTokenSpace::with_test_keys(keys)
     }
     fn source_ids() -> [ReadSourceId; 2] {
-        use crate::urma::read_owner::{
+        use crate::urma::read_registry::{
             ReadBudget, ReadCapacity, ReadDirection, ReadOwnerRegistry, ReadPeer,
         };
         let cap = ReadCapacity {

@@ -6,25 +6,25 @@
 
 use std::time::Duration;
 mod completion;
+mod destination_pool;
 mod error;
 pub mod fabric;
 pub(crate) mod ffi;
 mod lane;
-mod read_buffer_pool;
 mod read_child_owner;
 pub(crate) mod read_control;
 pub(crate) mod read_handoff;
-pub(crate) mod read_owner;
-mod read_owners;
 pub(crate) mod read_protocol;
-pub(crate) mod read_session;
+pub(crate) mod read_registry;
 #[cfg(test)]
 mod read_session_harness;
 mod read_source_owner;
 mod read_source_workers;
-mod read_wr_credit;
+mod read_table;
+pub(crate) mod read_transfer;
 pub mod rendezvous;
 pub(crate) mod runtime;
+mod wr_admission;
 
 pub(crate) use error::native_error;
 pub use error::{Error, Result};

@@ -4,7 +4,7 @@ use super::{
         source::{ReadBacking, ReadSourceStages},
         ReadDescriptor, ReadToken,
     },
-    read_owner::{ReadBudget, ReadCapacity, ReadOwnerId},
+    read_registry::{ReadBudget, ReadCapacity, ReadOwnerId},
     Error, Result,
 };
 
@@ -202,18 +202,18 @@ mod native {
     use super::*;
     use crate::urma::{
         completion::{deadline_after, deadline_expired, CompletionRouter, ReadCompletionSink},
+        destination_pool::ReadBufferPool,
         ffi::{self, NativeRuntime},
         lane::{JettyConfig, JettyDescriptor, PeerTarget, TransportMode, UrmaJetty},
         native_error,
-        read_buffer_pool::ReadBufferPool,
         read_child_owner::NativeChild,
-        read_owner::ReadPeer,
-        read_owners::ReadOwners,
-        read_owners::{ChildAdmission, ChildSpec, ReadDispatchError},
+        read_registry::ReadPeer,
         read_source_owner::{
             SourceAdmission, SourceAdmissionError, SourceRevoked, UnregisterPermit,
         },
-        read_wr_credit::{CreditedChild, ReadWrCredits},
+        read_table::ReadOwners,
+        read_table::{ChildAdmission, ChildSpec, ReadDispatchError},
+        wr_admission::{CreditedChild, ReadWrCredits},
     };
     use std::{
         collections::HashMap,
@@ -367,7 +367,7 @@ mod native {
         }
     }
 
-    fn read_owner_error(error: super::super::read_owner::OwnerError) -> Error {
+    fn read_owner_error(error: super::super::read_registry::OwnerError) -> Error {
         Error::Protocol(error.to_string())
     }
 
@@ -792,8 +792,10 @@ mod native {
             owners
                 .recycle_child_lease(id.0)
                 .map_err(|error| match error {
-                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
-                    super::super::read_owner::ReapError::Cleanup(error) => {
+                    super::super::read_registry::ReapError::Registry(error) => {
+                        read_owner_error(error)
+                    }
+                    super::super::read_registry::ReapError::Cleanup(error) => {
                         native_error("recycle_read_child_lease", error)
                     }
                 })
@@ -1011,10 +1013,10 @@ mod native {
                         let result = owners
                             .complete_worker_cleanup(completion.id, result)
                             .map_err(|error| match error {
-                                super::super::read_owner::ReapError::Registry(error) => {
+                                super::super::read_registry::ReapError::Registry(error) => {
                                     read_owner_error(error)
                                 }
-                                super::super::read_owner::ReapError::Cleanup(error) => {
+                                super::super::read_registry::ReapError::Cleanup(error) => {
                                     native_error("worker_source_cleanup", error)
                                 }
                             });
@@ -1200,8 +1202,10 @@ mod native {
             owners
                 .reap_source(id.0, &permit, None)
                 .map_err(|error| match error {
-                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
-                    super::super::read_owner::ReapError::Cleanup(error) => {
+                    super::super::read_registry::ReapError::Registry(error) => {
+                        read_owner_error(error)
+                    }
+                    super::super::read_registry::ReapError::Cleanup(error) => {
                         native_error("unregister_read_source", error)
                     }
                 })
@@ -1226,8 +1230,10 @@ mod native {
             owners
                 .reap_source(id.0, &permit, Some(&revoked))
                 .map_err(|error| match error {
-                    super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
-                    super::super::read_owner::ReapError::Cleanup(error) => {
+                    super::super::read_registry::ReapError::Registry(error) => {
+                        read_owner_error(error)
+                    }
+                    super::super::read_registry::ReapError::Cleanup(error) => {
                         native_error("release_read_source_after_revoke", error)
                     }
                 })
@@ -1242,8 +1248,8 @@ mod native {
             let RuntimeReadState { owners, .. } = &mut self.read;
             owners.retire(id.0).map_err(read_owner_error)?;
             owners.reap_child(id.0).map_err(|error| match error {
-                super::super::read_owner::ReapError::Registry(error) => read_owner_error(error),
-                super::super::read_owner::ReapError::Cleanup(error) => {
+                super::super::read_registry::ReapError::Registry(error) => read_owner_error(error),
+                super::super::read_registry::ReapError::Cleanup(error) => {
                     native_error("reap_read_child", error)
                 }
             })

@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn source_registry_rejections_return_backing_and_release_only_unused_budget() {
         use crate::urma::{
-            read_owner::{ReadBudget, ReadCapacity, ReadOwnerRegistry, ReadPeer},
+            read_registry::{ReadBudget, ReadCapacity, ReadOwnerRegistry, ReadPeer},
             read_source_owner::{SourceAdmission, SourceAdmissionError, SourceOwner},
         };
         let cap = |bytes, entries| ReadCapacity { bytes, entries };
@@ -416,7 +416,7 @@ mod tests {
             match (index, error) {
                 (
                     0,
-                    SourceAdmissionError::Budget(crate::urma::read_owner::OwnerError::Capacity),
+                    SourceAdmissionError::Budget(crate::urma::read_registry::OwnerError::Capacity),
                 ) => {}
                 (1, SourceAdmissionError::Native(FfiError::Contract("runtime is closed"))) => {}
                 (_, error) => panic!("unexpected rejection: {error:?}"),
@@ -434,9 +434,9 @@ mod tests {
     fn mixed_registry_source_preflight_returns_backing_and_clears_charge() {
         use crate::urma::{
             read_child_owner::NativeChild,
-            read_owner::{ReadBudget, ReadCapacity, ReadPeer},
-            read_owners::ReadOwners,
+            read_registry::{ReadBudget, ReadCapacity, ReadPeer},
             read_source_owner::SourceAdmission,
+            read_table::ReadOwners,
         };
         let cap = |bytes, entries| ReadCapacity { bytes, entries };
         let mut owners: ReadOwners<Guard, NativeChild<()>> = ReadOwners::new(ReadBudget {

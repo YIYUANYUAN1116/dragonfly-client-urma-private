@@ -7,7 +7,7 @@ use super::{
         },
         FfiError, JettyHandle, NativeRuntime, SegmentHandle, TargetHandle,
     },
-    read_owner::{ReadOwnerId, ReapDecision, VerifiedRetirement},
+    read_registry::{ReadOwnerId, ReapDecision, VerifiedRetirement},
 };
 use std::{
     collections::BTreeMap,
@@ -171,7 +171,7 @@ pub(crate) struct NativeChild<K> {
     import_uncertain: bool,
     // Pool shared with the runtime READ state; reuse replaces per-Piece
     // register/unregister. Buffers from an uncertain creation never re-enter.
-    pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+    pool: std::rc::Rc<std::cell::RefCell<super::destination_pool::ReadBufferPool>>,
     allocation_bytes: u64,
     buffer_uncertain: bool,
     _keepalive: K,
@@ -209,16 +209,16 @@ impl<K> NativeChild<K> {
         runtime: &mut NativeRuntime,
         jetty: std::rc::Rc<std::cell::RefCell<JettyHandle>>,
         target: std::rc::Rc<TargetHandle>,
-        spec: super::read_owners::ChildSpec,
+        spec: super::read_table::ChildSpec,
         alignment: u64,
         descriptor: &ReadDescriptor,
         token: &ReadToken,
         max_read_size: u32,
-        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+        pool: std::rc::Rc<std::cell::RefCell<super::destination_pool::ReadBufferPool>>,
         active_destination_bytes: u64,
         keepalive: K,
-    ) -> super::read_owners::ChildCreation<Self> {
-        use super::read_owners::ChildCreation;
+    ) -> super::read_table::ChildCreation<Self> {
+        use super::read_table::ChildCreation;
         if spec.piece_length == 0
             || descriptor.length != spec.piece_length
             || spec.allocation_bytes < spec.piece_length
@@ -683,7 +683,7 @@ impl<R: ChildResources> ChildOwner<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::urma::read_owner::{
+    use crate::urma::read_registry::{
         ReadBudget, ReadCapacity, ReadDirection, ReadOwnerRegistry, ReadPeer,
     };
     use std::{cell::RefCell, rc::Rc};

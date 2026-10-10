@@ -32,7 +32,7 @@ use crate::urma::read_control::{
 use crate::urma::read_protocol::{
     ReadCapability, ReadPieceLocator, ReadTransferIdentity, READ_DESCRIPTOR_VERSION,
 };
-use crate::urma::read_session::{ChildTransportFailure, ChildTransportSession, RetainedChildOwner};
+use crate::urma::read_transfer::child::{ChildTransfer, ChildTransportFailure, RetainedChildOwner};
 use crate::urma::runtime::{ReadChildId, ReadLeaseSpan};
 use dragonfly_client_config::dfdaemon::Config;
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
@@ -278,7 +278,7 @@ impl UrmaReadClient {
         // SAFETY: The lane identity was bound to an authenticated version-5
         // handshake and the destination allocation below is exclusively owned
         // by this transfer for its whole lifetime.
-        let session = ChildTransportSession::new(
+        let transfer = ChildTransfer::new(
             self.fabric.clone(),
             lane.lane_id,
             control,
@@ -293,7 +293,7 @@ impl UrmaReadClient {
         .map_err(|error| ClientError::Unknown(error.to_string()))?
         .with_deadline(deadline);
         let session_run_start = Instant::now();
-        let success = match unsafe { session.run_transport_only().await } {
+        let success = match unsafe { transfer.run_transport_only().await } {
             Ok(success) => success,
             Err(ChildTransportFailure {
                 error,

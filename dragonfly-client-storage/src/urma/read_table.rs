@@ -12,7 +12,7 @@ use super::{
         is_read_context, ChildOwner, ChildPostOutcome, ChildProgress, ChildResources, LeaseSpan,
         ReadChildUpdate, ReadRetired,
     },
-    read_owner::{
+    read_registry::{
         OwnerError, QuarantineReason, ReadBudget, ReadDirection, ReadOwnerId, ReadOwnerRegistry,
         ReadPeer, ReadUsage, ReapDecision, ReapError,
     },
@@ -240,12 +240,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.registry
                 .quarantine(id, QuarantineReason::RegistrationUncertain)?;
         }
-        Ok(self.registry.state(id)? == super::read_owner::OwnerState::Active)
+        Ok(self.registry.state(id)? == super::read_registry::OwnerState::Active)
     }
     pub(crate) fn worker_source(&mut self, id: ReadOwnerId) -> Result<usize, OwnerError> {
         if !matches!(
             self.registry.state(id)?,
-            super::read_owner::OwnerState::Retiring | super::read_owner::OwnerState::Quarantined(_)
+            super::read_registry::OwnerState::Retiring
+                | super::read_registry::OwnerState::Quarantined(_)
         ) {
             return Err(OwnerError::NotRetiring);
         }
@@ -585,7 +586,7 @@ impl<K, R: ChildResources> super::completion::ReadCompletionSink for ReadOwners<
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ffi::read::ReadRequest, read_child_owner::ChildPost, read_owner::ReadCapacity,
+        ffi::read::ReadRequest, read_child_owner::ChildPost, read_registry::ReadCapacity,
     };
     use super::*;
     use std::{cell::Cell, rc::Rc};
@@ -641,7 +642,7 @@ mod tests {
         assert_eq!(owners.usage().source_bytes, 8);
         assert_eq!(owners.worker_source(source).unwrap(), 1);
         assert!(owners.reserve_worker_source(PEER, 1).is_err());
-        let proof = unsafe { super::super::read_owner::VerifiedRetirement::new(source) };
+        let proof = unsafe { super::super::read_registry::VerifiedRetirement::new(source) };
         assert_eq!(
             owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
             Ok(true)
@@ -669,7 +670,7 @@ mod tests {
         );
         let other = owners.registry.reserve(PEER, ReadDirection::Source, 1);
         assert!(other.is_err());
-        let proof = unsafe { super::super::read_owner::VerifiedRetirement::new(source) };
+        let proof = unsafe { super::super::read_registry::VerifiedRetirement::new(source) };
         assert_eq!(
             owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
             Ok(true)
@@ -1109,7 +1110,7 @@ mod tests {
 }
 
 impl<K, C>
-    ReadOwners<K, super::read_wr_credit::CreditedChild<super::read_child_owner::NativeChild<C>>>
+    ReadOwners<K, super::wr_admission::CreditedChild<super::read_child_owner::NativeChild<C>>>
 {
     /// # Safety
     /// NativeChild::create's descriptor/provider requirements apply. credits must
@@ -1127,8 +1128,8 @@ impl<K, C>
         token: &ReadToken,
         max_read_size: u32,
         keepalive: C,
-        credits: std::rc::Rc<std::cell::RefCell<super::read_wr_credit::ReadWrCredits>>,
-        pool: std::rc::Rc<std::cell::RefCell<super::read_buffer_pool::ReadBufferPool>>,
+        credits: std::rc::Rc<std::cell::RefCell<super::wr_admission::ReadWrCredits>>,
+        pool: std::rc::Rc<std::cell::RefCell<super::destination_pool::ReadBufferPool>>,
     ) -> ChildAdmission {
         let active_destination_bytes = self.usage().destination_bytes;
         // SAFETY: create_child supplies byte admission before any native calls;
@@ -1149,7 +1150,7 @@ impl<K, C>
                     keepalive,
                 );
                 let wrap =
-                    |resources| super::read_wr_credit::CreditedChild::new(resources, credits, peer);
+                    |resources| super::wr_admission::CreditedChild::new(resources, credits, peer);
                 match result {
                     ChildCreation::Ready(resources) => ChildCreation::Ready(wrap(resources)),
                     ChildCreation::Uncertain { resources, error } => ChildCreation::Uncertain {
