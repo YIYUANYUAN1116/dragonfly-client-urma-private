@@ -317,9 +317,10 @@ impl UrmaFabricHandle {
     }
 
     /// Consumes a published destination lease: retires the Child owner and
-    /// closes the lease buffer, releasing the budget. Call only after Storage
+    /// recycles its buffer, releasing the owner charge. Idle registrations may
+    /// remain in the destination pool and charged to its budget. Call only after Storage
     /// consumers have joined and the published span will never be dereferenced
-    /// again. `Ok(true)` proves the full release; `Ok(false)` or an error
+    /// again. `Ok(true)` proves the owner release; `Ok(false)` or an error
     /// keeps the owner retained for a later cleanup pass.
     pub(crate) async fn recycle_published_child_lease(&self, id: ReadChildId) -> Result<bool> {
         // Retire is a state transition the recycle stage requires; a repeated

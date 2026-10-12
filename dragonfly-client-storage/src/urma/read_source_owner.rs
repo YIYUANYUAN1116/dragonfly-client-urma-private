@@ -83,8 +83,8 @@ impl<S: SourceResource> SourceCleanup<S> {
             return Ok(ReapDecision::Pending);
         }
         self.source.release()?;
-        // SAFETY: Native registration/token and backing have been released under
-        // the supplied proof. This bundle has no Child WRs or consumer workers.
+        // SAFETY: Native registration, backing and this source's shared-token
+        // reference have been released under the supplied proof. This bundle has no Child WRs or consumer workers.
         Ok(ReapDecision::Retired(unsafe {
             VerifiedRetirement::new(id)
         }))

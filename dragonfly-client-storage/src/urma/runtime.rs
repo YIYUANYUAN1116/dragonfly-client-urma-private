@@ -332,7 +332,7 @@ mod native {
         credits: Rc<std::cell::RefCell<ReadWrCredits>>,
         max_outstanding_per_peer: usize,
         buffer_alignment: u64,
-        // Retains closed registered destination buffers for reuse. Pool
+        // Retains idle, still-registered destination buffers for reuse. Pool
         // eviction combines this charge with active owner bytes so their
         // sum never exceeds the configured destination budget.
         destination_pool: Rc<std::cell::RefCell<ReadBufferPool>>,
@@ -781,8 +781,9 @@ mod native {
             })
         }
 
-        /// Final lease stage: close the published lease and finish the reap,
-        /// releasing the budget. Requires a retired (or quarantined) Child and
+        /// Final lease stage: recycle the published buffer and finish the reap,
+        /// releasing the owner charge. Pooled buffers remain registered and
+        /// charged to the pool. Requires a retired (or quarantined) Child and
         /// joined Storage consumer workers.
         pub(crate) fn recycle_read_child_lease(&mut self, id: ReadChildId) -> Result<bool> {
             if !self.read.owners.contains(id.0) {

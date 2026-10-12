@@ -130,7 +130,8 @@ pub(crate) struct ReadChildUpdate {
 }
 
 /// Implementations must retain destination/import/native dependencies until close.
-/// Kept private to this transport module; no CPU buffer access is exposed.
+/// Kept private to this transport module; only a fully retired destination
+/// may expose its CPU span for Storage consumption.
 pub(crate) trait ChildResources {
     type Wr;
     /// The extracted registered destination buffer, owned outside the bundle
@@ -148,7 +149,8 @@ pub(crate) trait ChildResources {
     /// Moves the registered destination buffer out for Storage consumption.
     /// ChildOwner guarantees no outstanding WRs and a closed import.
     fn extract_lease(&mut self) -> Result<(Self::Lease, LeaseSpan), FfiError>;
-    /// Closes a previously extracted lease buffer (unregister + release).
+    /// Releases a previously extracted lease buffer from this owner. A native
+    /// implementation may return a safe registration to its pool for reuse.
     /// Failure returns the still-live lease; the owner must retain it for retry.
     fn close_lease(&mut self, lease: Self::Lease) -> Result<(), (Self::Lease, FfiError)>;
 }
@@ -178,7 +180,7 @@ pub(crate) struct NativeChild<K> {
 }
 impl<K> NativeChild<K> {
     /// Returns the registered destination buffer to the pool when it is healthy
-    /// and the pool still has retention capacity; closes it otherwise. The
+    /// and the pool still has retention capacity; closes it otherwise.
     /// On close failure the caller receives the still-live buffer for retry.
     fn release_local(
         &mut self,
@@ -618,11 +620,13 @@ impl<R: ChildResources> ChildOwner<R> {
         }
         if !self.closed {
             self.resources.close_buffer()?;
-            // SAFETY: No WRs/consumers, import and destination closed successfully.
+            // SAFETY: No WRs/consumers remain, the import is closed, and the
+            // destination was released from this owner (closed or pooled).
             unsafe { ManuallyDrop::drop(&mut self.resources) };
             self.closed = true;
         }
-        // SAFETY: Entire Child bundle is closed. No remote source owned here.
+        // SAFETY: This Child retains no resources or consumers. A pooled buffer
+        // belongs to the pool; no remote source is owned here.
         Ok(ReapDecision::Retired(unsafe {
             VerifiedRetirement::new(self.id)
         }))
@@ -665,8 +669,9 @@ impl<R: ChildResources> ChildOwner<R> {
         Ok(span)
     }
 
-    /// Closes the published lease and finishes the ordinary reap, releasing the
-    /// budget. Call only after consumer workers joined.
+    /// Recycles the published lease and finishes the ordinary reap, releasing
+    /// the owner charge. Idle registrations remain charged to the pool.
+    /// Call only after consumer workers joined.
     pub(crate) fn recycle_lease(&mut self) -> Result<ReapDecision, FfiError> {
         if let Some(lease) = self.published.take() {
             if let Err((lease, error)) = self.resources.close_lease(lease) {

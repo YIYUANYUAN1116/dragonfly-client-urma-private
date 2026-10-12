@@ -58,8 +58,8 @@ struct ReadLaneSession {
 
 /// A fully read destination lease. The registered buffer content is final
 /// (every READ WR retired before publication); Storage must consume the span
-/// and then call [`UrmaReadPieceLease::recycle`] to close the buffer and
-/// release the transfer budget. Dropping the lease without recycling keeps
+/// and then call [`UrmaReadPieceLease::recycle`] to release the owner charge.
+/// Safe buffers may stay registered in the destination pool and charged there. Dropping the lease without recycling keeps
 /// the native owner registered (fail closed) and the budget charged.
 pub struct UrmaReadPieceLease {
     fabric: UrmaFabricHandle,
@@ -85,17 +85,18 @@ impl UrmaReadPieceLease {
     }
 
     /// Returns the final READ content. The backing registered buffer is
-    /// exclusively owned by this lease until recycle, so no other reader or
-    /// DMA can touch the span.
+    /// owned by the native owner until recycle. CPU readers borrow this lease
+    /// immutably; no READ DMA can modify the published span.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: Every READ WR retired before publication, the span is valid
-        // for the lease lifetime, and recycle closes the buffer afterwards.
+        // for the lease lifetime; recycle ends access before closing or pooling it.
         unsafe { std::slice::from_raw_parts(self.span.data, self.span.length) }
     }
 
-    /// Releases the registered destination buffer and the transfer budget.
-    /// Returns false when the native owner could not prove a full close; the
-    /// id stays registered for a later cleanup pass.
+    /// Recycles the destination buffer and releases the transfer owner charge.
+    /// Idle registrations may remain charged to the destination pool.
+    /// Returns an error when owner release cannot be proven; the id remains
+    /// retained for a later cleanup pass.
     pub async fn recycle(mut self) -> ClientResult<()> {
         // Consumer workers have joined; cancellation or native failure may now
         // enqueue recycling safely, unlike Drop of a lease still used by Storage.
@@ -358,8 +359,8 @@ impl UrmaReadClient {
         Ok((lease, success.piece_offset, success.digest))
     }
 
-    /// Retries fail-closed owners without delaying the current transfer. An
-    /// owner remains queued until the native owner thread proves full release.
+    /// Retries fail-closed owners with one shared one-second deadline. Callers
+    /// await this pass before continuing; unreleased owners remain queued.
     async fn retry_retained_children(&self) {
         let pending = {
             let mut retained = self.retained_children.lock().await;

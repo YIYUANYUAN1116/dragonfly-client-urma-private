@@ -52,8 +52,10 @@ impl<K> ReadBacking<K> {
     }
 }
 
-/// Rejected means no registration call occurred and backing may be released.
-/// Uncertain owns the Storage keepalive and native copy/token even when the
+/// Rejected means no registration remains under the shim rollback contract;
+/// backing may be released.
+/// Uncertain retains the Storage keepalive and any native backing/token reference
+/// even when the
 /// registration result cannot be classified as a clean rejection.
 pub(crate) enum SourceRegistration<K> {
     Registered(ReadSource<K>),
@@ -292,7 +294,8 @@ impl<K> ReadSource<K> {
             .raw
             .ok_or(FfiError::Contract("READ source is closed"))?;
         // SAFETY: Caller supplies revocation proof; C refuses live registrations
-        // and retains the wrapper/token on token-release failure.
+        // and retains the wrapper on failure. Success releases this source's
+        // shared-token reference; the token itself lives until runtime close.
         status_result(unsafe { sys::dfurma_read_source_release_after_revoke(raw.as_ptr()) })?;
         self.raw = None;
         drop(self.memory.take());

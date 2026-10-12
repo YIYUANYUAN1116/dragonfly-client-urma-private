@@ -145,12 +145,13 @@ int dfurma_read_source_register_stages(dfurma_read_source_t *source,
 int dfurma_read_source_descriptor(dfurma_read_source_t *source,
                                   dfurma_read_descriptor_t *out);
 /* Stops descriptor export; success means native unregister only, not revocation.
- * Wrapper, explicitly owned token ID, backing and runtime count remain retained.
+ * Wrapper, shared-token reference, backing and runtime count remain retained.
  * Registration-uncertain sources cannot be unregistered using a missing handle. */
 int dfurma_read_source_unregister(dfurma_read_source_t *source);
 /* CALLER MUST independently prove remote access has ceased and cannot resume.
- * Only accepts sources without a live native registration; releases token ID and
- * wrapper on success. Caller may release backing only after this also succeeds. */
+ * Only accepts sources without a live native registration; releases the source
+ * wrapper and its shared-token reference on success. The token ID itself is
+ * freed at runtime close. Caller may release backing only after this also succeeds. */
 int dfurma_read_source_release_after_revoke(dfurma_read_source_t *source);
 
 /* Validates the supported descriptor subset and peer identity before import.

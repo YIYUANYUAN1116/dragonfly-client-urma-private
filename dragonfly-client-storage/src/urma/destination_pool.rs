@@ -2,7 +2,7 @@
 //!
 //! Every Piece used to allocate and register a fresh pinned destination buffer
 //! and unregister it after the lease recycle, paying the full provider MR
-//! round trip per Piece. The pool retains closed registered buffers keyed by
+//! round trip per Piece. The pool retains idle, still-registered buffers keyed by
 //! their allocation length so the next Piece of the same length reuses the
 //! registration instead of recreating it.
 //!

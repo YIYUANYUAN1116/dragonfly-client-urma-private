@@ -134,7 +134,8 @@ impl VerifiedRetirement {
     /// # Safety
     /// All resources belonging to this exact owner must be safe to drop: native
     /// WRs retired, imports closed, consumer workers joined, and remote grants
-    /// independently proven revoked with source unregister/token release complete.
+    /// independently proven revoked with source unregister and bundle release
+    /// complete. A shared runtime token and pooled buffers may outlive this owner.
     /// The proof covers the whole bundle, including uncertain native operations.
     pub(crate) unsafe fn new(id: ReadOwnerId) -> Self {
         Self(id)

@@ -904,9 +904,9 @@ static void dfurma_wr_posted(dfurma_wr_t *wr)
  * one token id carrying many Segments, and it is explicitly owned here because
  * the core unregister path may free automatically allocated ids on failure.
  *
- * Allocation is the dominant cost of the register stage (~9ms/piece, serialized
- * in the provider's control path), so paying it once per runtime instead of once
- * per Piece removes it from the data path.
+ * Sharing the token keeps token-ID allocation out of subsequent Piece
+ * registrations. Source release drops a reference; runtime_close frees the
+ * token after all source and worker references have retired.
  */
 static int dfurma_read_token_id_acquire(dfurma_runtime_t *runtime,
                                         urma_token_id_t **out)
