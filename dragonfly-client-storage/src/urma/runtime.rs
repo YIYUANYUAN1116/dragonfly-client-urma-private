@@ -1286,6 +1286,10 @@ mod native {
             self.max_payload_size
         }
 
+        pub(crate) fn max_read_size(&self) -> u32 {
+            self.capability.max_read_size
+        }
+
         pub(crate) fn close_peer_target(&mut self, peer_id: u16) -> Result<()> {
             // Close is asynchronous at the provider boundary. The PeerTarget stays
             // owned by Runtime until `reap_drained_peers` observes both gates.

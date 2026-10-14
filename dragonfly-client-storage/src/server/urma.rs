@@ -478,7 +478,8 @@ fn read_parent_config(
                 max_read_size: read.max_read_size.as_u64() as u32,
                 max_jfs_sge: read.max_jfs_sge,
                 descriptor_version: READ_DESCRIPTOR_VERSION,
-            },
+            }
+            .with_provider_limit(fabric.max_read_size()),
         },
         _revocation_gate: ProviderRevocationValidated,
     }

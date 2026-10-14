@@ -86,7 +86,8 @@ fn lane_capability(fabric: &UrmaFabricHandle) -> ReadLaneCapability {
             max_read_size: MAX_READ_SIZE,
             max_jfs_sge: MAX_JFS_SGE,
             descriptor_version: READ_DESCRIPTOR_VERSION,
-        },
+        }
+        .with_provider_limit(fabric.max_read_size()),
     }
 }
 

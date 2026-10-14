@@ -735,6 +735,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn driver_uses_whole_pieces_or_splits_at_negotiated_provider_and_software_limits() {
+        use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION};
+
+        let mib = 1024 * 1024u32;
+        let automatic = dragonfly_client_config::dfdaemon::UrmaReadServer::default()
+            .max_read_size
+            .as_u64() as u32;
+        // Piece MiB, Child provider MiB, Parent provider MiB, software cap, WR MiB.
+        for (piece_mib, child_max, parent_max, software, expected) in [
+            (16, 64, 64, automatic, vec![16]),
+            (32, 64, 64, automatic, vec![32]),
+            (64, 64, 64, automatic, vec![64]),
+            (128, 64, 64, automatic, vec![64, 64]),
+            (64, 64, 32, automatic, vec![32, 32]),
+            (64, 16, 64, automatic, vec![16, 16, 16, 16]),
+            (17, 64, 8, automatic, vec![8, 8, 1]),
+            (32, 64, 64, 8 * mib, vec![8, 8, 8, 8]),
+            (16, 64, 64, mib, vec![1; 16]),
+        ] {
+            let capability = |provider_mib| {
+                ReadCapability {
+                    max_read_size: software,
+                    max_jfs_sge: 1,
+                    descriptor_version: READ_DESCRIPTOR_VERSION,
+                }
+                .with_provider_limit(provider_mib * mib)
+            };
+            let max_read_size = capability(child_max)
+                .effective_max_read_size(&capability(parent_max))
+                .unwrap();
+            let piece_length = u64::from(piece_mib * mib);
+            let update = |bytes, count| ReadChildUpdate {
+                progress: ReadChildProgress {
+                    piece_length,
+                    accepted_bytes: bytes,
+                    retired_bytes: bytes,
+                    accepted_wr_count: count,
+                    retired_wr_count: count,
+                    outstanding_wr_count: 0,
+                    posting_stopped: false,
+                    failed: false,
+                    read_succeeded: bytes == piece_length,
+                },
+                timing: ReadCompletionTiming::default(),
+                notified_at: std::time::Instant::now(),
+                interrupted: false,
+            };
+            let (tx, rx) = tokio::sync::watch::channel(update(0, 0));
+            let mut posted = Vec::new();
+            let mut bytes = 0;
+            let result = drive_read_notifications(
+                rx,
+                piece_length,
+                8,
+                max_read_size,
+                Instant::now() + Duration::from_secs(1),
+                0,
+                |lengths| {
+                    for &length in &lengths {
+                        assert!(length > 0 && length <= max_read_size);
+                        bytes += u64::from(length);
+                    }
+                    let count = lengths.len();
+                    posted.extend(lengths);
+                    tx.send_replace(update(bytes, posted.len() as u64));
+                    std::future::ready(Ok(count))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                posted,
+                expected.into_iter().map(|n| n * mib).collect::<Vec<_>>()
+            );
+            assert_eq!(result.completed_bytes, piece_length);
+            assert_eq!(result.read_wr_count, posted.len() as u64);
+        }
+    }
+
+    #[tokio::test]
     async fn notification_driver_refills_window_when_completion_precedes_await() {
         let (tx, rx) = tokio::sync::watch::channel(update_progress(0, 0));
         let mut accepted = 0;

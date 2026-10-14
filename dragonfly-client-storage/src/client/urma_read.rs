@@ -198,7 +198,8 @@ impl UrmaReadClient {
                 max_read_size: read_config.max_read_size.as_u64() as u32,
                 max_jfs_sge: read_config.max_jfs_sge,
                 descriptor_version: READ_DESCRIPTOR_VERSION,
-            },
+            }
+            .with_provider_limit(fabric.max_read_size()),
         };
         Self {
             transfer_timeout: urma_config.transfer_timeout,
@@ -287,7 +288,7 @@ impl UrmaReadClient {
             locator,
             piece_length,
             piece_length,
-            read_config.max_read_size.as_u64() as u32,
+            self.capability.read.max_read_size,
             read_config.max_outstanding_per_peer as usize,
             self.transfer_timeout,
         )

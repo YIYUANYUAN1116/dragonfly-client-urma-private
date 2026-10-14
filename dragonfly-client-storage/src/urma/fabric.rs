@@ -42,7 +42,7 @@ const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 /// the process-wide Fabric registry forever.
 const FABRIC_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-type StartupProbe = (u32, u32, u64);
+type StartupProbe = (u32, u32, u64, u32);
 type StartupResult = Result<StartupProbe>;
 
 /// Process-wide weak registry used by dfdaemon's server and downloader adapters. Native UMDK
@@ -150,19 +150,22 @@ impl UrmaFabric {
             })?;
 
         match startup_rx.recv_timeout(FABRIC_STARTUP_TIMEOUT) {
-            Ok(Ok((transport_type, transport_modes, max_message_size))) => Ok(UrmaFabricHandle {
-                inner: Arc::new(FabricInner {
-                    command_tx: Mutex::new(Some(command_tx)),
-                    command_slots,
-                    readiness: readiness_rx,
-                    runtime_config,
-                    transport_type,
-                    transport_modes,
-                    max_message_size,
-                    shutdown: AsyncMutex::new(()),
-                    join: Mutex::new(Some(join)),
-                }),
-            }),
+            Ok(Ok((transport_type, transport_modes, max_message_size, max_read_size))) => {
+                Ok(UrmaFabricHandle {
+                    inner: Arc::new(FabricInner {
+                        command_tx: Mutex::new(Some(command_tx)),
+                        command_slots,
+                        readiness: readiness_rx,
+                        runtime_config,
+                        transport_type,
+                        transport_modes,
+                        max_message_size,
+                        max_read_size,
+                        shutdown: AsyncMutex::new(()),
+                        join: Mutex::new(Some(join)),
+                    }),
+                })
+            }
             Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error)
@@ -217,6 +220,12 @@ impl UrmaFabricHandle {
     /// reported by the device.
     pub fn max_message_size(&self) -> u64 {
         self.inner.max_message_size
+    }
+
+    /// Provider READ payload ceiling copied at startup; no native handle crosses
+    /// threads. Keep this separate from the device's ordinary message limit.
+    pub(crate) fn max_read_size(&self) -> u32 {
+        self.inner.max_read_size
     }
 
     /// is_failed reports whether the owner thread has entered a failed state
@@ -504,6 +513,7 @@ struct FabricInner {
     transport_type: u32,
     transport_modes: u32,
     max_message_size: u64,
+    max_read_size: u32,
     shutdown: AsyncMutex<()>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -660,6 +670,7 @@ fn run_owner(
         runtime.transport_type(),
         runtime.transport_modes(),
         runtime.max_message_size(),
+        runtime.max_read_size(),
     );
     readiness_tx.send_replace(FabricReadiness::Ready);
     if startup_tx.send(Ok(probe)).is_err() {

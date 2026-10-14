@@ -1115,7 +1115,9 @@ pub struct UrmaReadServer {
     #[validate(range(min = 1, max = 1024))]
     pub max_outstanding_per_peer: u32,
 
-    /// Largest single READ WR payload advertised to peers.
+    /// Software ceiling for a single READ WR. Defaults to the wire length limit,
+    /// so a Piece uses one WR when both providers support it. Advertised limits
+    /// also respect the local provider; larger Pieces are split as needed.
     #[serde(with = "bytesize_serde", default = "default_urma_read_max_read_size")]
     pub max_read_size: ByteSize,
 
@@ -1179,7 +1181,7 @@ fn default_urma_read_max_outstanding_per_peer() -> u32 {
 }
 
 fn default_urma_read_max_read_size() -> ByteSize {
-    ByteSize::mib(1)
+    ByteSize::b(u64::from(u32::MAX))
 }
 
 fn default_urma_read_max_concurrent_storage_writes() -> u32 {
@@ -1210,9 +1212,9 @@ fn validate_urma_read_server(read: &UrmaReadServer) -> std::result::Result<(), V
             "urma read per-peer byte budgets must not exceed their pool budgets",
         ));
     }
-    if read.max_read_size.as_u64() == 0 {
+    if read.max_read_size.as_u64() == 0 || read.max_read_size.as_u64() > u64::from(u32::MAX) {
         return Err(ValidationError::new(
-            "urma read maxReadSize must be non-zero",
+            "urma read maxReadSize must be non-zero and fit u32",
         ));
     }
     Ok(())
@@ -2830,8 +2832,21 @@ mod urma_config_tests {
             assert_eq!(read.per_peer_source_bytes, ByteSize::gib(8));
             assert_eq!(read.per_peer_destination_bytes, ByteSize::gib(8));
             assert_eq!(read.quarantine_bytes, ByteSize::gib(1));
+            assert_eq!(read.max_read_size, ByteSize::b(u64::from(u32::MAX)));
             assert_eq!(read.max_concurrent_storage_writes, 1024);
             read.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn read_wr_limit_preserves_explicit_caps_and_rejects_unrepresentable_values() {
+        let read: UrmaReadServer = serde_yaml::from_str("maxReadSize: 16MiB").unwrap();
+        assert_eq!(read.max_read_size, ByteSize::mib(16));
+        read.validate().unwrap();
+        for value in ["0B", "4GiB"] {
+            let read: UrmaReadServer =
+                serde_yaml::from_str(&format!("maxReadSize: {value}")).unwrap();
+            assert!(read.validate().is_err());
         }
     }
 

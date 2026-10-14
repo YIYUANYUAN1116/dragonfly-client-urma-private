@@ -100,6 +100,13 @@ pub(crate) struct ReadCapability {
 }
 
 impl ReadCapability {
+    /// Clamp the configured software ceiling before handshake negotiation, so
+    /// the READ driver sees provider limits rather than discovering them at post.
+    pub(crate) fn with_provider_limit(mut self, max_read_size: u32) -> Self {
+        self.max_read_size = self.max_read_size.min(max_read_size);
+        self
+    }
+
     pub(crate) fn compatible(&self, remote: &Self) -> Result<()> {
         if self.max_read_size == 0 || remote.max_read_size == 0 {
             return Err(protocol("READ capability has zero max_read_size"));
