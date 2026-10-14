@@ -248,9 +248,9 @@ impl UrmaReadClient {
         let identity = ReadTransferIdentity {
             session_generation: lane.session_generation,
             transfer_id,
-            // The metadata generation has no dedicated state machine yet; it
-            // rides the identity like the wire tests allocate it.
-            metadata_generation: u64::from(transfer_id) + 100,
+            // No independent metadata version is tracked yet; this field follows
+            // the transfer ID and does not validate Storage metadata freshness.
+            metadata_generation: u64::from(transfer_id),
         };
         let control = lane.control.register(identity).map_err(|error| {
             ClientError::Unknown(format!("urma READ lane register failed: {error}"))
