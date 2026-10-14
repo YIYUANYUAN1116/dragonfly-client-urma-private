@@ -1059,7 +1059,7 @@ pub struct UrmaServer {
 }
 
 /// Byte budgets for the READ-only data plane. Each capacity derives its entry
-/// count from the 64KiB registered slot size.
+/// count from a 64KiB accounting unit, independent of the actual Piece size.
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[validate(schema(function = "validate_urma_read_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
@@ -1151,27 +1151,27 @@ impl Default for UrmaReadServer {
 }
 
 fn default_urma_read_total_bytes() -> ByteSize {
-    ByteSize::mib(16)
+    ByteSize::gib(32)
 }
 
 fn default_urma_read_source_bytes() -> ByteSize {
-    ByteSize::mib(8)
+    ByteSize::gib(16)
 }
 
 fn default_urma_read_destination_bytes() -> ByteSize {
-    ByteSize::mib(8)
+    ByteSize::gib(16)
 }
 
 fn default_urma_read_per_peer_source_bytes() -> ByteSize {
-    ByteSize::mib(4)
+    ByteSize::gib(8)
 }
 
 fn default_urma_read_per_peer_destination_bytes() -> ByteSize {
-    ByteSize::mib(4)
+    ByteSize::gib(8)
 }
 
 fn default_urma_read_quarantine_bytes() -> ByteSize {
-    ByteSize::mib(2)
+    ByteSize::gib(1)
 }
 
 fn default_urma_read_max_outstanding_per_peer() -> u32 {
@@ -2818,9 +2818,21 @@ mod urma_config_tests {
         assert_eq!(urma.max_concurrent_transfers, 64);
         assert!(urma.read.is_none());
         assert_eq!(urma.transfer_timeout, Duration::from_secs(30));
-        let read = UrmaReadServer::default();
-        assert!(!read.provider_revocation_validated);
-        assert_eq!(read.max_concurrent_storage_writes, 1024);
+        for read in [
+            UrmaReadServer::default(),
+            serde_yaml::from_str::<UrmaReadServer>("{}").unwrap(),
+        ] {
+            assert!(!read.provider_revocation_validated);
+            assert_eq!(read.source_workers, 0);
+            assert_eq!(read.total_bytes, ByteSize::gib(32));
+            assert_eq!(read.source_bytes, ByteSize::gib(16));
+            assert_eq!(read.destination_bytes, ByteSize::gib(16));
+            assert_eq!(read.per_peer_source_bytes, ByteSize::gib(8));
+            assert_eq!(read.per_peer_destination_bytes, ByteSize::gib(8));
+            assert_eq!(read.quarantine_bytes, ByteSize::gib(1));
+            assert_eq!(read.max_concurrent_storage_writes, 1024);
+            read.validate().unwrap();
+        }
     }
 
     #[test]
