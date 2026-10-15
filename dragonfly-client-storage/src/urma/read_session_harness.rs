@@ -68,6 +68,7 @@ fn read_budget() -> ReadRuntimeConfig {
             quarantine: cap(1024 * 1024, 2),
         },
         max_outstanding_per_peer: MAX_OUTSTANDING,
+        max_outstanding_per_piece: MAX_OUTSTANDING,
         buffer_alignment: 4096,
     }
 }

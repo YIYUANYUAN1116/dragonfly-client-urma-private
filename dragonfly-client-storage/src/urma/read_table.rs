@@ -21,7 +21,7 @@ use super::{
         UnregisterPermit,
     },
 };
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use tokio::sync::watch;
 
 #[derive(Clone, Copy)]
@@ -106,6 +106,8 @@ pub(crate) enum ChildAdmission {
 pub(crate) struct ReadOwners<K, R: ChildResources> {
     registry: ReadOwnerRegistry<ReadBundle<K, R>>,
     routes: BTreeMap<u64, ReadRoute>,
+    // Only IDs are queued; resources and WR permits stay with their owners.
+    blocked_children: BTreeSet<ReadOwnerId>,
     // Channels own snapshots only, never native resources or budget. A dropped
     // receiver cannot cancel DMA or release an owner.
     progress_watchers: BTreeMap<ReadOwnerId, watch::Sender<ReadChildUpdate>>,
@@ -115,6 +117,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         Ok(Self {
             registry: ReadOwnerRegistry::new(budget)?,
             routes: BTreeMap::new(),
+            blocked_children: BTreeSet::new(),
             progress_watchers: BTreeMap::new(),
         })
     }
@@ -139,6 +142,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     }
     pub(crate) fn drain_peer(&mut self, peer: ReadPeer) -> Result<(), OwnerError> {
         self.registry.drain_peer(peer)?;
+        self.blocked_children.retain(|id| id.peer() != peer);
         for (id, tx) in &self.progress_watchers {
             if id.peer() == peer {
                 tx.send_modify(|update| {
@@ -151,11 +155,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     }
     pub(crate) fn retire(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
         self.registry.retire(id)?;
+        self.blocked_children.remove(&id);
         self.notify_child(id, true);
         Ok(())
     }
 
     pub(crate) fn interrupt_waiters(&mut self) {
+        self.blocked_children.clear();
         for tx in self.progress_watchers.values() {
             tx.send_modify(|update| {
                 update.interrupted = true;
@@ -200,6 +206,15 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             notified_at: std::time::Instant::now(),
             interrupted: already_interrupted || interrupted,
         });
+    }
+
+    fn wake_credit_waiters(&mut self) {
+        // Any retired WR can free the process-wide JFS capacity, including a WR
+        // from another peer. Watch snapshots retain wakeups until async drivers
+        // observe them; exhausted drivers register again without busy polling.
+        for id in std::mem::take(&mut self.blocked_children) {
+            self.notify_child(id, false);
+        }
     }
 
     pub(crate) fn record_post_command_wait(
@@ -370,7 +385,15 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             ChildAdmission::Ready(id)
         }
     }
+    #[cfg(test)]
     pub(crate) fn post(&mut self, id: ReadOwnerId, length: u32) -> Result<u64, ReadDispatchError> {
+        self.try_post(id, length)?
+            .ok_or_else(|| FfiError::Contract("READ post temporarily blocked").into())
+    }
+
+    fn try_post(&mut self, id: ReadOwnerId, length: u32) -> Result<Option<u64>, ReadDispatchError> {
+        self.blocked_children.remove(&id);
+
         let outcome = self
             .registry
             .active_owner(id)?
@@ -378,6 +401,10 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .post_routed(length);
         let (context, error) = match outcome {
             ChildPostOutcome::Posted(context) => (Some(context), None),
+            ChildPostOutcome::Blocked => {
+                self.blocked_children.insert(id);
+                return Ok(None);
+            }
             ChildPostOutcome::Uncertain { context, error } => (Some(context), Some(error)),
             ChildPostOutcome::Rejected(error) => (None, Some(error)),
         };
@@ -405,12 +432,13 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.notify_child(id, true);
             return Err(error.into());
         }
-        Ok(context.expect("successful READ post has a context"))
+        Ok(Some(context.expect("successful READ post has a context")))
     }
 
     /// Posts one scheduling batch without returning to the async facade between
-    /// WRs. If a later post fails, earlier contexts remain routed and the owner
-    /// is quarantined by post(); the existing cleanup path drains them.
+    /// WRs. Capacity exhaustion returns the posted prefix (possibly zero) and
+    /// waits for another owner's CQE; it does not quarantine. Native failures
+    /// still retain earlier contexts and use the existing cleanup path.
     pub(crate) fn post_batch(
         &mut self,
         id: ReadOwnerId,
@@ -421,10 +449,16 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         }
         let mut posted = 0usize;
         for &length in lengths {
-            self.post(id, length)?;
+            if self.try_post(id, length)?.is_none() {
+                break;
+            }
             posted += 1;
         }
-        self.notify_child(id, false);
+        // Do not notify on a zero post: the driver must sleep until capacity is
+        // returned or its lifecycle is interrupted, rather than retrying itself.
+        if posted != 0 {
+            self.notify_child(id, false);
+        }
         Ok(posted)
     }
 
@@ -504,6 +538,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.routes.remove(&context);
         }
         self.notify_child(id, result.is_err());
+        if result.is_ok() {
+            self.wake_credit_waiters();
+        }
         result.map_err(Into::into)
     }
     pub(crate) fn reap_child(&mut self, id: ReadOwnerId) -> Result<bool, ReapError<FfiError>> {
@@ -511,6 +548,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .registry
             .reap_with(id, |bundle| bundle.child_mut()?.reap());
         if matches!(result, Ok(true)) {
+            self.blocked_children.remove(&id);
             self.progress_watchers.remove(&id);
         }
         result
@@ -559,6 +597,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             .registry
             .reap_with(id, |bundle| bundle.child_mut()?.recycle_lease());
         if matches!(result, Ok(true)) {
+            self.blocked_children.remove(&id);
             self.progress_watchers.remove(&id);
         }
         result
@@ -633,6 +672,205 @@ mod tests {
         jetty_id: 7,
         max_outstanding: 2,
     };
+    type CreditedOwners = ReadOwners<(), super::super::wr_admission::CreditedChild<Mock>>;
+    type SharedCredits = Rc<std::cell::RefCell<super::super::wr_admission::ReadWrCredits>>;
+
+    fn credited_setup(capacity: usize, per_peer: usize) -> (CreditedOwners, SharedCredits) {
+        let cap = |bytes, entries| ReadCapacity { bytes, entries };
+        let mut owners = ReadOwners::new(ReadBudget {
+            total: cap(512, 128),
+            source: cap(256, 64),
+            destination: cap(256, 64),
+            per_peer_source: cap(256, 64),
+            per_peer_destination: cap(256, 64),
+            quarantine: cap(256, 64),
+        })
+        .unwrap();
+        owners.activate_peer(PEER).unwrap();
+        let credits = super::super::wr_admission::ReadWrCredits::new(capacity, per_peer).unwrap();
+        (owners, credits)
+    }
+
+    fn credited_child(
+        owners: &mut CreditedOwners,
+        credits: &SharedCredits,
+        peer: ReadPeer,
+    ) -> ReadOwnerId {
+        // SAFETY: Mock resources have no native backing, and create_child owns admission.
+        match unsafe {
+            owners.create_child(
+                peer,
+                ChildSpec {
+                    allocation_bytes: 4,
+                    ..SPEC
+                },
+                || {
+                    ChildCreation::Ready(super::super::wr_admission::CreditedChild::new(
+                        Mock {
+                            closes: Rc::new(Cell::new(0)),
+                        },
+                        credits.clone(),
+                        peer,
+                    ))
+                },
+            )
+        } {
+            ChildAdmission::Ready(id) => id,
+            _ => panic!("mock admission"),
+        }
+    }
+
+    fn complete_credited(owners: &mut CreditedOwners, id: ReadOwnerId) {
+        let context = *owners
+            .routes
+            .iter()
+            .find(|(_, route)| route.owner == id)
+            .unwrap()
+            .0;
+        // SAFETY: Test-owned mock WR has no DMA and exactly matches its route.
+        owners
+            .complete(id, unsafe {
+                ReadRetired::new(id, SPEC.jetty_id, context, 4, true)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn sixteen_pieces_wait_on_eight_shared_credits_without_quarantine() {
+        let (mut owners, credits) = credited_setup(8, 8);
+        let ids = (0..16)
+            .map(|_| credited_child(&mut owners, &credits, PEER))
+            .collect::<Vec<_>>();
+        let mut waiting = Vec::new();
+        for (index, &id) in ids.iter().enumerate() {
+            let mut rx = owners.subscribe_child_progress(id).unwrap();
+            assert_eq!(owners.post_batch(id, &[4]).unwrap(), usize::from(index < 8));
+            if index >= 8 {
+                rx.borrow_and_update();
+                assert_eq!(owners.post_batch(id, &[4]).unwrap(), 0);
+                assert!(
+                    !rx.has_changed().unwrap(),
+                    "zero posts must not wake themselves"
+                );
+                assert!(!rx.borrow().progress.failed);
+                assert!(!rx.borrow().interrupted);
+                waiting.push(rx);
+            }
+        }
+        assert_eq!(credits.borrow().used(), 8);
+        assert_eq!(owners.usage().quarantined_entries, 0);
+        for &id in &ids[..8] {
+            complete_credited(&mut owners, id);
+        }
+        for (rx, &id) in waiting.iter_mut().zip(&ids[8..]) {
+            assert!(
+                rx.has_changed().unwrap(),
+                "another Piece's CQE must wake a zero-WR waiter"
+            );
+            assert_eq!(owners.post_batch(id, &[4]).unwrap(), 1);
+        }
+        for &id in &ids[8..] {
+            complete_credited(&mut owners, id);
+        }
+        assert_eq!(credits.borrow().used(), 0);
+        for id in ids {
+            assert!(owners.child_progress(id).unwrap().read_succeeded);
+            owners.retire(id).unwrap();
+            assert_eq!(owners.reap_child(id), Ok(true));
+        }
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn global_credit_return_wakes_a_different_peer() {
+        let (mut owners, credits) = credited_setup(1, 1);
+        let other = ReadPeer {
+            id: 2,
+            generation: 1,
+        };
+        owners.activate_peer(other).unwrap();
+        let first = credited_child(&mut owners, &credits, PEER);
+        let second = credited_child(&mut owners, &credits, other);
+        let mut rx = owners.subscribe_child_progress(second).unwrap();
+        assert_eq!(owners.post_batch(first, &[4]).unwrap(), 1);
+        assert_eq!(owners.post_batch(second, &[4]).unwrap(), 0);
+        rx.borrow_and_update();
+        complete_credited(&mut owners, first);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(owners.post_batch(second, &[4]).unwrap(), 1);
+        complete_credited(&mut owners, second);
+        for id in [first, second] {
+            owners.retire(id).unwrap();
+            assert_eq!(owners.reap_child(id), Ok(true));
+        }
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn blocked_waiters_are_interrupted_and_removed_on_retire_drain_and_shutdown() {
+        for mode in 0..3 {
+            let (mut owners, credits) = credited_setup(1, 1);
+            let active = credited_child(&mut owners, &credits, PEER);
+            let waiting = credited_child(&mut owners, &credits, PEER);
+            let mut rx = owners.subscribe_child_progress(waiting).unwrap();
+            assert_eq!(owners.post_batch(active, &[4]).unwrap(), 1);
+            assert_eq!(owners.post_batch(waiting, &[4]).unwrap(), 0);
+            rx.borrow_and_update();
+            match mode {
+                0 => owners.retire(waiting).unwrap(),
+                1 => owners.drain_peer(PEER).unwrap(),
+                _ => owners.begin_shutdown(),
+            }
+            assert!(owners.blocked_children.is_empty());
+            assert!(rx.has_changed().unwrap());
+            assert!(rx.borrow().interrupted);
+            assert_eq!(owners.reap_child(waiting), Ok(true));
+            complete_credited(&mut owners, active);
+            assert!(!owners.contains(waiting));
+            owners.retire(active).unwrap();
+            assert_eq!(owners.reap_child(active), Ok(true));
+            assert_eq!(credits.borrow().used(), 0);
+            assert!(owners.drained());
+        }
+    }
+
+    #[test]
+    fn partial_batch_keeps_prefix_routed_and_waits_for_capacity() {
+        let (mut owners, credits) = credited_setup(1, 1);
+        // SAFETY: Mock-only resource owner; no native DMA exists.
+        let id = match unsafe {
+            owners.create_child(
+                PEER,
+                ChildSpec {
+                    allocation_bytes: 8,
+                    piece_length: 8,
+                    ..SPEC
+                },
+                || {
+                    ChildCreation::Ready(super::super::wr_admission::CreditedChild::new(
+                        Mock {
+                            closes: Rc::new(Cell::new(0)),
+                        },
+                        credits.clone(),
+                        PEER,
+                    ))
+                },
+            )
+        } {
+            ChildAdmission::Ready(id) => id,
+            _ => panic!("mock admission"),
+        };
+        assert_eq!(owners.post_batch(id, &[4, 4]).unwrap(), 1);
+        assert_eq!(owners.outstanding_completions(), 1);
+        assert_eq!(owners.usage().quarantined_entries, 0);
+        complete_credited(&mut owners, id);
+        assert_eq!(owners.post_batch(id, &[4]).unwrap(), 1);
+        complete_credited(&mut owners, id);
+        assert!(owners.child_progress(id).unwrap().read_succeeded);
+        owners.retire(id).unwrap();
+        assert_eq!(owners.reap_child(id), Ok(true));
+    }
+
     #[test]
     fn successful_worker_result_after_shutdown_never_reopens_publication() {
         let mut owners = setup();

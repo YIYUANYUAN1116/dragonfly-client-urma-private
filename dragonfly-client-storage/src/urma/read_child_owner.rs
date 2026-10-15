@@ -69,12 +69,15 @@ impl ReadRetired {
 
 pub(crate) enum ChildPost<W> {
     Posted(W),
+    /// No native post occurred; retry after capacity becomes available.
+    Blocked,
     Rejected(FfiError),
     Uncertain(W, FfiError),
 }
 
 pub(crate) enum ChildPostOutcome {
     Posted(u64),
+    Blocked,
     /// The provider may have accepted the WR. The context must be routed even
     /// though the operation is quarantined and no further READ may be posted.
     Uncertain {
@@ -137,6 +140,10 @@ pub(crate) trait ChildResources {
     /// The extracted registered destination buffer, owned outside the bundle
     /// between publish and recycle.
     type Lease;
+    /// Local capacity only; all checks and posts run on the same owner thread.
+    fn post_capacity_available(&self) -> bool {
+        true
+    }
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError>;
     fn post_timing(_wr: &Self::Wr) -> Option<ReadPostTiming> {
         None
@@ -496,6 +503,7 @@ impl<R: ChildResources> ChildOwner<R> {
     pub(crate) fn post(&mut self, length: u32) -> Result<u64, FfiError> {
         match self.post_routed(length) {
             ChildPostOutcome::Posted(context) => Ok(context),
+            ChildPostOutcome::Blocked => Err(FfiError::Contract("READ post temporarily blocked")),
             ChildPostOutcome::Uncertain { error, .. } | ChildPostOutcome::Rejected(error) => {
                 Err(error)
             }
@@ -507,9 +515,13 @@ impl<R: ChildResources> ChildOwner<R> {
             || !self.imported
             || length == 0
             || u64::from(length) > self.piece_length - self.posted_bytes
-            || self.pending.len() >= self.max_outstanding
         {
             return ChildPostOutcome::Rejected(FfiError::Contract("READ post admission rejected"));
+        }
+        if self.pending.len() >= self.max_outstanding || !self.resources.post_capacity_available() {
+            // Do not spend a WR identity on a known-capacity wait. CQE routing
+            // contexts are allocated only once a local post can proceed.
+            return ChildPostOutcome::Blocked;
         }
         let sequence =
             match NEXT_READ_CONTEXT
@@ -529,6 +541,7 @@ impl<R: ChildResources> ChildOwner<R> {
         };
         let (wr, error) = match self.resources.post(&request) {
             Ok(ChildPost::Posted(wr)) => (wr, None),
+            Ok(ChildPost::Blocked) => return ChildPostOutcome::Blocked,
             Ok(ChildPost::Uncertain(wr, error)) => (wr, Some(error)),
             Ok(ChildPost::Rejected(error)) => {
                 self.failed = true;

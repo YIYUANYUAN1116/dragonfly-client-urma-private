@@ -15,12 +15,12 @@ pub(crate) struct ReadWrCredits {
 }
 impl ReadWrCredits {
     pub(crate) fn new(capacity: usize, per_peer: usize) -> Result<Rc<RefCell<Self>>, FfiError> {
-        if capacity == 0 || per_peer == 0 || per_peer > capacity {
+        if capacity == 0 || per_peer == 0 {
             return Err(FfiError::Contract("invalid READ WR credits"));
         }
         Ok(Rc::new(RefCell::new(Self {
             capacity,
-            per_peer,
+            per_peer: per_peer.min(capacity),
             used: 0,
             peers: BTreeMap::new(),
         })))
@@ -29,15 +29,15 @@ impl ReadWrCredits {
     pub(crate) fn used(&self) -> usize {
         self.used
     }
-    fn acquire(shared: &Rc<RefCell<Self>>, peer: ReadPeer) -> Result<WrPermit, FfiError> {
+    fn acquire(shared: &Rc<RefCell<Self>>, peer: ReadPeer) -> Option<WrPermit> {
         let mut state = shared.borrow_mut();
         let used = state.peers.get(&peer).copied().unwrap_or(0);
         if state.used >= state.capacity || used >= state.per_peer {
-            return Err(FfiError::Contract("READ WR credits exhausted"));
+            return None;
         }
         state.used += 1;
         state.peers.insert(peer, used + 1);
-        Ok(WrPermit {
+        Some(WrPermit {
             shared: shared.clone(),
             peer,
         })
@@ -81,13 +81,19 @@ impl<R> CreditedChild<R> {
 impl<R: ChildResources> ChildResources for CreditedChild<R> {
     type Wr = CreditedWr<R::Wr>;
     type Lease = R::Lease;
+    fn post_capacity_available(&self) -> bool {
+        let credits = self.credits.borrow();
+        credits.used < credits.capacity
+            && credits.peers.get(&self.peer).copied().unwrap_or(0) < credits.per_peer
+            && self.resources.post_capacity_available()
+    }
     fn post_timing(wr: &Self::Wr) -> Option<super::ffi::read::ReadPostTiming> {
         R::post_timing(&wr.wr)
     }
     fn post(&mut self, request: &ReadRequest) -> Result<ChildPost<Self::Wr>, FfiError> {
         let permit = match ReadWrCredits::acquire(&self.credits, self.peer) {
-            Ok(permit) => permit,
-            Err(error) => return Ok(ChildPost::Rejected(error)),
+            Some(permit) => permit,
+            None => return Ok(ChildPost::Blocked),
         };
         match self.resources.post(request) {
             Ok(ChildPost::Posted(wr)) => Ok(ChildPost::Posted(CreditedWr {
@@ -104,6 +110,10 @@ impl<R: ChildResources> ChildResources for CreditedChild<R> {
             Ok(ChildPost::Rejected(error)) => {
                 drop(permit);
                 Ok(ChildPost::Rejected(error))
+            }
+            Ok(ChildPost::Blocked) => {
+                drop(permit);
+                Ok(ChildPost::Blocked)
             }
             Err(error) => {
                 std::mem::forget(permit);
@@ -191,7 +201,7 @@ mod tests {
         let ChildPost::Posted(first) = a.post(&request()).unwrap() else {
             panic!()
         };
-        assert!(matches!(a.post(&request()), Ok(ChildPost::Rejected(_))));
+        assert!(matches!(a.post(&request()), Ok(ChildPost::Blocked)));
         let ChildPost::Posted(second) = b.post(&request()).unwrap() else {
             panic!()
         };
@@ -203,6 +213,40 @@ mod tests {
         assert_eq!(credits.borrow().used(), 0);
         assert!(credits.borrow().peers.is_empty());
     }
+    #[test]
+    fn peer_capacity_above_jfs_depth_is_clamped_and_waits_for_retirement() {
+        let credits = ReadWrCredits::new(2, 64).unwrap();
+        assert_eq!(credits.borrow().per_peer, 2);
+        let mut child = CreditedChild::new(
+            Mock(0),
+            credits.clone(),
+            ReadPeer {
+                id: 1,
+                generation: 1,
+            },
+        );
+        let ChildPost::Posted(first) = child.post(&request()).unwrap() else {
+            panic!()
+        };
+        let ChildPost::Posted(second) = child.post(&request()).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(child.post(&request()), Ok(ChildPost::Blocked)));
+        assert_eq!(credits.borrow().used(), 2);
+        // SAFETY: Mock completion has no native DMA and owns this exact permit.
+        unsafe { child.complete(first) };
+        let ChildPost::Posted(third) = child.post(&request()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(credits.borrow().used(), 2);
+        // SAFETY: Both remaining mock WRs have independently retired here.
+        unsafe {
+            child.complete(second);
+            child.complete(third);
+        }
+        assert_eq!(credits.borrow().used(), 0);
+    }
+
     #[test]
     fn rejection_returns_credit_uncertainty_keeps_it() {
         let credits = ReadWrCredits::new(1, 1).unwrap();
@@ -237,6 +281,6 @@ mod tests {
         );
         assert!(child.post(&request()).is_err());
         assert_eq!(credits.borrow().used(), 1);
-        assert!(matches!(child.post(&request()), Ok(ChildPost::Rejected(_))));
+        assert!(matches!(child.post(&request()), Ok(ChildPost::Blocked)));
     }
 }

@@ -95,9 +95,11 @@ impl ReadRuntimeConfig {
                 "sourceWorkers exceeds 16".into(),
             ));
         }
-        if read.max_outstanding_per_peer == 0 {
+        if !(1..=1024).contains(&read.max_outstanding_per_peer)
+            || !(1..=1024).contains(&read.max_outstanding_per_piece)
+        {
             return Err(Error::InvalidConfiguration(
-                "urma read maxOutstandingPerPeer must be positive".into(),
+                "urma read outstanding limits must be in 1..=1024".into(),
             ));
         }
         Ok(Self {
@@ -116,6 +118,7 @@ impl ReadRuntimeConfig {
                 quarantine: capacity("quarantineBytes", read.quarantine_bytes.as_u64())?,
             },
             max_outstanding_per_peer: read.max_outstanding_per_peer as usize,
+            max_outstanding_per_piece: read.max_outstanding_per_piece as usize,
             buffer_alignment: 4096,
             source_workers: read.source_workers as usize,
         })
@@ -127,6 +130,7 @@ pub(crate) struct ReadRuntimeConfig {
     pub(crate) source_workers: usize,
     pub(crate) budget: ReadBudget,
     pub(crate) max_outstanding_per_peer: usize,
+    pub(crate) max_outstanding_per_piece: usize,
     pub(crate) buffer_alignment: u64,
 }
 
@@ -330,7 +334,7 @@ mod native {
     struct RuntimeReadState {
         owners: RuntimeReadOwners,
         credits: Rc<std::cell::RefCell<ReadWrCredits>>,
-        max_outstanding_per_peer: usize,
+        max_outstanding_per_piece: usize,
         buffer_alignment: u64,
         // Retains idle, still-registered destination buffers for reuse. Pool
         // eviction combines this charge with active owner bytes so their
@@ -519,7 +523,7 @@ mod native {
                 RuntimeReadState {
                     owners,
                     credits,
-                    max_outstanding_per_peer: read.max_outstanding_per_peer,
+                    max_outstanding_per_piece: read.max_outstanding_per_piece,
                     buffer_alignment: read.buffer_alignment,
                     destination_pool: Rc::new(std::cell::RefCell::new(ReadBufferPool::new(
                         read.budget.destination.bytes,
@@ -657,17 +661,17 @@ mod native {
             let RuntimeReadState {
                 owners,
                 credits,
-                max_outstanding_per_peer,
+                max_outstanding_per_piece,
                 buffer_alignment,
                 destination_pool,
             } = &mut self.read;
             let credits = credits.clone();
-            let configured_max = *max_outstanding_per_peer;
+            let configured_max = *max_outstanding_per_piece;
             let alignment = *buffer_alignment;
             let destination_pool = destination_pool.clone();
             if request.max_outstanding > configured_max {
                 return Err(Error::InvalidConfiguration(format!(
-                    "READ Child max_outstanding={} exceeds per-peer limit {configured_max}",
+                    "READ Child max_outstanding={} exceeds per-Piece limit {configured_max}",
                     request.max_outstanding
                 )));
             }
@@ -1527,7 +1531,10 @@ mod native {
         }
     }
 
-    fn validate_config(config: &RuntimeConfig, capability: &UrmaDeviceCapability) -> Result<()> {
+    pub(super) fn validate_config(
+        config: &RuntimeConfig,
+        capability: &UrmaDeviceCapability,
+    ) -> Result<()> {
         if capability.max_jfc < 2 {
             return Err(Error::InvalidConfiguration(
                 "device reports fewer than two available JFC resources".into(),
@@ -1556,12 +1563,9 @@ mod native {
                     "device does not advertise URMA READ capability".into(),
                 ));
             }
-            if read.max_outstanding_per_peer == 0
-                || read.max_outstanding_per_peer
-                    > config.send_jfc_depth.min(capability.max_jfs_depth) as usize
-            {
+            if read.max_outstanding_per_peer == 0 || read.max_outstanding_per_piece == 0 {
                 return Err(Error::InvalidConfiguration(
-                    "READ per-peer outstanding limit exceeds effective JFS depth".into(),
+                    "READ outstanding limits must be positive".into(),
                 ));
             }
             if read.buffer_alignment < 4096 || !read.buffer_alignment.is_power_of_two() {
@@ -1744,6 +1748,23 @@ mod tests {
         .with_tp_type(crate::urma::TpType::Ctp);
         let endpoint = shared_endpoint_config(&runtime, &capability_for_depths(8, 8));
         assert_eq!(endpoint.tp_type, crate::urma::TpType::Ctp);
+    }
+
+    #[test]
+    fn configured_peer_capacity_above_device_depth_uses_backpressure_instead_of_failing_startup() {
+        let read = ReadRuntimeConfig::try_from_config(
+            &dragonfly_client_config::dfdaemon::UrmaReadServer::default(),
+        )
+        .unwrap();
+        assert_eq!(read.max_outstanding_per_peer, 64);
+        assert_eq!(read.max_outstanding_per_piece, 8);
+        let mut config = RuntimeConfig::new("urma0", 0, read);
+        config.send_jfc_depth = 4;
+        config.recv_jfc_depth = 4;
+        let mut capability = capability_for_depths(4, 4);
+        capability.max_read_size = 64 * 1024 * 1024;
+        native::validate_config(&config, &capability).unwrap();
+        assert_eq!(shared_endpoint_config(&config, &capability).send_depth, 4);
     }
 
     #[test]

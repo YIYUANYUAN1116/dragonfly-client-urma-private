@@ -1110,10 +1110,16 @@ pub struct UrmaReadServer {
     )]
     pub quarantine_bytes: ByteSize,
 
-    /// READ WRs one peer may keep outstanding on one Piece transfer.
+    /// Outstanding READ WR credits shared by all Pieces of one peer/lane.
+    /// The effective capacity is capped by the local JFS depth.
     #[serde(default = "default_urma_read_max_outstanding_per_peer")]
     #[validate(range(min = 1, max = 1024))]
     pub max_outstanding_per_peer: u32,
+
+    /// READ WR window for one Piece, independent of the shared peer credits.
+    #[serde(default = "default_urma_read_max_outstanding_per_piece")]
+    #[validate(range(min = 1, max = 1024))]
+    pub max_outstanding_per_piece: u32,
 
     /// Software ceiling for a single READ WR. Defaults to the wire length limit,
     /// so a Piece uses one WR when both providers support it. Advertised limits
@@ -1145,6 +1151,7 @@ impl Default for UrmaReadServer {
             per_peer_destination_bytes: default_urma_read_per_peer_destination_bytes(),
             quarantine_bytes: default_urma_read_quarantine_bytes(),
             max_outstanding_per_peer: default_urma_read_max_outstanding_per_peer(),
+            max_outstanding_per_piece: default_urma_read_max_outstanding_per_piece(),
             max_read_size: default_urma_read_max_read_size(),
             max_concurrent_storage_writes: default_urma_read_max_concurrent_storage_writes(),
             max_jfs_sge: default_urma_read_max_jfs_sge(),
@@ -1177,6 +1184,10 @@ fn default_urma_read_quarantine_bytes() -> ByteSize {
 }
 
 fn default_urma_read_max_outstanding_per_peer() -> u32 {
+    64
+}
+
+fn default_urma_read_max_outstanding_per_piece() -> u32 {
     8
 }
 
@@ -2833,6 +2844,8 @@ mod urma_config_tests {
             assert_eq!(read.per_peer_destination_bytes, ByteSize::gib(8));
             assert_eq!(read.quarantine_bytes, ByteSize::gib(1));
             assert_eq!(read.max_read_size, ByteSize::b(u64::from(u32::MAX)));
+            assert_eq!(read.max_outstanding_per_peer, 64);
+            assert_eq!(read.max_outstanding_per_piece, 8);
             assert_eq!(read.max_concurrent_storage_writes, 1024);
             read.validate().unwrap();
         }
@@ -2847,6 +2860,22 @@ mod urma_config_tests {
             let read: UrmaReadServer =
                 serde_yaml::from_str(&format!("maxReadSize: {value}")).unwrap();
             assert!(read.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn read_peer_credits_and_piece_window_are_independent() {
+        let read: UrmaReadServer =
+            serde_yaml::from_str("maxOutstandingPerPeer: 2\nmaxOutstandingPerPiece: 8").unwrap();
+        read.validate().unwrap();
+        assert_eq!(read.max_outstanding_per_peer, 2);
+        assert_eq!(read.max_outstanding_per_piece, 8);
+        for field in ["maxOutstandingPerPeer", "maxOutstandingPerPiece"] {
+            for value in [0, 1025] {
+                let read: UrmaReadServer =
+                    serde_yaml::from_str(&format!("{field}: {value}")).unwrap();
+                assert!(read.validate().is_err());
+            }
         }
     }
 

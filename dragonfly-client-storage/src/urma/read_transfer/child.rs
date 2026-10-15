@@ -679,14 +679,19 @@ where
                 .map_err(|_| protocol("Child READ completion deadline expired"))??;
             post_command_ns =
                 post_command_ns.saturating_add(post_start.elapsed().as_nanos() as u64);
-            if posted != batch_length {
+            if posted > batch_length {
                 return Err(protocol("inconsistent READ post batch result"));
             }
-            read_post_batch_count += 1;
+            // A shared peer/JFS credit limit may admit only a prefix or none.
+            // Retry from accepted_bytes after the owner's next notification.
+            if posted != 0 {
+                read_post_batch_count += 1;
+            }
         }
         // The owner publishes accepted progress before replying to post. changed()
         // sees that update even if it was sent before this await, then later sees
-        // CQE progress. No progress command is sent back to the owner.
+        // CQE progress. Zero posts wait for capacity notifications, including
+        // CQEs of other owners sharing credits. No polling query is sent.
         let wait_start = Instant::now();
         timeout_at(deadline, updates.changed())
             .await
@@ -812,6 +817,66 @@ mod tests {
             assert_eq!(result.completed_bytes, piece_length);
             assert_eq!(result.read_wr_count, posted.len() as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn notification_driver_retries_zero_and_partial_posts_from_accepted_progress() {
+        let (tx, rx) = tokio::sync::watch::channel(update_progress(0, 0));
+        let mut calls = 0;
+        let mut accepted = 0;
+        let result = drive_read_notifications(
+            rx,
+            8,
+            2,
+            4,
+            Instant::now() + Duration::from_secs(1),
+            0,
+            |lengths| {
+                calls += 1;
+                if calls == 1 {
+                    assert_eq!(lengths, vec![4, 4]);
+                    // Another owner's CQE frees capacity before this submit
+                    // reply is observed; this Piece still has zero accepted WRs.
+                    tx.send_replace(update_progress(0, 0));
+                    return std::future::ready(Ok(0));
+                }
+                // Admit only a prefix, even though the first retry offers two WRs.
+                assert_eq!(lengths[0], 4);
+                accepted += 4;
+                tx.send_replace(update_progress(accepted, accepted));
+                std::future::ready(Ok(1))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(result.completed_bytes, 8);
+        assert_eq!(result.read_wr_count, 2);
+        assert_eq!(result.read_post_batch_count, 2);
+    }
+
+    #[tokio::test]
+    async fn zero_post_sleeps_without_notifications_and_remains_deadline_bounded() {
+        let (_tx, rx) = tokio::sync::watch::channel(update_progress(0, 0));
+        let mut calls = 0;
+        let result = drive_read_notifications(
+            rx,
+            8,
+            2,
+            4,
+            Instant::now() + Duration::from_millis(50),
+            0,
+            |_| {
+                calls += 1;
+                std::future::ready(Ok(0))
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+        assert_eq!(
+            calls, 1,
+            "exhausted credits must not cause a submit spin loop"
+        );
     }
 
     #[tokio::test]

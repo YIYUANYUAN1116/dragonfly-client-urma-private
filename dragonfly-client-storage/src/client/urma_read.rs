@@ -289,7 +289,7 @@ impl UrmaReadClient {
             piece_length,
             piece_length,
             self.capability.read.max_read_size,
-            read_config.max_outstanding_per_peer as usize,
+            read_config.max_outstanding_per_piece as usize,
             self.transfer_timeout,
         )
         .map_err(|error| ClientError::Unknown(error.to_string()))?
