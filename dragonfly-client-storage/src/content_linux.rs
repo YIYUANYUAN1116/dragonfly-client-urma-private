@@ -73,7 +73,7 @@ impl Drop for RmReadPwriteActivity {
     }
 }
 
-/// Writes every registered RX span at one positional file offset. Linux may
+/// Writes the provided READ spans at one positional file offset. Linux may
 /// complete a pwritev only partially, including in the middle of an iovec, so
 /// keep advancing both the iovec view and the file offset until all bytes have
 /// been accepted.
@@ -83,9 +83,9 @@ fn write_all_vectored_at(
     mut buffers: &mut [IoSlice<'_>],
     mut offset: u64,
 ) -> io::Result<u64> {
-    // Match Linux IOV_MAX and the existing stream write path. A configured
-    // receive window may grow beyond this, in which case it is split across
-    // the minimum number of pwritev calls.
+    // Match Linux IOV_MAX and the existing stream write path. Larger iovec
+    // lists are split across multiple pwritev calls; partial writes and EINTR
+    // retries also contribute to the returned syscall count.
     const MAX_WRITE_IOVECS: usize = 1024;
 
     let mut calls = 0u64;
@@ -630,12 +630,19 @@ impl Content {
         // this future is cancelled, dropping the armed lease deliberately keeps
         // the owner registered, so the worker cannot observe freed memory.
         let (data_addr, data_len) = (data.as_ptr() as usize, data.len());
+        let digest_submitted_at = Instant::now();
         let digest = tokio::task::spawn_blocking(move || {
             let start = Instant::now();
+            let digest_blocking_queue_ns =
+                start.duration_since(digest_submitted_at).as_nanos() as u64;
             let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(data);
-            (hasher, start.elapsed().as_nanos() as u64)
+            (
+                hasher,
+                start.elapsed().as_nanos() as u64,
+                digest_blocking_queue_ns,
+            )
         });
 
         let pwrite_admission_start = Instant::now();
@@ -663,7 +670,9 @@ impl Content {
             let task_id = task_id.to_string();
             let piece_id = piece_id.to_string();
             let storage_clock = storage_total_start;
+            let pwrite_submitted_at = Instant::now();
             tokio::task::spawn_blocking(move || {
+                let pwrite_blocking_queue_ns = pwrite_submitted_at.elapsed().as_nanos() as u64;
                 let _pwrite_permit = pwrite_permit;
                 let (activity, pwrite_active) = RmReadPwriteActivity::start();
                 let data = unsafe { std::slice::from_raw_parts(data_addr as *const u8, data_len) };
@@ -680,26 +689,29 @@ impl Content {
                     piece_id,
                     expected_length = data_len,
                     pwrite_ns,
+                    pwrite_blocking_queue_ns,
                     pwrite_limit,
                     pwrite_active_at_start = pwrite_active,
                     pwrite_active_after,
                     pwrite_succeeded = result.is_ok(),
                     "finished pwrite for RM-READ lease"
                 );
-                result?;
-                Ok::<(u64, u64, u64, u64), std::io::Error>((
+                let pwrite_calls = result?;
+                Ok::<(u64, u64, u64, u64, u64), std::io::Error>((
                     pwrite_ns,
-                    1,
+                    pwrite_calls,
                     pwrite_start_ns,
                     pwrite_end_ns,
+                    pwrite_blocking_queue_ns,
                 ))
             })
         };
         let (write, digest) = tokio::join!(write, digest);
-        let (pwrite_ns, pwrite_calls, pwrite_start_ns, pwrite_end_ns) = write
-            .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
-            .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
-        let (hasher, digest_ns) = digest
+        let (pwrite_ns, pwrite_calls, pwrite_start_ns, pwrite_end_ns, pwrite_blocking_queue_ns) =
+            write
+                .map_err(|error| Error::Unknown(format!("write READ lease panicked: {error}")))?
+                .inspect_err(|error| error!("write {:?} failed: {}", task_path, error))?;
+        let (hasher, digest_ns, digest_blocking_queue_ns) = digest
             .map_err(|error| Error::Unknown(format!("digest READ lease panicked: {error}")))?;
         let writeback_start = Instant::now();
         let writeback_start_ns = writeback_start
@@ -714,12 +726,14 @@ impl Content {
             expected_length = length,
             file_open_ns,
             pwrite_admission_ns,
+            pwrite_blocking_queue_ns,
             pwrite_limit,
             pwrite_ns,
             pwrite_calls,
             pwrite_start_ns,
             pwrite_end_ns,
             digest_ns,
+            digest_blocking_queue_ns,
             writeback_start_ns,
             writeback_ns,
             storage_total_ns = storage_total_start.elapsed().as_nanos() as u64,
