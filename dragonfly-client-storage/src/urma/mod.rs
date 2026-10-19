@@ -18,6 +18,7 @@ pub(crate) mod read_protocol;
 pub(crate) mod read_registry;
 #[cfg(test)]
 mod read_session_harness;
+mod read_source_lease;
 mod read_source_owner;
 mod read_source_workers;
 mod read_table;

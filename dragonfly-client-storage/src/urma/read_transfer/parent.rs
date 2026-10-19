@@ -14,6 +14,7 @@ use crate::urma::{
         ParentAction, ParentReadState, ReadFrame, ReadPieceLocator, ReadSegmentOffer,
         ReadTransferIdentity,
     },
+    read_source_lease::SourceLease,
     runtime::{ReadSourceAdmission, ReadSourceId, ReadSourceOffer, ReadSourceRequest},
     Error, Result,
 };
@@ -79,9 +80,8 @@ pub(crate) struct ParentTransfer {
     piece_offset: u64,
     digest: String,
     effective_max_read_size: u32,
-    published_source: Option<(ReadSourceId, u64)>,
     awaiting_buffer_ready: bool,
-    source_guard: Option<ResourceGuard>,
+    source_lease: Option<SourceLease>,
     on_source_state: Option<std::sync::Arc<dyn Fn(ReadSourceId, SourceState) + Send + Sync>>,
 }
 
@@ -95,13 +95,14 @@ pub(crate) enum ParentTerminal {
 }
 
 pub(crate) struct PendingSourceRevoke {
+    identity: ReadTransferIdentity,
     pub(crate) source_id: ReadSourceId,
     pub(crate) segment_generation: u64,
     pub(crate) completed_length: u64,
     pub(crate) read_wr_count: u64,
     pub(crate) terminal: ParentTerminal,
-    /// Stage timings for the monitoring checklist: native source register
-    /// (aligned copy + token + provider MR registration) and the ReadDone wait.
+    /// Source admission (including owner/worker queueing) and ReadDone wait.
+    /// The native register sub-phases are recorded separately below.
     pub(crate) register_ns: u64,
     pub(crate) wait_read_done_ns: u64,
     /// Diagnostic shim sub-phases of `register_ns`: alloc / copy#2 / token /
@@ -171,9 +172,8 @@ impl ParentTransfer {
                 piece_offset,
                 digest,
                 effective_max_read_size,
-                published_source: None,
                 awaiting_buffer_ready: false,
-                source_guard: None,
+                source_lease: None,
                 on_source_state: None,
             },
             request,
@@ -188,14 +188,15 @@ impl ParentTransfer {
         self
     }
     fn guard_source(&mut self, id: ReadSourceId, ready: bool) {
-        self.source_guard = Some(if let Some(callback) = self.on_source_state.clone() {
+        let guard = if let Some(callback) = self.on_source_state.clone() {
             callback(id, SourceState::Registered);
             ResourceGuard::new(move || callback(id, SourceState::Retained))
         } else if ready {
             self.fabric.source_guard(id)
         } else {
             self.fabric.retained_source_guard(id)
-        });
+        };
+        self.source_lease = Some(SourceLease::new(id, self.identity, ready, guard));
     }
     /// Registers and publishes a source, then waits until ReadDone or a full
     /// cancel drain requests the provider-specific revoke step. It never
@@ -281,12 +282,15 @@ impl ParentTransfer {
             Ok(offer) => offer,
             Err(error) => return Err(unpublished(error)),
         };
-        if self.on_source_state.is_none() {
-            if let Some(guard) = self.source_guard.take() {
-                guard.disarm();
-            }
-            self.source_guard = Some(self.fabric.retained_source_guard(source_id));
-        }
+        let exposed_guard = self
+            .on_source_state
+            .is_none()
+            .then(|| self.fabric.retained_source_guard(source_id));
+        self.source_lease
+            .as_mut()
+            .ok_or_else(|| unpublished(protocol("Parent source lease missing")))?
+            .expose(segment_generation, exposed_guard)
+            .map_err(unpublished)?;
         let deadline = Instant::now() + completion_timeout;
         let send_result = tokio::time::timeout_at(
             deadline,
@@ -319,7 +323,6 @@ impl ParentTransfer {
                 }),
             });
         }
-        self.published_source = Some((source_id, segment_generation));
         let published = |error: Error| ParentTransportFailure {
             error,
             retained_source: Some(RetainedSourceOwner {
@@ -383,6 +386,11 @@ impl ParentTransfer {
                 }
             }
         };
+        self.source_lease
+            .as_mut()
+            .ok_or_else(|| published(protocol("Parent source lease missing")))?
+            .child_drained(self.identity, segment_generation)
+            .map_err(published)?;
         if let Err(error) = self.fabric.retire_read_source(source_id).await {
             return Err(ParentTransportFailure {
                 error,
@@ -392,9 +400,11 @@ impl ParentTransfer {
                 }),
             });
         }
+        let identity = self.identity;
         Ok((
             self,
             PendingSourceRevoke {
+                identity,
                 source_id,
                 segment_generation,
                 completed_length,
@@ -419,9 +429,15 @@ impl ParentTransfer {
         mut self,
         pending: PendingSourceRevoke,
     ) -> Result<()> {
-        if self.published_source != Some((pending.source_id, pending.segment_generation)) {
-            return Err(protocol("Parent revoke identity mismatch"));
-        }
+        let lease = self
+            .source_lease
+            .as_mut()
+            .ok_or_else(|| protocol("Parent source lease missing"))?;
+        lease.check_revoke(
+            pending.source_id,
+            pending.identity,
+            pending.segment_generation,
+        )?;
         // SAFETY: The caller supplies the provider drain proof.
         if unsafe {
             self.fabric
@@ -438,11 +454,17 @@ impl ParentTransfer {
         } {
             return Err(protocol("source remained pending after revocation proof"));
         }
+        // SAFETY: Both owner cleanup stages above completed under the caller's
+        // provider revocation contract for the identity checked by the lease.
+        unsafe {
+            lease.released_after_revoke(
+                pending.source_id,
+                pending.identity,
+                pending.segment_generation,
+            )?;
+        }
         if let Some(callback) = &self.on_source_state {
             callback(pending.source_id, SourceState::Released);
-        }
-        if let Some(guard) = self.source_guard.take() {
-            guard.disarm();
         }
         match self.state.source_released()? {
             ParentAction::SendDone { segment_generation } => {
@@ -473,7 +495,6 @@ impl ParentTransfer {
             }
             _ => return Err(protocol("Parent source release produced invalid action")),
         }
-        self.published_source = None;
         self.control.finish(Some(pending.segment_generation))
     }
 }

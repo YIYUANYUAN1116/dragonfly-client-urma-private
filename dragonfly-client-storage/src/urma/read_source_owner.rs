@@ -1,4 +1,4 @@
-//! Parent native source adapter. Not connected to production dispatch.
+//! Parent native source adapter used by the owner and source workers.
 //! Keep the shared source/destination registry alive through shutdown.
 
 use super::{
