@@ -39,6 +39,12 @@ use tracing::{debug, error, info, instrument, warn};
 
 mod piece_notifier;
 
+#[cfg(all(feature = "urma", target_os = "linux"))]
+mod read_source_file;
+
+#[cfg(all(feature = "urma", target_os = "linux"))]
+mod read_region;
+
 #[cfg(target_os = "linux")]
 mod content_linux;
 

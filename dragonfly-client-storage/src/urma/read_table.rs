@@ -24,6 +24,18 @@ use super::{
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use tokio::sync::watch;
 
+fn cache_owner_error(error: super::read_source_cache::CacheError) -> OwnerError {
+    use super::read_source_cache::CacheError;
+    match error {
+        CacheError::Registry(error) => error,
+        CacheError::Missing => OwnerError::UnknownOwner,
+        CacheError::InvalidState => OwnerError::NotActive,
+        CacheError::IdentityMismatch => OwnerError::WrongProof,
+        CacheError::Shutdown => OwnerError::Shutdown,
+        CacheError::Storage(_) => OwnerError::InvalidSize,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ReadRoute {
     owner: ReadOwnerId,
@@ -105,6 +117,7 @@ pub(crate) enum ChildAdmission {
 
 pub(crate) struct ReadOwners<K, R: ChildResources> {
     registry: ReadOwnerRegistry<ReadBundle<K, R>>,
+    source_cache: super::read_source_cache::ReadSourceCache,
     routes: BTreeMap<u64, ReadRoute>,
     // Only IDs are queued; resources and WR permits stay with their owners.
     blocked_children: BTreeSet<ReadOwnerId>,
@@ -116,6 +129,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     pub(crate) fn new(budget: ReadBudget) -> Result<Self, OwnerError> {
         Ok(Self {
             registry: ReadOwnerRegistry::new(budget)?,
+            source_cache: super::read_source_cache::ReadSourceCache::new(),
             routes: BTreeMap::new(),
             blocked_children: BTreeSet::new(),
             progress_watchers: BTreeMap::new(),
@@ -137,6 +151,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         self.routes.is_empty() && self.registry.drained()
     }
     pub(crate) fn begin_shutdown(&mut self) {
+        if let Err(error) = self.source_cache.begin_shutdown(&mut self.registry) {
+            tracing::error!(%error, "source cache shutdown incomplete; resources retained");
+        }
         self.registry.begin_shutdown();
         self.interrupt_waiters();
     }
@@ -154,6 +171,12 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         Ok(())
     }
     pub(crate) fn retire(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
+        if self.source_cache.contains(id) {
+            return self
+                .source_cache
+                .retire(&mut self.registry, id)
+                .map_err(cache_owner_error);
+        }
         self.registry.retire(id)?;
         self.blocked_children.remove(&id);
         self.notify_child(id, true);
@@ -239,7 +262,39 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
     ) -> Result<ReadOwnerId, OwnerError> {
         self.registry.reserve(peer, ReadDirection::Source, bytes)
     }
+
+    /// Owner-side entry for the upcoming cached registration command. It does
+    /// not dispatch native work. Only register=true may dispatch; failures to
+    /// dispatch must resolve through reject_worker_source, not drop the claim.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cached Fabric command follows the Region Offer change"
+        )
+    )]
+    pub(crate) fn claim_cached_worker_source(
+        &mut self,
+        request: super::read_source_cache::CacheRequest<'_>,
+        now: std::time::Instant,
+    ) -> Result<super::read_source_cache::CacheClaim, super::read_source_cache::CacheError> {
+        let claim = self.source_cache.claim(&mut self.registry, request, now)?;
+        if claim.register {
+            self.source_cache.start_registration(claim.source)?;
+        }
+        Ok(claim)
+    }
+
     pub(crate) fn reject_worker_source(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
+        if self.source_cache.contains(id) {
+            // SAFETY: this existing entry is only used for a known native
+            // rejection or a job that failed dispatch before native execution.
+            return unsafe {
+                self.source_cache
+                    .registration_rejected(&mut self.registry, id)
+            }
+            .map_err(cache_owner_error);
+        }
         self.registry.release_unused_reservation(id)
     }
     pub(crate) fn attach_worker_source(
@@ -248,6 +303,17 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         worker: usize,
         uncertain: bool,
     ) -> Result<bool, OwnerError> {
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .registered(
+                    &mut self.registry,
+                    id,
+                    ReadBundle::WorkerSource(worker),
+                    uncertain,
+                )
+                .map_err(|(error, _)| cache_owner_error(error))?;
+            return Ok(self.registry.state(id)? == super::read_registry::OwnerState::Active);
+        }
         self.registry
             .attach(id, ReadBundle::WorkerSource(worker))
             .map_err(|(error, _)| error)?;
@@ -258,6 +324,15 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         Ok(self.registry.state(id)? == super::read_registry::OwnerState::Active)
     }
     pub(crate) fn worker_source(&mut self, id: ReadOwnerId) -> Result<usize, OwnerError> {
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .check_cleanup(&self.registry, id)
+                .map_err(cache_owner_error)?;
+        }
+        // This runs before sending native cleanup to a worker. Checking only
+        // when its completion arrives would allow unregister during another
+        // peer's READ even though the registry later refused to release bytes.
+        self.registry.check_source_cleanup(id)?;
         if !matches!(
             self.registry.state(id)?,
             super::read_registry::OwnerState::Retiring
@@ -275,12 +350,23 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         id: ReadOwnerId,
         result: Result<ReapDecision, FfiError>,
     ) -> Result<bool, ReapError<FfiError>> {
-        self.registry.reap_with(id, |bundle| match bundle {
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .check_cleanup(&self.registry, id)
+                .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+        }
+        let result = self.registry.reap_with(id, |bundle| match bundle {
             ReadBundle::WorkerSource(_) => result,
             _ => Err(FfiError::Contract(
                 "worker cleanup source identity mismatch",
             )),
-        })
+        });
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .observe_cleanup(&self.registry, id)
+                .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+        }
+        result
     }
 
     /// # Safety
@@ -314,7 +400,18 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         permit: &UnregisterPermit,
         revoked: Option<&SourceRevoked>,
     ) -> Result<bool, ReapError<FfiError>> {
-        self.registry.reap_source(id, permit, revoked)
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .check_cleanup(&self.registry, id)
+                .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+        }
+        let result = self.registry.reap_source(id, permit, revoked);
+        if self.source_cache.contains(id) {
+            self.source_cache
+                .observe_cleanup(&self.registry, id)
+                .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+        }
+        result
     }
 
     /// Reserve before invoking any allocation/import factory; execute synchronously
@@ -629,6 +726,145 @@ mod tests {
     };
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn cached_worker_registration_shares_budget_and_blocks_native_cleanup_until_all_leases_end() {
+        use super::super::{
+            read_protocol::ReadTransferIdentity,
+            read_registry::VerifiedRetirement,
+            read_source_cache::{CacheRequest, CacheState},
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let request = || CacheRequest {
+            kind: PieceKind::Piece,
+            task: "task",
+            file: file.clone(),
+            piece_length: 8,
+            max_region_bytes: 64,
+            piece_offset: 0,
+            completed: &[0..64],
+        };
+        let (mut owners, _) = credited_setup(8, 4);
+        let other = ReadPeer {
+            id: 2,
+            generation: 1,
+        };
+        owners.activate_peer(other).unwrap();
+        let now = std::time::Instant::now();
+        let first = owners.claim_cached_worker_source(request(), now).unwrap();
+        let second = owners.claim_cached_worker_source(request(), now).unwrap();
+        assert!(first.register);
+        assert!(!second.register);
+        assert_eq!(first.source, second.source);
+        assert!(owners.attach_worker_source(first.source, 4, false).unwrap());
+        assert_eq!(*second.updates.borrow(), CacheState::Ready);
+        let transfer = ReadTransferIdentity {
+            session_generation: 1,
+            transfer_id: 1,
+            metadata_generation: 1,
+        };
+        let a = owners
+            .source_cache
+            .acquire(
+                &mut owners.registry,
+                first.source,
+                PEER,
+                transfer,
+                0..8,
+                now,
+            )
+            .unwrap();
+        let b = owners
+            .source_cache
+            .acquire(
+                &mut owners.registry,
+                first.source,
+                other,
+                transfer,
+                8..16,
+                now,
+            )
+            .unwrap();
+        assert_eq!(owners.usage().source_bytes, 64);
+        owners.retire(first.source).unwrap();
+        assert_eq!(
+            owners.worker_source(first.source),
+            Err(OwnerError::SourceBusy)
+        );
+        owners
+            .source_cache
+            .abandon(&mut owners.registry, a, now)
+            .unwrap();
+        assert_eq!(
+            owners.worker_source(first.source),
+            Err(OwnerError::SourceBusy)
+        );
+        owners
+            .source_cache
+            .abandon(&mut owners.registry, b, now)
+            .unwrap();
+        assert_eq!(owners.worker_source(first.source), Ok(4));
+        assert!(owners
+            .complete_worker_cleanup(first.source, Err(FfiError::Status(-5)))
+            .is_err());
+        assert_eq!(*second.updates.borrow(), CacheState::Retained);
+        assert_eq!(owners.usage().source_bytes, 64);
+        assert_eq!(owners.worker_source(first.source), Ok(4));
+        // SAFETY: only a worker index exists in this device-free test.
+        let proof = unsafe { VerifiedRetirement::new(first.source) };
+        assert_eq!(
+            owners.complete_worker_cleanup(first.source, Ok(ReapDecision::Retired(proof))),
+            Ok(true)
+        );
+        assert_eq!(*second.updates.borrow(), CacheState::Released);
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn cached_worker_dispatch_rejection_and_shutdown_late_result_update_waiters() {
+        use super::super::{
+            read_registry::VerifiedRetirement,
+            read_source_cache::{CacheRequest, CacheState},
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let request = || CacheRequest {
+            kind: PieceKind::Piece,
+            task: "task",
+            file: file.clone(),
+            piece_length: 8,
+            max_region_bytes: 64,
+            piece_offset: 0,
+            completed: &[0..64],
+        };
+        let (mut owners, _) = credited_setup(8, 4);
+        let now = std::time::Instant::now();
+        let rejected = owners.claim_cached_worker_source(request(), now).unwrap();
+        owners.reject_worker_source(rejected.source).unwrap();
+        assert_eq!(*rejected.updates.borrow(), CacheState::Released);
+        assert!(owners.drained());
+        let late = owners.claim_cached_worker_source(request(), now).unwrap();
+        owners.begin_shutdown();
+        assert_eq!(*late.updates.borrow(), CacheState::Retiring);
+        assert!(!owners.attach_worker_source(late.source, 3, false).unwrap());
+        assert_eq!(*late.updates.borrow(), CacheState::Retiring);
+        assert_eq!(owners.worker_source(late.source), Ok(3));
+        // SAFETY: no native registration exists; model a verified worker reply.
+        let proof = unsafe { VerifiedRetirement::new(late.source) };
+        assert_eq!(
+            owners.complete_worker_cleanup(late.source, Ok(ReapDecision::Retired(proof))),
+            Ok(true)
+        );
+        assert_eq!(*late.updates.borrow(), CacheState::Released);
+        assert!(owners.drained());
+    }
     struct Mock {
         closes: Rc<Cell<usize>>,
     }
@@ -885,6 +1121,47 @@ mod tests {
             owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
             Ok(true)
         );
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn another_peer_lease_blocks_worker_cleanup_before_native_dispatch() {
+        let mut owners = setup();
+        let other = ReadPeer {
+            id: 2,
+            generation: 1,
+        };
+        owners.activate_peer(other).unwrap();
+        let source = owners.reserve_worker_source(PEER, 4).unwrap();
+        assert!(owners.attach_worker_source(source, 1, false).unwrap());
+        let lease = owners
+            .registry
+            .acquire_source_lease(source, other, 4)
+            .unwrap();
+        owners.retire(source).unwrap();
+        // worker_source is the runtime's pre-dispatch gate, not just a check
+        // performed after native unregister may already have run.
+        assert_eq!(owners.worker_source(source), Err(OwnerError::SourceBusy));
+        assert_eq!(
+            owners.complete_worker_cleanup(source, Ok(ReapDecision::Pending)),
+            Err(ReapError::Registry(OwnerError::SourceBusy))
+        );
+        assert!(!owners.peer_drained(PEER));
+        assert!(!owners.peer_drained(other));
+        assert_eq!(owners.usage().source_bytes, 4);
+        // SAFETY: Test owners have no native resources or remote accesses.
+        unsafe {
+            owners.registry.release_source_lease(lease).unwrap();
+        }
+        assert!(owners.peer_drained(other));
+        assert_eq!(owners.worker_source(source), Ok(1));
+        // SAFETY: Resource-free mock worker completed all cleanup.
+        let proof = unsafe { super::super::read_registry::VerifiedRetirement::new(source) };
+        assert_eq!(
+            owners.complete_worker_cleanup(source, Ok(ReapDecision::Retired(proof))),
+            Ok(true)
+        );
+        assert!(owners.peer_drained(PEER));
         assert!(owners.drained());
     }
 

@@ -26,7 +26,22 @@ pub(crate) struct ReadOwnerId {
     peer: ReadPeer,
 }
 
+/// A peer's use of a source registration. The registration keeps its own ID
+/// and physical charge even when the peer that first used it has departed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ReadSourceLeaseId {
+    source: ReadOwnerId,
+    sequence: u64,
+}
+
+struct SourceLeaseCharge {
+    peer: ReadPeer,
+    bytes: u64,
+}
+
 impl ReadOwnerId {
+    /// Destination peer, or the internal id-zero scope for a physical source.
+    /// Source peer usage/lifetime is tracked by leases, not this scope value.
     pub(crate) fn peer(self) -> ReadPeer {
         self.peer
     }
@@ -79,6 +94,8 @@ pub(crate) enum OwnerError {
     AlreadyAttached,
     OwnerAttached,
     OwnerMissing,
+    UnknownLease,
+    SourceBusy,
     NotActive,
     NotRetiring,
     WrongProof,
@@ -161,6 +178,21 @@ struct Entry<T> {
     // Generic bundles may have destructors that release native backing/permits.
     // Only a checked retirement proof permits invoking these destructors.
     owner: Option<ManuallyDrop<T>>,
+    source_leases: BTreeMap<ReadSourceLeaseId, SourceLeaseCharge>,
+    next_source_lease: u64,
+    // The existing per-Piece API owns this first lease. Additional leases must
+    // be explicitly drained before it can invoke native cleanup. Cached sources
+    // will release their leases separately and retain the physical registration.
+    primary_source_lease: Option<ReadSourceLeaseId>,
+}
+
+impl<T> Entry<T> {
+    fn charged_to(&self, id: ReadOwnerId, peer: ReadPeer) -> bool {
+        match self.direction {
+            ReadDirection::Destination => id.peer == peer,
+            ReadDirection::Source => self.source_leases.values().any(|lease| lease.peer == peer),
+        }
+    }
 }
 
 struct PeerState {
@@ -180,6 +212,10 @@ pub(crate) struct ReadOwnerRegistry<T> {
 }
 
 impl<T> ReadOwnerRegistry<T> {
+    pub(crate) fn identity(&self) -> u64 {
+        self.registry_id
+    }
+
     pub(crate) fn new(budget: ReadBudget) -> Result<Self, OwnerError> {
         let bytes = budget.destination.bytes.checked_add(budget.source.bytes);
         let entries = budget
@@ -220,7 +256,17 @@ impl<T> ReadOwnerRegistry<T> {
             if peer.generation <= previous.generation {
                 return Err(OwnerError::StalePeer);
             }
-            if previous.active || self.entries.keys().any(|id| id.peer.id == peer.id) {
+            if previous.active
+                || self.entries.iter().any(|(id, entry)| {
+                    entry.charged_to(
+                        *id,
+                        ReadPeer {
+                            id: peer.id,
+                            generation: previous.generation,
+                        },
+                    )
+                })
+            {
                 return Err(OwnerError::PeerBusy);
             }
         }
@@ -246,35 +292,49 @@ impl<T> ReadOwnerRegistry<T> {
     }
 
     pub(crate) fn peer_usage(&self, peer: ReadPeer) -> ReadUsage {
+        // Source usage is logical lease bytes/entries. Global usage counts each
+        // physical source once; summing peer usage need not equal global usage.
         self.usage_for(Some(peer))
     }
 
     fn usage_for(&self, peer: Option<ReadPeer>) -> ReadUsage {
         let mut usage = ReadUsage::default();
         for (id, entry) in &self.entries {
-            if peer.is_some_and(|peer| peer != id.peer) {
+            let (bytes, count) = match (peer, entry.direction) {
+                (None, _) => (entry.bytes, 1),
+                (Some(peer), ReadDirection::Destination) if peer == id.peer => (entry.bytes, 1),
+                (Some(peer), ReadDirection::Source) => entry
+                    .source_leases
+                    .values()
+                    .filter(|lease| lease.peer == peer)
+                    .fold((0, 0), |(bytes, count), lease| {
+                        (bytes + lease.bytes, count + 1)
+                    }),
+                _ => (0, 0),
+            };
+            if count == 0 {
                 continue;
             }
-            usage.bytes += entry.bytes;
-            usage.entries += 1;
+            usage.bytes += bytes;
+            usage.entries += count;
             match entry.direction {
                 ReadDirection::Destination => {
-                    usage.destination_bytes += entry.bytes;
-                    usage.destination_entries += 1;
+                    usage.destination_bytes += bytes;
+                    usage.destination_entries += count;
                 }
                 ReadDirection::Source => {
-                    usage.source_bytes += entry.bytes;
-                    usage.source_entries += 1;
+                    usage.source_bytes += bytes;
+                    usage.source_entries += count;
                 }
             }
             if entry.owner.is_none() {
-                usage.reserved_entries += 1;
+                usage.reserved_entries += count;
             }
             match entry.state {
-                OwnerState::Retiring => usage.retiring_entries += 1,
+                OwnerState::Retiring => usage.retiring_entries += count,
                 OwnerState::Quarantined(_) => {
-                    usage.quarantined_entries += 1;
-                    usage.quarantined_bytes += entry.bytes;
+                    usage.quarantined_entries += count;
+                    usage.quarantined_bytes += bytes;
                 }
                 _ => {}
             }
@@ -282,10 +342,9 @@ impl<T> ReadOwnerRegistry<T> {
         usage
     }
 
-    /// Non-blocking, atomic owner-thread admission. Charge actual allocation/
-    /// registration bytes, including alignment and capacity padding. Source and
-    /// destination cannot borrow each other's partition. Runtime supplies bounded
-    /// waits/fair scheduling; no native resource may be created before this succeeds.
+    /// Non-blocking admission for a dedicated Piece. Source bytes are charged
+    /// once to the physical pool and independently to its initial peer lease.
+    /// No native resource may be created before both reservations succeed.
     pub(crate) fn reserve(
         &mut self,
         peer: ReadPeer,
@@ -301,37 +360,85 @@ impl<T> ReadOwnerRegistry<T> {
         if bytes == 0 {
             return Err(OwnerError::InvalidSize);
         }
+        if direction == ReadDirection::Source {
+            let id = self.reserve_source(bytes)?;
+            match self.acquire_source_lease(id, peer, bytes) {
+                Ok(lease) => {
+                    self.entries
+                        .get_mut(&id)
+                        .expect("inserted source")
+                        .primary_source_lease = Some(lease);
+                    return Ok(id);
+                }
+                Err(error) => {
+                    // Native registration has not started, so the physical
+                    // reservation may be rolled back without a revocation proof.
+                    self.entries.remove(&id);
+                    return Err(error);
+                }
+            }
+        }
+        // Preserve quarantine as the process-wide stop reason even when this
+        // peer's destination quota is also exhausted.
         let usage = self.usage();
         if usage.quarantined_bytes >= self.budget.quarantine.bytes
             || usage.quarantined_entries >= self.budget.quarantine.entries
         {
             return Err(OwnerError::QuarantineLimit);
         }
-        let peer_usage = self.peer_usage(peer);
-        let (used, count, peer_used, peer_count, limit, peer_limit) = match direction {
+        let used = self.peer_usage(peer);
+        let limit = self.budget.per_peer_destination;
+        if bytes > limit.bytes.saturating_sub(used.destination_bytes)
+            || used.destination_entries >= limit.entries
+        {
+            return Err(OwnerError::Capacity);
+        }
+        self.reserve_physical(peer, direction, bytes)
+    }
+
+    /// Source registrations belong to this registry, not the first Child.
+    /// Peer id zero is internal and can never be activated as a network peer.
+    pub(crate) fn reserve_source(&mut self, bytes: u64) -> Result<ReadOwnerId, OwnerError> {
+        self.reserve_physical(
+            ReadPeer {
+                id: 0,
+                generation: 1,
+            },
+            ReadDirection::Source,
+            bytes,
+        )
+    }
+
+    fn reserve_physical(
+        &mut self,
+        owner_peer: ReadPeer,
+        direction: ReadDirection,
+        bytes: u64,
+    ) -> Result<ReadOwnerId, OwnerError> {
+        if !self.accepting {
+            return Err(OwnerError::Shutdown);
+        }
+        if bytes == 0 {
+            return Err(OwnerError::InvalidSize);
+        }
+        let usage = self.usage();
+        if usage.quarantined_bytes >= self.budget.quarantine.bytes
+            || usage.quarantined_entries >= self.budget.quarantine.entries
+        {
+            return Err(OwnerError::QuarantineLimit);
+        }
+        let (used, count, limit) = match direction {
             ReadDirection::Destination => (
                 usage.destination_bytes,
                 usage.destination_entries,
-                peer_usage.destination_bytes,
-                peer_usage.destination_entries,
                 self.budget.destination,
-                self.budget.per_peer_destination,
             ),
-            ReadDirection::Source => (
-                usage.source_bytes,
-                usage.source_entries,
-                peer_usage.source_bytes,
-                peer_usage.source_entries,
-                self.budget.source,
-                self.budget.per_peer_source,
-            ),
+            ReadDirection::Source => (usage.source_bytes, usage.source_entries, self.budget.source),
         };
-        if bytes > limit.bytes - used
-            || bytes > self.budget.total.bytes - usage.bytes
-            || bytes > peer_limit.bytes - peer_used
+        if bytes > limit.bytes.saturating_sub(used)
+            || bytes > self.budget.total.bytes.saturating_sub(usage.bytes)
             || usage.entries >= self.budget.total.entries
             || count >= limit.entries
-            || peer_count >= peer_limit.entries
         {
             return Err(OwnerError::Capacity);
         }
@@ -340,7 +447,7 @@ impl<T> ReadOwnerRegistry<T> {
         let id = ReadOwnerId {
             registry: self.registry_id,
             sequence,
-            peer,
+            peer: owner_peer,
         };
         self.entries.insert(
             id,
@@ -349,9 +456,98 @@ impl<T> ReadOwnerRegistry<T> {
                 bytes,
                 state: OwnerState::Reserved,
                 owner: None,
+                source_leases: BTreeMap::new(),
+                next_source_lease: 1,
+                primary_source_lease: None,
             },
         );
         Ok(id)
+    }
+
+    pub(crate) fn acquire_source_lease(
+        &mut self,
+        source: ReadOwnerId,
+        peer: ReadPeer,
+        bytes: u64,
+    ) -> Result<ReadSourceLeaseId, OwnerError> {
+        if !self.accepting {
+            return Err(OwnerError::Shutdown);
+        }
+        if !self.peer(peer)?.active {
+            return Err(OwnerError::PeerDraining);
+        }
+        let entry = self.entries.get(&source).ok_or(OwnerError::UnknownOwner)?;
+        if entry.direction != ReadDirection::Source {
+            return Err(OwnerError::NotActive);
+        }
+        // Only the initial lease may precede the native registration result.
+        if entry.state != OwnerState::Active
+            && !(entry.state == OwnerState::Reserved && entry.next_source_lease == 1)
+        {
+            return Err(OwnerError::NotActive);
+        }
+        if bytes == 0 || bytes > entry.bytes {
+            return Err(OwnerError::InvalidSize);
+        }
+        let usage = self.usage();
+        if usage.quarantined_bytes >= self.budget.quarantine.bytes
+            || usage.quarantined_entries >= self.budget.quarantine.entries
+        {
+            return Err(OwnerError::QuarantineLimit);
+        }
+        let usage = self.peer_usage(peer);
+        let limit = self.budget.per_peer_source;
+        if bytes > limit.bytes.saturating_sub(usage.source_bytes)
+            || usage.source_entries >= limit.entries
+        {
+            return Err(OwnerError::Capacity);
+        }
+        let entry = self.entries.get_mut(&source).expect("validated source");
+        let sequence = entry.next_source_lease;
+        entry.next_source_lease = sequence.checked_add(1).ok_or(OwnerError::IdExhausted)?;
+        let lease = ReadSourceLeaseId { source, sequence };
+        entry
+            .source_leases
+            .insert(lease, SourceLeaseCharge { peer, bytes });
+        Ok(lease)
+    }
+
+    /// # Safety
+    /// This exact lease has finished all remote accesses and cannot resume
+    /// them. Timeout/EOF or dropping a future is insufficient. Releasing a lease
+    /// never unregisters the source or releases its physical charge/backing.
+    pub(crate) unsafe fn release_source_lease(
+        &mut self,
+        lease: ReadSourceLeaseId,
+    ) -> Result<(), OwnerError> {
+        let entry = self
+            .entries
+            .get_mut(&lease.source)
+            .ok_or(OwnerError::UnknownOwner)?;
+        entry
+            .source_leases
+            .remove(&lease)
+            .ok_or(OwnerError::UnknownLease)?;
+        if entry.primary_source_lease == Some(lease) {
+            entry.primary_source_lease = None;
+        }
+        Ok(())
+    }
+
+    /// Existing dedicated-Piece cleanup may retire its primary lease together
+    /// with the registration under the caller's revocation proof. Any additional
+    /// lease blocks native cleanup, even after its peer has started draining.
+    pub(crate) fn check_source_cleanup(&self, id: ReadOwnerId) -> Result<(), OwnerError> {
+        let entry = self.entries.get(&id).ok_or(OwnerError::UnknownOwner)?;
+        if entry.direction == ReadDirection::Source
+            && entry
+                .source_leases
+                .keys()
+                .any(|lease| Some(*lease) != entry.primary_source_lease)
+        {
+            return Err(OwnerError::SourceBusy);
+        }
+        Ok(())
     }
 
     /// Ownership is returned on rejection, never implicitly dropped. A reservation
@@ -454,7 +650,18 @@ impl<T> ReadOwnerRegistry<T> {
         self.peer(peer)?;
         self.peers.get_mut(&peer.id).expect("validated peer").active = false;
         for (id, entry) in &mut self.entries {
-            if id.peer == peer && !matches!(entry.state, OwnerState::Quarantined(_)) {
+            // A shared registration has no dedicated primary lease. Its cache
+            // controls retirement, even when its final peer starts draining;
+            // outstanding peer lease charges still remain until explicit drain.
+            let draining = entry.charged_to(*id, peer)
+                && (entry.direction == ReadDirection::Destination
+                    || (entry.primary_source_lease.is_some()
+                        && !entry.source_leases.values().any(|lease| {
+                            self.peers.get(&lease.peer.id).is_some_and(|state| {
+                                state.generation == lease.peer.generation && state.active
+                            })
+                        })));
+            if draining && !matches!(entry.state, OwnerState::Quarantined(_)) {
                 entry.state = OwnerState::Retiring;
             }
         }
@@ -501,6 +708,9 @@ impl<T> ReadOwnerRegistry<T> {
         id: ReadOwnerId,
         cleanup: impl FnOnce(&mut T) -> Result<ReapDecision, E>,
     ) -> Result<bool, ReapError<E>> {
+        // Do not invoke a native unregister/release closure while another
+        // transfer still owns a lease; checking only after cleanup is too late.
+        self.check_source_cleanup(id).map_err(ReapError::Registry)?;
         let entry = self
             .entries
             .get_mut(&id)
@@ -526,6 +736,11 @@ impl<T> ReadOwnerRegistry<T> {
                 Err(ReapError::Registry(OwnerError::WrongProof))
             }
             Ok(ReapDecision::Retired(_)) => {
+                if let Some(lease) = entry.primary_source_lease {
+                    // SAFETY: The checked owner proof covers this registration
+                    // and all accesses of its sole remaining dedicated lease.
+                    unsafe { self.release_source_lease(lease) }.map_err(ReapError::Registry)?;
+                }
                 let mut entry = self.entries.remove(&id).expect("entry validated");
                 // SAFETY: The checked VerifiedRetirement authorizes dropping this
                 // entire ownership bundle; it is removed and taken exactly once.
@@ -587,6 +802,230 @@ mod tests {
 
     fn reap(registry: &mut ReadOwnerRegistry<u32>, id: ReadOwnerId) {
         assert_eq!(registry.reap_with(id, |_| Ok::<_, ()>(proof(id))), Ok(true));
+    }
+
+    fn unlease(registry: &mut ReadOwnerRegistry<u32>, lease: ReadSourceLeaseId) {
+        // SAFETY: All tests below use integer owners with no remote accesses.
+        unsafe { registry.release_source_lease(lease).unwrap() };
+    }
+
+    #[test]
+    fn shared_source_physical_charge_and_peer_lease_limits_are_independent() {
+        let mut r = registry::<u32>();
+        // The physical source may exceed a peer's Piece-lease budget.
+        let source = r.reserve_source(64).unwrap();
+        assert_eq!(
+            source.peer(),
+            ReadPeer {
+                id: 0,
+                generation: 1
+            }
+        );
+        assert_eq!(r.activate_peer(source.peer()), Err(OwnerError::InvalidPeer));
+        r.attach(source, 7).unwrap();
+        let a1 = r.acquire_source_lease(source, A, 16).unwrap();
+        let a2 = r.acquire_source_lease(source, A, 16).unwrap();
+        let b = r.acquire_source_lease(source, B, 32).unwrap();
+        assert_eq!(r.usage().source_bytes, 64);
+        assert_eq!(r.usage().source_entries, 1);
+        assert_eq!(r.peer_usage(A).source_bytes, 32);
+        assert_eq!(r.peer_usage(A).source_entries, 2);
+        assert_eq!(r.peer_usage(B).source_bytes, 32);
+        let before = r.usage();
+        assert_eq!(
+            r.acquire_source_lease(source, A, 1),
+            Err(OwnerError::Capacity)
+        );
+        assert_eq!(
+            r.acquire_source_lease(source, B, 1),
+            Err(OwnerError::Capacity)
+        );
+        assert_eq!(
+            r.acquire_source_lease(source, B, 0),
+            Err(OwnerError::InvalidSize)
+        );
+        assert_eq!(
+            r.acquire_source_lease(source, B, 65),
+            Err(OwnerError::InvalidSize)
+        );
+        assert_eq!(r.usage(), before);
+        for lease in [a1, a2, b] {
+            unlease(&mut r, lease);
+        }
+        assert_eq!(r.peer_usage(A), ReadUsage::default());
+        assert_eq!(r.usage().source_bytes, 64);
+        r.retire(source).unwrap();
+        reap(&mut r, source);
+        assert!(r.drained());
+    }
+
+    #[test]
+    fn first_peer_drain_cannot_retire_another_peers_source_lease() {
+        let mut r = registry::<u32>();
+        let source = r.reserve_source(32).unwrap();
+        r.attach(source, 1).unwrap();
+        let a = r.acquire_source_lease(source, A, 16).unwrap();
+        let b = r.acquire_source_lease(source, B, 16).unwrap();
+        r.drain_peer(A).unwrap();
+        assert_eq!(r.state(source), Ok(OwnerState::Active));
+        assert_eq!(r.peer_usage(A).source_bytes, 16);
+        assert_eq!(
+            r.acquire_source_lease(source, A, 1),
+            Err(OwnerError::PeerDraining)
+        );
+        let next = ReadPeer { generation: 2, ..A };
+        assert_eq!(r.activate_peer(next), Err(OwnerError::PeerBusy));
+        unlease(&mut r, a);
+        r.activate_peer(next).unwrap();
+        let newer = r.acquire_source_lease(source, next, 16).unwrap();
+        assert_eq!(
+            unsafe { r.release_source_lease(a) },
+            Err(OwnerError::UnknownLease)
+        );
+        assert_eq!(r.peer_usage(next).source_bytes, 16);
+        assert_eq!(
+            r.acquire_source_lease(source, A, 1),
+            Err(OwnerError::StalePeer)
+        );
+        r.retire(source).unwrap();
+        assert_eq!(
+            r.acquire_source_lease(source, B, 1),
+            Err(OwnerError::NotActive)
+        );
+        assert_eq!(
+            r.reap_with(source, |_| -> Result<_, ()> {
+                panic!("must reject before native cleanup")
+            }),
+            Err(ReapError::Registry(OwnerError::SourceBusy))
+        );
+        unlease(&mut r, b);
+        assert_eq!(r.check_source_cleanup(source), Err(OwnerError::SourceBusy));
+        unlease(&mut r, newer);
+        reap(&mut r, source);
+    }
+
+    #[test]
+    fn extra_lease_blocks_cleanup_and_failed_cleanup_keeps_primary_charge() {
+        let mut r = registry::<u32>();
+        let source = r.reserve(A, ReadDirection::Source, 16).unwrap();
+        r.attach(source, 1).unwrap();
+        let b = r.acquire_source_lease(source, B, 16).unwrap();
+        r.retire(source).unwrap();
+        assert_eq!(
+            r.reap_with(source, |_| -> Result<_, ()> {
+                panic!("must reject before native unregister")
+            }),
+            Err(ReapError::Registry(OwnerError::SourceBusy))
+        );
+        unlease(&mut r, b);
+        assert_eq!(
+            r.reap_with(source, |_| Err("unregister failed")),
+            Err(ReapError::Cleanup("unregister failed"))
+        );
+        assert_eq!(r.usage().quarantined_bytes, 16);
+        assert_eq!(r.peer_usage(A).source_bytes, 16);
+        assert_eq!(
+            r.reap_with(source, |_| Ok::<_, ()>(ReapDecision::Pending)),
+            Ok(false)
+        );
+        assert_eq!(r.peer_usage(A).source_bytes, 16);
+        reap(&mut r, source);
+        assert_eq!(r.peer_usage(A), ReadUsage::default());
+    }
+
+    #[test]
+    fn lease_identity_cannot_alias_a_different_source_or_registry() {
+        let mut r = registry::<u32>();
+        let source = r.reserve_source(16).unwrap();
+        r.attach(source, 1).unwrap();
+        let old = r.acquire_source_lease(source, A, 8).unwrap();
+        unlease(&mut r, old);
+        let newer = r.acquire_source_lease(source, A, 8).unwrap();
+        assert_ne!(old, newer);
+        assert_eq!(
+            unsafe { r.release_source_lease(old) },
+            Err(OwnerError::UnknownLease)
+        );
+        let second = r.reserve_source(16).unwrap();
+        r.attach(second, 2).unwrap();
+        let other = r.acquire_source_lease(second, B, 8).unwrap();
+        assert_eq!(old.sequence, other.sequence);
+        assert_ne!(old, other);
+        assert_eq!(
+            unsafe { r.release_source_lease(old) },
+            Err(OwnerError::UnknownLease)
+        );
+        assert_eq!(r.peer_usage(B).source_bytes, 8);
+        let mut foreign = registry::<u32>();
+        assert_eq!(
+            unsafe { foreign.release_source_lease(newer) },
+            Err(OwnerError::UnknownOwner)
+        );
+        assert_eq!(r.peer_usage(A).source_bytes, 8);
+        unlease(&mut r, newer);
+        unlease(&mut r, other);
+        for id in [source, second] {
+            r.retire(id).unwrap();
+            reap(&mut r, id);
+        }
+    }
+
+    #[test]
+    fn peer_lease_rejection_rolls_back_physical_source_reservation() {
+        let mut r = registry::<u32>();
+        let source = r.reserve(A, ReadDirection::Source, 32).unwrap();
+        r.attach(source, 1).unwrap();
+        let before = r.usage();
+        assert_eq!(
+            r.reserve(A, ReadDirection::Source, 1),
+            Err(OwnerError::Capacity)
+        );
+        assert_eq!(r.usage(), before);
+        let rejected = r.reserve(B, ReadDirection::Source, 16).unwrap();
+        assert_eq!(r.peer_usage(B).source_bytes, 16);
+        r.release_unused_reservation(rejected).unwrap();
+        assert_eq!(r.usage(), before);
+        assert_eq!(r.peer_usage(B), ReadUsage::default());
+        r.retire(source).unwrap();
+        reap(&mut r, source);
+    }
+
+    #[test]
+    fn idle_registration_survives_peer_drain_but_not_verified_shutdown() {
+        let mut r = registry::<u32>();
+        let source = r.reserve_source(16).unwrap();
+        r.attach(source, 1).unwrap();
+        let a = r.acquire_source_lease(source, A, 8).unwrap();
+        unlease(&mut r, a);
+        r.drain_peer(A).unwrap();
+        assert_eq!(r.state(source), Ok(OwnerState::Active));
+        assert_eq!(r.usage().source_bytes, 16);
+        r.begin_shutdown();
+        assert_eq!(
+            r.acquire_source_lease(source, B, 8),
+            Err(OwnerError::Shutdown)
+        );
+        assert_eq!(r.reserve_source(1), Err(OwnerError::Shutdown));
+        assert_eq!(r.state(source), Ok(OwnerState::Retiring));
+        reap(&mut r, source);
+        assert!(r.drained());
+    }
+
+    #[test]
+    fn source_lease_sequence_never_wraps_or_mutates_usage_on_exhaustion() {
+        let mut r = registry::<u32>();
+        let source = r.reserve_source(16).unwrap();
+        r.attach(source, 1).unwrap();
+        r.entries.get_mut(&source).unwrap().next_source_lease = u64::MAX;
+        let before = r.usage();
+        assert_eq!(
+            r.acquire_source_lease(source, A, 8),
+            Err(OwnerError::IdExhausted)
+        );
+        assert_eq!(r.peer_usage(A), ReadUsage::default());
+        assert_eq!(r.usage(), before);
+        r.retire(source).unwrap();
+        reap(&mut r, source);
     }
 
     #[test]

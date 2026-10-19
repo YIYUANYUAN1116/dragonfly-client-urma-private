@@ -740,10 +740,10 @@ impl UrmaServerHandler {
             PieceSource::Mapped(mapped) => {
                 // ReadSource retains this mapping through verified revocation.
                 // Its page-aligned VA can therefore be registered directly.
-                if mapped.as_slice().len() as u64 != accepted_length {
+                if mapped.offset() != piece.offset || mapped.len() as u64 != accepted_length {
                     return Err(ClientError::Unknown(format!(
-                        "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
-                        mapped.as_slice().len()
+                        "READ piece {piece_id} source range {}+{} diverges from expected {}+{accepted_length}",
+                        mapped.offset(), mapped.len(), piece.offset
                     )));
                 }
                 ReadSourceMemory::Mapped(mapped)

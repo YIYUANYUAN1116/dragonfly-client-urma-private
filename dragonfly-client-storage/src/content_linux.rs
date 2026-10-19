@@ -444,40 +444,18 @@ impl Content {
             return Err(Error::InvalidParameter);
         }
         let mapped = tokio::task::spawn_blocking(move || -> Result<super::content::MappedPiece> {
-            let file = std::fs::File::open(&path).inspect_err(|err| {
+            let source = super::content::ReadSourceFile::open(&path).inspect_err(|err| {
                 error!("open {:?} failed: {}", path, err);
             })?;
-            let metadata = file.metadata().inspect_err(|err| {
-                error!("stat {:?} failed: {}", path, err);
-            })?;
-            let end = offset.checked_add(length).ok_or(Error::InvalidParameter)?;
-            if end > metadata.len() {
-                return Err(Error::Unknown(format!(
-                    "piece range [{}, {}) exceeds content length {}",
-                    offset,
-                    end,
-                    metadata.len()
-                )));
-            }
-            // Safety: the file remains open while the mapping is constructed; MappedPiece owns
-            // the resulting pages for the piece lifetime.
-            let mmap = unsafe {
-                memmap2::MmapOptions::new()
-                    .offset(offset)
-                    .len(length as usize)
-                    .map(&file)
-            }
-            .inspect_err(|err| {
+            // SAFETY: the Storage upload contract requires a finished,
+            // immutable range; map_upload_piece checks Piece completion.
+            // Unlink/path replacement is allowed; overwrite/truncate is not.
+            unsafe { source.map_range(offset, length) }.inspect_err(|err| {
                 error!(
                     "mmap {:?} offset {} length {} failed: {}",
                     path, offset, length, err
                 );
-            })?;
-            // Fault pages in so later window copies do not block the fabric send path on major
-            // page faults under memory pressure.
-            mmap.advise(memmap2::Advice::Sequential).ok();
-            mmap.advise(memmap2::Advice::WillNeed).ok();
-            Ok(super::content::MappedPiece::new(mmap))
+            })
         })
         .await
         .map_err(|err| Error::Unknown(format!("mmap piece task join failed: {err}")))??;
@@ -1345,6 +1323,59 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "urma")]
+    #[tokio::test]
+    async fn read_mapping_survives_storage_delete_and_same_task_recreation() {
+        use crate::rendezvous::PieceKind;
+
+        let temp_dir = tempdir().unwrap();
+        let content = Content::new(Arc::new(Config::default()), temp_dir.path())
+            .await
+            .unwrap();
+        let task = "60409bd0ec44160f44c53c39b3fe1c5fdfb23faded0228c68bee83bc15a200e3";
+        for kind in [
+            PieceKind::Piece,
+            PieceKind::PersistentPiece,
+            PieceKind::PersistentCachePiece,
+        ] {
+            let path = match kind {
+                PieceKind::Piece => content.create_task(task, 4096).await,
+                PieceKind::PersistentPiece => content.create_persistent_task(task, 4096).await,
+                PieceKind::PersistentCachePiece => {
+                    content.create_persistent_cache_task(task, 4096).await
+                }
+            }
+            .unwrap();
+            fs::write(&path, vec![1; 4096]).await.unwrap();
+            let old = content.map_path_range(path.clone(), 0, 4096).await.unwrap();
+            let identity = old.source_file().identity();
+            match kind {
+                PieceKind::Piece => content.delete_task(task).await,
+                PieceKind::PersistentPiece => content.delete_persistent_task(task).await,
+                PieceKind::PersistentCachePiece => content.delete_persistent_cache_task(task).await,
+            }
+            .unwrap();
+            assert!(!path.exists());
+            assert!(old.source_file().is_unlinked().unwrap());
+            // Run the same creation API used by a subsequent download. There
+            // must be no dependency on dropping the previous READ mapping.
+            let recreated = match kind {
+                PieceKind::Piece => content.create_task(task, 4096).await,
+                PieceKind::PersistentPiece => content.create_persistent_task(task, 4096).await,
+                PieceKind::PersistentCachePiece => {
+                    content.create_persistent_cache_task(task, 4096).await
+                }
+            }
+            .unwrap();
+            assert_eq!(path, recreated);
+            fs::write(&recreated, vec![2; 4096]).await.unwrap();
+            let new = content.map_path_range(recreated, 0, 4096).await.unwrap();
+            assert_ne!(identity, new.source_file().identity());
+            assert_eq!(old.as_slice(), &[1; 4096]);
+            assert_eq!(new.as_slice(), &[2; 4096]);
+        }
+    }
 
     #[test]
     fn test_write_all_vectored_at_preserves_offset_and_parts() {
