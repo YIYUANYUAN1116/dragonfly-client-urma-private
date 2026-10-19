@@ -1058,12 +1058,43 @@ pub struct UrmaServer {
     pub read: Option<UrmaReadServer>,
 }
 
+/// Parent source registration policy. Incomplete files always use Piece registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UrmaRegistrationMode {
+    #[default]
+    Piece,
+    Cached,
+}
+
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UrmaRegistration {
+    pub mode: UrmaRegistrationMode,
+
+    /// Whole-file threshold and fixed Region size ceiling for completed files.
+    #[serde(with = "bytesize_serde")]
+    pub max_region_bytes: ByteSize,
+}
+
+impl Default for UrmaRegistration {
+    fn default() -> Self {
+        Self {
+            mode: UrmaRegistrationMode::Piece,
+            max_region_bytes: ByteSize::gib(1),
+        }
+    }
+}
+
 /// Byte budgets for the READ-only data plane. Each capacity derives its entry
 /// count from a 64KiB accounting unit, independent of the actual Piece size.
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[validate(schema(function = "validate_urma_read_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UrmaReadServer {
+    #[validate]
+    pub registration: UrmaRegistration,
+
     /// Enables production publication of the READ listener only after the
     /// deployment provider has passed the source-revocation gate. The normal
     /// READ completion handshake is not itself proof that an old descriptor
@@ -1142,6 +1173,7 @@ pub struct UrmaReadServer {
 impl Default for UrmaReadServer {
     fn default() -> Self {
         Self {
+            registration: UrmaRegistration::default(),
             provider_revocation_validated: false,
             source_workers: 0,
             total_bytes: default_urma_read_total_bytes(),
@@ -1206,6 +1238,11 @@ fn default_urma_read_max_jfs_sge() -> u32 {
 }
 
 fn validate_urma_read_server(read: &UrmaReadServer) -> std::result::Result<(), ValidationError> {
+    if read.registration.max_region_bytes.as_u64() == 0 {
+        return Err(ValidationError::new(
+            "urma read registration.maxRegionBytes must be non-zero",
+        ));
+    }
     let total = read.total_bytes.as_u64();
     let reserved = read
         .source_bytes
@@ -2182,6 +2219,23 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::fs;
+
+    #[test]
+    fn urma_completed_file_registration_configuration() {
+        let default = UrmaReadServer::default();
+        assert_eq!(default.registration.mode, UrmaRegistrationMode::Piece);
+        assert_eq!(default.registration.max_region_bytes, ByteSize::gib(1));
+        let read: UrmaReadServer =
+            serde_yaml::from_str("registration:\n  mode: cached\n  maxRegionBytes: 256MiB\n")
+                .unwrap();
+        assert_eq!(read.registration.mode, UrmaRegistrationMode::Cached);
+        assert_eq!(read.registration.max_region_bytes, ByteSize::mib(256));
+        assert!(read.validate().is_ok());
+        let invalid: UrmaReadServer =
+            serde_yaml::from_str("registration:\n  mode: cached\n  maxRegionBytes: 0B\n").unwrap();
+        assert!(invalid.validate().is_err());
+        assert!(serde_yaml::from_str::<UrmaReadServer>("registration:\n  mode: file\n").is_err());
+    }
 
     #[test]
     fn urma_source_workers_configuration() {

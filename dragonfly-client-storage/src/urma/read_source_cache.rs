@@ -61,7 +61,7 @@ pub(crate) struct CacheRequest<'a> {
     pub(crate) piece_length: u64,
     pub(crate) max_region_bytes: u64,
     pub(crate) piece_offset: u64,
-    /// Completed ranges must belong to this exact file instance.
+    /// Completed ranges belong to this file; an empty list permits lookup only.
     pub(crate) completed: &'a [Range<u64>],
 }
 
@@ -214,10 +214,28 @@ impl ReadSourceCache {
             .flat_map(|ranges| ranges.values())
             .map(|id| self.regions[id].range.clone())
             .collect();
-        match layout
-            .select(request.piece_offset, request.completed, &occupied)
-            .map_err(CacheError::Storage)?
-        {
+        // An empty completion list is lookup-only. Only an existing claim can
+        // supply a Region; the caller must establish full-file completion
+        // before sending a registration request on a miss.
+        let selection = if request.completed.is_empty() {
+            layout
+                .window(request.piece_offset)
+                .map_err(CacheError::Storage)?;
+            let end =
+                request.piece_offset + request.piece_length.min(length - request.piece_offset);
+            ReadRegionSelection::Covered(
+                occupied
+                    .iter()
+                    .find(|range| range.start <= request.piece_offset && range.end >= end)
+                    .cloned()
+                    .ok_or(CacheError::Missing)?,
+            )
+        } else {
+            layout
+                .select(request.piece_offset, request.completed, &occupied)
+                .map_err(CacheError::Storage)?
+        };
+        match selection {
             ReadRegionSelection::Covered(range) => {
                 let source = self.files[&key][&range.start];
                 let region = &self.regions[&source];
@@ -584,16 +602,6 @@ impl ReadSourceCache {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.regions.is_empty()
-    }
-
-    /// Weak handles keep a queued filesystem scan from extending cache backing
-    /// lifetime. The scanner must never call native APIs or interpret errors as
-    /// unlink evidence.
-    pub(crate) fn scan_files(&self) -> Vec<(ReadOwnerId, std::sync::Weak<ReadSourceFile>)> {
-        self.regions
-            .iter()
-            .map(|(&id, region)| (id, Arc::downgrade(&region.file)))
-            .collect()
     }
 
     /// Software drain is a precondition, not revocation proof. Runtime must
@@ -1029,6 +1037,82 @@ mod tests {
     }
 
     #[test]
+    fn lookup_only_miss_never_registers_and_hit_reuses_completed_file_claim() {
+        let mut f = Fixture::new();
+        assert!(matches!(
+            f.cache.claim(
+                &mut f.registry,
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file: f.file.clone(),
+                    piece_length: 8,
+                    max_region_bytes: 32,
+                    piece_offset: 8,
+                    completed: &[],
+                },
+                f.now
+            ),
+            Err(CacheError::Missing)
+        ));
+        assert_eq!(f.registry.usage().source_entries, 0);
+        let register = f
+            .cache
+            .claim(
+                &mut f.registry,
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file: f.file.clone(),
+                    piece_length: 8,
+                    max_region_bytes: 32,
+                    piece_offset: 8,
+                    completed: &[0..64],
+                },
+                f.now,
+            )
+            .unwrap();
+        assert!(register.register);
+        assert_eq!(register.range, 0..32);
+        let hit = f
+            .cache
+            .claim(
+                &mut f.registry,
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file: f.file.clone(),
+                    piece_length: 8,
+                    max_region_bytes: 32,
+                    piece_offset: 24,
+                    completed: &[],
+                },
+                f.now,
+            )
+            .unwrap();
+        assert!(!hit.register);
+        assert_eq!(hit.source, register.source);
+        assert_eq!(hit.range, 0..32);
+        assert!(matches!(
+            f.cache.claim(
+                &mut f.registry,
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file: f.file.clone(),
+                    piece_length: 8,
+                    max_region_bytes: 32,
+                    piece_offset: 32,
+                    completed: &[],
+                },
+                f.now
+            ),
+            Err(CacheError::Missing)
+        ));
+        assert_eq!(f.registry.usage().source_entries, 1);
+    }
+
+    #[test]
     fn wrong_registry_geometry_and_incomplete_hit_do_not_mutate_cache() {
         let mut f = Fixture::new();
         let id = f.claim(0, &[0..64]).source;
@@ -1037,9 +1121,11 @@ mod tests {
             f.cache.observe_cleanup(&other, id),
             Err(CacheError::IdentityMismatch)
         ));
-        for (piece_length, max_region_bytes, completed) in
-            [(16, 64, vec![0..64]), (8, 32, vec![0..64]), (8, 64, vec![])]
-        {
+        for (piece_length, max_region_bytes, completed) in [
+            (16, 64, vec![0..64]),
+            (8, 32, vec![0..64]),
+            (8, 64, vec![0..4]),
+        ] {
             assert!(f
                 .cache
                 .claim(

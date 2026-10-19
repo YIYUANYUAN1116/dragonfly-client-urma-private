@@ -15,6 +15,7 @@
  */
 
 use crate::content::MappedPiece;
+use crate::read_storage_source::ReadStorageSource;
 use crate::rendezvous::PieceKind;
 use crate::urma::fabric::{FabricReadiness, UrmaFabric, UrmaFabricHandle};
 use crate::urma::ffi::read::source::{ReadBacking, ReadSourceMemory};
@@ -27,14 +28,18 @@ use crate::urma::read_handoff::ResourceGuard;
 use crate::urma::read_protocol::{ReadCapability, READ_DESCRIPTOR_VERSION};
 use crate::urma::read_transfer::parent::{ParentTransfer, SourceState};
 use crate::urma::rendezvous::{CapabilityRegistry, UrmaAdvertisement, UrmaCapability};
-use crate::urma::runtime::{ReadSourceId, ReadSourceRequest};
+use crate::urma::runtime::{
+    ReadCachedSource, ReadCachedSourceRequest, ReadSourceId, ReadSourceRequest,
+};
 use crate::urma::server_session_idle_timeout;
 
 use crate::urma::Error as UrmaError;
 
 use crate::urma::{TpType, TransportMode};
 use crate::Storage;
-use dragonfly_client_config::dfdaemon::{Config, UrmaReadServer};
+use dragonfly_client_config::dfdaemon::{
+    Config, UrmaReadServer, UrmaRegistration, UrmaRegistrationMode,
+};
 use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
 use dragonfly_client_metric::{
     collect_upload_piece_finished_metrics, collect_upload_piece_traffic_metrics,
@@ -360,6 +365,7 @@ struct UrmaServerHandler {
 struct ReadParentConfig {
     capability: ReadLaneCapability,
     _revocation_gate: ProviderRevocationValidated,
+    registration: UrmaRegistration,
 }
 
 /// Startup evidence that the deployment provider passed the external source
@@ -482,6 +488,7 @@ fn read_parent_config(
             .with_provider_limit(fabric.max_read_size()),
         },
         _revocation_gate: ProviderRevocationValidated,
+        registration: read.registration.clone(),
     }
 }
 
@@ -519,6 +526,77 @@ impl UrmaServerHandler {
             PieceKind::PersistentPiece => self.storage.get_persistent_piece(piece_id),
             PieceKind::PersistentCachePiece => self.storage.get_persistent_cache_piece(piece_id),
         }
+    }
+
+    /// Only ordinary, on-disk completed files enter the cache. A lookup miss
+    /// performs the full-file check; hits reuse its prior completion evidence.
+    async fn prepare_cached_source(
+        &self,
+        lane_id: u16,
+        kind: PieceKind,
+        task_id: &str,
+        piece_id: &str,
+    ) -> ClientResult<Option<(ReadStorageSource, ReadCachedSource, u64)>> {
+        if kind != PieceKind::Piece
+            || !self.mmap_content
+            || self.read.registration.mode != UrmaRegistrationMode::Cached
+        {
+            return Ok(None);
+        }
+        let Some(storage) = self.storage.read_cache_source(task_id, piece_id).await? else {
+            return Ok(None);
+        };
+        let max_region_bytes = self.read.registration.max_region_bytes.as_u64();
+        if storage.piece_length > max_region_bytes
+            && storage.file.opened_length() > max_region_bytes
+        {
+            return Ok(None);
+        }
+        let request = |completed| -> ClientResult<_> {
+            Ok(ReadCachedSourceRequest {
+                peer_id: lane_id,
+                kind,
+                task: task_id.to_owned(),
+                file: storage.file.clone(),
+                piece_length: storage.piece_length,
+                max_region_bytes,
+                piece_offset: storage.piece.offset,
+                completed,
+                token: ReadToken::new(next_read_token()?),
+            })
+        };
+        let started = Instant::now();
+        // SAFETY: lookup-only cannot create a Source. Current Piece availability
+        // was established above; file identity separates unlink/recreation.
+        let source = match unsafe {
+            self.fabric
+                .register_cached_source(request(Vec::new())?, self.transfer_timeout)
+                .await
+        } {
+            Ok(source) => source,
+            Err(UrmaError::SourceCacheMiss) => {
+                if !self
+                    .storage
+                    .file_is_complete_for_cache(task_id, &storage)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                // SAFETY: canonical completed disk Pieces cover this whole file;
+                // reuse Dragonfly's existing completed-content immutability contract.
+                unsafe {
+                    self.fabric
+                        .register_cached_source(
+                            request(vec![0..storage.file.opened_length()])?,
+                            self.transfer_timeout,
+                        )
+                        .await
+                }
+                .map_err(client_error)?
+            }
+            Err(error) => return Err(client_error(error)),
+        };
+        Ok(Some((storage, source, started.elapsed().as_nanos() as u64)))
     }
 
     async fn open_piece_source(
@@ -701,7 +779,14 @@ impl UrmaServerHandler {
             lane_id,
             "start READ upload piece content"
         );
-        let Some(piece) = self.piece_metadata(locator.kind, &piece_id)? else {
+        let cached = self
+            .prepare_cached_source(lane_id, locator.kind, &locator.task_id, &piece_id)
+            .await?;
+        let piece = match &cached {
+            Some((storage, _, _)) => Some(storage.piece.clone()),
+            None => self.piece_metadata(locator.kind, &piece_id)?,
+        };
+        let Some(piece) = piece else {
             return Err(ClientError::Unknown(format!(
                 "READ piece {piece_id} is not available"
             )));
@@ -730,53 +815,75 @@ impl UrmaServerHandler {
                 retained_lane.abort("READ source retained after failure or cancellation");
             }
         });
+        let source_cached = cached.is_some();
         let source_open_start = Instant::now();
-        let source = self
-            .open_piece_source(locator.kind, &locator.task_id, &piece_id)
-            .await?;
-        let source_open_ns = source_open_start.elapsed().as_nanos() as u64;
-        let source_copy_start = Instant::now();
-        let memory = match source {
-            PieceSource::Mapped(mapped) => {
-                // ReadSource retains this mapping through verified revocation.
-                // Its page-aligned VA can therefore be registered directly.
-                if mapped.offset() != piece.offset || mapped.len() as u64 != accepted_length {
-                    return Err(ClientError::Unknown(format!(
+        let (published, source_open_ns, source_copy_ns) = if let Some((
+            _storage,
+            source,
+            register_ns,
+        )) = cached
+        {
+            // SAFETY: prepare_cached_source checked ordinary Task completion and
+            // the offered Piece comes from that same opened file.
+            let result = unsafe {
+                transfer
+                    .publish_cached_source_and_wait_read_done(
+                        source,
+                        register_ns,
+                        self.transfer_timeout,
+                    )
+                    .await
+            };
+            (result, 0, 0)
+        } else {
+            let source = self
+                .open_piece_source(locator.kind, &locator.task_id, &piece_id)
+                .await?;
+            let source_open_ns = source_open_start.elapsed().as_nanos() as u64;
+            let source_copy_start = Instant::now();
+            let memory = match source {
+                PieceSource::Mapped(mapped) => {
+                    // ReadSource retains this mapping through verified revocation.
+                    // Its page-aligned VA can therefore be registered directly.
+                    if mapped.offset() != piece.offset || mapped.len() as u64 != accepted_length {
+                        return Err(ClientError::Unknown(format!(
                         "READ piece {piece_id} source range {}+{} diverges from expected {}+{accepted_length}",
                         mapped.offset(), mapped.len(), piece.offset
                     )));
+                    }
+                    ReadSourceMemory::Mapped(mapped)
                 }
-                ReadSourceMemory::Mapped(mapped)
-            }
-            PieceSource::Reader(mut reader) => {
-                let mut bytes = Vec::with_capacity(usize::try_from(piece.length).unwrap_or(0));
-                reader.read_to_end(&mut bytes).await?;
-                if bytes.len() as u64 != accepted_length {
-                    return Err(ClientError::Unknown(format!(
+                PieceSource::Reader(mut reader) => {
+                    let mut bytes = Vec::with_capacity(usize::try_from(piece.length).unwrap_or(0));
+                    reader.read_to_end(&mut bytes).await?;
+                    if bytes.len() as u64 != accepted_length {
+                        return Err(ClientError::Unknown(format!(
                         "READ piece {piece_id} source bytes {} diverge from accepted length {accepted_length}",
                         bytes.len()
                     )));
+                    }
+                    ReadSourceMemory::Bytes(bytes.into_boxed_slice())
                 }
-                ReadSourceMemory::Bytes(bytes.into_boxed_slice())
-            }
-        };
-        let source_copy_ns = source_copy_start.elapsed().as_nanos() as u64;
-        let token = ReadToken::new(next_read_token()?);
+            };
+            let source_copy_ns = source_copy_start.elapsed().as_nanos() as u64;
+            let token = ReadToken::new(next_read_token()?);
 
-        // SAFETY: The version-6 handshake authenticated this lane and the
-        // accepted length was proven to match the immutable Storage Piece.
-        let (parent, pending) = match unsafe {
-            transfer.publish_and_wait_read_done(
-                ReadSourceRequest {
-                    peer_id: lane_id,
-                    backing: ReadBacking::new(memory, ()),
-                    token,
-                },
-                self.transfer_timeout,
-            )
-        }
-        .await
-        {
+            // SAFETY: the existing Piece path provides completed immutable bytes.
+            let result = unsafe {
+                transfer
+                    .publish_and_wait_read_done(
+                        ReadSourceRequest {
+                            peer_id: lane_id,
+                            backing: ReadBacking::new(memory, ()),
+                            token,
+                        },
+                        self.transfer_timeout,
+                    )
+                    .await
+            };
+            (result, source_open_ns, source_copy_ns)
+        };
+        let (parent, pending) = match published {
             Ok(published) => published,
             Err(failure) => {
                 if let Some(retained) = failure.retained_source {
@@ -792,6 +899,8 @@ impl UrmaServerHandler {
         collect_upload_piece_traffic_metrics(pending.completed_length);
         info!(
             piece_id,
+            source_cached,
+            source_id = ?pending.source_id,
             source_e2e_ns = source_e2e_start.elapsed().as_nanos() as u64,
             source_open_ns,
             source_copy_ns,
@@ -803,20 +912,32 @@ impl UrmaServerHandler {
             register_seg_ns = pending.register_stages.seg_ns,
             register_direct = pending.register_stages.direct,
             wait_read_done_ns = pending.wait_read_done_ns,
-            "urma READ source fully read; revoking export"
+            "{}",
+            if source_cached {
+                "urma READ cached source fully read; releasing lease"
+            } else {
+                "urma READ source fully read; revoking export"
+            }
         );
 
         // SAFETY: Construction of this handler required the deployment's
         // explicit provider-revocation gate. ReadDone/CancelDrained supplies
         // the cooperative Child drain, while the validated provider contract
-        // supplies the independent guarantee that successful unregister makes
-        // this descriptor/token generation unable to resume remote access.
+        // supplies the independent guarantee for dedicated Source unregister.
+        // Cached completion instead releases only this transfer's lease; the
+        // physical Source remains registered until cache eviction.
         let revoke_start = Instant::now();
         unsafe { parent.revoke_and_finish(pending).await }.map_err(client_error)?;
         info!(
             piece_id,
+            source_cached,
             revoke_ns = revoke_start.elapsed().as_nanos() as u64,
-            "urma READ source revoke finished"
+            "{}",
+            if source_cached {
+                "urma READ cached source lease released"
+            } else {
+                "urma READ source revoke finished"
+            }
         );
         collect_upload_piece_finished_metrics();
         Ok(())

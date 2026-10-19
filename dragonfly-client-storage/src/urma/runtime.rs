@@ -70,7 +70,7 @@ pub(crate) struct ReadCachedSourceRequest {
     pub(crate) piece_length: u64,
     pub(crate) max_region_bytes: u64,
     pub(crate) piece_offset: u64,
-    /// Completion evidence for this opened file, provided by Storage.
+    /// Full-file completion evidence from Storage. Empty means lookup-only.
     pub(crate) completed: Vec<std::ops::Range<u64>>,
     pub(crate) token: ReadToken,
 }
@@ -487,8 +487,7 @@ mod native {
         orphan_sources: super::super::read_source_workers::OrphanSources,
         orphan_children: super::super::read_source_workers::OrphanSources,
         cached_cleanup: super::super::read_source_workers::OrphanSources,
-        cache_scanner: Option<super::super::read_cache_maintenance::FileScanner>,
-        next_cache_scan: Instant,
+        next_cache_idle_check: Instant,
         next_cache_maintenance: Instant,
         cached_revocation_validated: bool,
         _not_send_sync: PhantomData<Rc<()>>,
@@ -612,8 +611,7 @@ mod native {
                 orphan_sources: Default::default(),
                 orphan_children: Default::default(),
                 cached_cleanup: Default::default(),
-                cache_scanner: None,
-                next_cache_scan: Instant::now(),
+                next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated,
                 _not_send_sync: PhantomData,
@@ -915,7 +913,7 @@ mod native {
         }
 
         /// Metadata decisions remain on this owner; fstat is delegated and
-        /// neither idle time nor unlink is treated as remote drain evidence.
+        /// idle time is never treated as remote drain evidence.
         pub(crate) fn maintain_cached_sources(&mut self) {
             let now = Instant::now();
             // Avoid walking cache metadata on each hot READ post/CQ iteration.
@@ -923,39 +921,10 @@ mod native {
                 return;
             }
             self.next_cache_maintenance = now + Duration::from_millis(10);
-            if let Some(scanner) = &mut self.cache_scanner {
-                match scanner.poll() {
-                    Ok(Some(result)) => {
-                        self.read
-                            .owners
-                            .retire_unlinked_cached_sources(result.unlinked);
-                        for (id, error) in result.errors {
-                            tracing::warn!(source_id = ?id, %error, "cache file scan failed; no unlink inferred");
-                        }
-                    }
-                    Ok(None) => (),
-                    Err(error) => {
-                        if self.accepting {
-                            tracing::warn!(%error, "cache scanner unavailable; idle cleanup remains active");
-                        }
-                        scanner.stop();
-                        // Do not repeatedly log a dead inspector. A fresh one
-                        // can start on a subsequent registration command.
-                        self.cache_scanner = None;
-                    }
-                }
-            }
-            if now >= self.next_cache_scan {
-                self.next_cache_scan = now + Duration::from_secs(1);
+            if now >= self.next_cache_idle_check {
+                self.next_cache_idle_check = now + Duration::from_secs(1);
                 if let Some(before) = now.checked_sub(SOURCE_CACHE_IDLE_TIMEOUT) {
                     self.read.owners.retire_idle_cached_sources(before);
-                }
-                if self.accepting {
-                    if let Some(scanner) = &mut self.cache_scanner {
-                        if let Err(error) = scanner.submit(self.read.owners.cached_source_files()) {
-                            tracing::warn!(%error, "cache file scan submission failed");
-                        }
-                    }
                 }
             }
             if !self.cached_revocation_validated {
@@ -1160,15 +1129,6 @@ mod native {
                 )));
                 return;
             }
-            if self.cache_scanner.is_none() {
-                match super::super::read_cache_maintenance::FileScanner::start() {
-                    Ok(scanner) => self.cache_scanner = Some(scanner),
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return;
-                    }
-                }
-            }
             let peer_generation = self
                 .peers
                 .get(&request.peer_id)
@@ -1192,7 +1152,12 @@ mod native {
                         },
                         Instant::now(),
                     )
-                    .map_err(|error| Error::Protocol(error.to_string()))
+                    .map_err(|error| match error {
+                        super::super::read_source_cache::CacheError::Missing => {
+                            Error::SourceCacheMiss
+                        }
+                        other => Error::Protocol(other.to_string()),
+                    })
             })();
             let claim = match claim {
                 Ok(claim) => claim,
@@ -1797,9 +1762,6 @@ mod native {
             }
             self.accepting = false;
             self.read.begin_shutdown();
-            if let Some(scanner) = &mut self.cache_scanner {
-                scanner.stop();
-            }
             progress(self);
             self.next_cache_maintenance = Instant::now();
             self.maintain_cached_sources();
@@ -1909,21 +1871,6 @@ mod native {
                     }
                 }
 
-                while self
-                    .cache_scanner
-                    .as_ref()
-                    .is_some_and(|scanner| !scanner.stopped())
-                    && !deadline_expired(source_deadline)
-                {
-                    thread::sleep(Duration::from_micros(100));
-                }
-                if let Some(scanner) = &mut self.cache_scanner {
-                    if let Err(error) = scanner.join() {
-                        return Err(Error::Shutdown {
-                            failures: vec![error.to_string()],
-                        });
-                    }
-                }
                 if let Some(mut endpoint) = self.endpoint.take() {
                     if let Err(error) = endpoint.jetty.close() {
                         failures.push(error.to_string());
@@ -2089,8 +2036,7 @@ mod native {
                 orphan_sources: Default::default(),
                 orphan_children: Default::default(),
                 cached_cleanup: Default::default(),
-                cache_scanner: None,
-                next_cache_scan: Instant::now(),
+                next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated: true,
                 _not_send_sync: PhantomData,
@@ -2159,19 +2105,21 @@ mod native {
         }
 
         #[test]
-        fn unlink_scan_drives_cached_native_cleanup_without_storage_gc_callback() {
+        fn idle_eviction_reclaims_unlinked_file_without_storage_gc_callback() {
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut runtime = runtime(events.clone());
             let (dir, claim) = register(&mut runtime);
             registered(&mut runtime, &claim);
-            runtime.cache_scanner =
-                Some(crate::urma::read_cache_maintenance::FileScanner::start().unwrap());
             let path = dir.path().join("task");
             std::fs::remove_file(&path).unwrap();
             std::fs::write(&path, [2; 64]).unwrap();
+            runtime
+                .read
+                .owners
+                .retire_idle_cached_sources(Instant::now());
             let deadline = Instant::now() + Duration::from_secs(2);
             while *claim.updates.borrow() != CacheState::Released {
-                assert!(Instant::now() < deadline, "unlink cleanup stalled");
+                assert!(Instant::now() < deadline, "idle cleanup stalled");
                 runtime.poll_source_workers();
                 runtime.maintain_cached_sources();
                 thread::sleep(Duration::from_millis(1));
@@ -2213,9 +2161,8 @@ mod native {
                 .expose_cached_source_lease(lease, 1)
                 .unwrap();
             runtime
-                .read
-                .owners
-                .retire_unlinked_cached_sources(vec![claim.source]);
+                .retire_read_source(ReadSourceId(claim.source))
+                .unwrap();
             runtime.maintain_cached_sources();
             assert!(!runtime.source_work_pending());
             assert_eq!(*events.lock().unwrap(), vec!["registered"]);

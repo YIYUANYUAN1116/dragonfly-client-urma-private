@@ -275,10 +275,7 @@ impl Content {
             error!("create {:?} failed: {}", task_dir, err);
         })?;
 
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(task_dir.join(task_id))
+        let f = fs::File::create(task_dir.join(task_id))
             .await
             .inspect_err(|err| {
                 error!("create {:?} failed: {}", task_dir, err);
@@ -289,27 +286,6 @@ impl Content {
         })?;
 
         Ok(task_dir.join(task_id))
-    }
-
-    /// Detaches a residual inode before publishing a new ordinary Task.
-    /// Caller serializes Task create/delete; an unlink failure must abort new
-    /// metadata publication rather than permit overwrite of an old mapping.
-    pub(crate) async fn reset_task_file(&self, task_id: &str) -> Result<()> {
-        let path = self.get_task_path(task_id);
-        self.fd_cache.remove(&path)?;
-        match fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::IO(error)),
-        }
-    }
-
-    pub(crate) async fn validate_task_file(&self, task_id: &str, length: u64) -> Result<()> {
-        let metadata = fs::metadata(self.get_task_path(task_id)).await?;
-        if !metadata.is_file() || metadata.len() != length {
-            return Err(Error::InvalidParameter);
-        }
-        Ok(())
     }
 
     /// Hard links the task content to the destination.
@@ -417,7 +393,7 @@ impl Content {
         ))
     }
 
-    /// Opens the current ordinary Task inode for a Storage completion snapshot.
+    /// Open the current Task file for an URMA cache lookup, bypassing the path FD cache.
     #[cfg(feature = "urma")]
     pub(crate) async fn open_task_read_source(
         &self,

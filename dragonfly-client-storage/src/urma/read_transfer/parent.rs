@@ -4,6 +4,9 @@
 //! require provider revocation before release; cached transfers release only
 //! their own lease. EOF and timeout never substitute for the required proof.
 
+#[cfg(test)]
+use crate::urma::runtime::ReadCachedSourceRequest;
+
 use super::protocol;
 use crate::urma::{
     fabric::{ReadCachedSourceLease, UrmaFabricHandle},
@@ -16,7 +19,7 @@ use crate::urma::{
     },
     read_source_lease::SourceLease,
     runtime::{
-        ReadCachedLeaseRequest, ReadCachedSourceRequest, ReadSourceAdmission, ReadSourceId,
+        ReadCachedLeaseRequest, ReadCachedSource, ReadSourceAdmission, ReadSourceId,
         ReadSourceOffer, ReadSourceRequest,
     },
     Error, Result,
@@ -294,15 +297,9 @@ impl ParentTransfer {
     /// # Safety
     /// Storage evidence belongs to the exact immutable file instance; all
     /// completion/range/provider and authenticated lane requirements apply.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Storage cached policy is enabled after independent cache reclamation"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) async unsafe fn publish_cached_and_wait_read_done(
-        mut self,
+        self,
         request: ReadCachedSourceRequest,
         completion_timeout: Duration,
     ) -> std::result::Result<(Self, PendingSourceCompletion), ParentTransportFailure> {
@@ -337,6 +334,38 @@ impl ParentTransfer {
                 .await
         }
         .map_err(fail)?;
+        unsafe {
+            self.publish_cached_source_and_wait_read_done(
+                source,
+                started.elapsed().as_nanos() as u64,
+                completion_timeout,
+            )
+            .await
+        }
+    }
+
+    /// # Safety
+    /// The prepared source belongs to this accepted Piece's immutable Storage
+    /// file and the authenticated lane; completion was checked before caching.
+    pub(crate) async unsafe fn publish_cached_source_and_wait_read_done(
+        mut self,
+        source: ReadCachedSource,
+        register_ns: u64,
+        completion_timeout: Duration,
+    ) -> std::result::Result<(Self, PendingSourceCompletion), ParentTransportFailure> {
+        let fail = |error| ParentTransportFailure {
+            error,
+            retained_source: None,
+        };
+        let piece_end = self
+            .piece_offset
+            .checked_add(self.piece_length)
+            .ok_or_else(|| fail(protocol("cached Piece file range overflow")))?;
+        if self.locator.kind != crate::rendezvous::PieceKind::Piece || self.awaiting_buffer_ready {
+            return Err(fail(protocol(
+                "cached source requires an admitted ordinary Task Piece",
+            )));
+        }
         if source.range.start > self.piece_offset || source.range.end < piece_end {
             return Err(fail(protocol("cached source does not cover this Piece")));
         }
@@ -355,13 +384,8 @@ impl ParentTransfer {
         let source_offset = lease.source_offset;
         let offer = lease.offer.for_cached_transfer();
         self.cached_lease = Some(lease);
-        self.publish_offer_and_wait(
-            offer,
-            source_offset,
-            started.elapsed().as_nanos() as u64,
-            completion_timeout,
-        )
-        .await
+        self.publish_offer_and_wait(offer, source_offset, register_ns, completion_timeout)
+            .await
     }
 
     async fn publish_offer_and_wait(

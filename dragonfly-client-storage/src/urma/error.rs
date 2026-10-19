@@ -8,6 +8,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     AlreadyInitialized,
+    /// Lookup-only request found no registered Region; no reservation was created.
+    SourceCacheMiss,
     InvalidConfiguration(String),
     Protocol(String),
     StartupTimeout {
@@ -65,6 +67,7 @@ pub(crate) fn native_error(operation: &'static str, error: FfiError) -> Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SourceCacheMiss => write!(f, "source cache miss"),
             Self::AlreadyInitialized => {
                 write!(f, "an URMA runtime already owns process-global liburma")
             }

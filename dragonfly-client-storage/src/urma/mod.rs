@@ -11,7 +11,6 @@ mod error;
 pub mod fabric;
 pub(crate) mod ffi;
 mod lane;
-mod read_cache_maintenance;
 mod read_child_owner;
 pub(crate) mod read_control;
 pub(crate) mod read_handoff;

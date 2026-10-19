@@ -301,28 +301,10 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         !self.source_cache.is_empty()
     }
 
-    pub(crate) fn cached_source_files(
-        &self,
-    ) -> Vec<(ReadOwnerId, std::sync::Weak<crate::content::ReadSourceFile>)> {
-        self.source_cache.scan_files()
-    }
-
     pub(crate) fn retire_idle_cached_sources(&mut self, before: std::time::Instant) {
         for id in self.source_cache.idle_candidates(before) {
             if let Err(error) = self.source_cache.retire(&mut self.registry, id) {
                 tracing::error!(source_id = ?id, %error, "cache idle retirement failed");
-            }
-        }
-    }
-
-    pub(crate) fn retire_unlinked_cached_sources(&mut self, ids: Vec<ReadOwnerId>) {
-        for id in ids {
-            // A delayed scan may refer to an already cleaned entry. IDs do not
-            // recycle, so it cannot retire a replacement file's Source.
-            if self.source_cache.contains(id) {
-                if let Err(error) = self.source_cache.retire(&mut self.registry, id) {
-                    tracing::error!(source_id = ?id, %error, "cache unlink retirement failed");
-                }
             }
         }
     }

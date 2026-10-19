@@ -1593,17 +1593,6 @@ impl<E: StorageEngineOwned> Metadata<E> {
         self.db.exists::<Piece>(piece_id.as_bytes())
     }
 
-    /// Tests for completed bytes without collecting every Piece in a large Task.
-    pub(crate) fn has_finished_pieces(&self, task_id: &str) -> Result<bool> {
-        for entry in self.db.prefix_iter_raw::<Piece>(task_id.as_bytes())? {
-            let (_, value) = entry?;
-            if Piece::deserialize_from(&value)?.is_finished() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Gets the piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub fn get_pieces(&self, task_id: &str) -> Result<Vec<Piece>> {

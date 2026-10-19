@@ -1,115 +1,93 @@
-//! Opened-file and completed-Piece evidence for ordinary Tasks. GC does not
-//! wait for native work: the short Storage guard ends when this snapshot is
-//! returned, and the opened inode remains owned independently.
+//! Thin Storage adapter for completed-file URMA caching. Existing Task creation,
+//! writes and GC are unchanged; this follows the same completed-Piece contract
+//! as map_upload_piece. No guard spans native operations or remote READ.
 
-use crate::{
-    content::{ReadRegionLayout, ReadSourceFile},
-    metadata::Piece,
-    Storage,
-};
-use dragonfly_client_core::{Error, Result};
-use std::{ops::Range, sync::Arc};
+use crate::{content::ReadSourceFile, metadata::Piece, Storage};
+use dragonfly_client_core::Result;
+use std::sync::Arc;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "cached server policy awaits write-lifecycle audit"
-    )
-)]
 pub(crate) struct ReadStorageSource {
     pub(crate) file: Arc<ReadSourceFile>,
     pub(crate) piece: Piece,
     pub(crate) piece_length: u64,
-    pub(crate) completed: Vec<Range<u64>>,
 }
 
 impl Storage {
-    /// This does not query the URMA cache. Task/Piece availability and the
-    /// current opened instance must be established before any cache lookup.
-    /// Only ordinary Tasks are covered; persistent hardlink publication uses
-    /// another lifecycle and must be integrated separately.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cached server policy awaits write-lifecycle audit"
-        )
-    )]
-    pub(crate) async fn read_source_snapshot(
+    /// Establish current Piece availability before looking in the URMA cache.
+    /// Missing/unsuitable disk content uses the existing Piece path instead.
+    pub(crate) async fn read_cache_source(
         &self,
         task_id: &str,
-        piece_number: u32,
-        max_region_bytes: u64,
-    ) -> Result<ReadStorageSource> {
-        let _guard = self.task_file_lifecycle.gate(task_id).read_owned().await;
-        let task = self
-            .metadata
-            .get_task(task_id)?
-            .ok_or_else(|| Error::TaskNotFound(task_id.into()))?;
-        let piece_length = task.piece_length.ok_or(Error::InvalidParameter)?;
-        let content_length = task.content_length.ok_or(Error::InvalidParameter)?;
-        let layout = ReadRegionLayout::new(content_length, piece_length, max_region_bytes)?;
-        let piece_offset = u64::from(piece_number)
-            .checked_mul(piece_length)
-            .ok_or(Error::InvalidParameter)?;
-        let window = layout.window(piece_offset)?;
-        let first = window.start / piece_length;
-        let end = window.end.div_ceil(piece_length);
-        if end > u64::from(u32::MAX) + 1 {
-            return Err(Error::InvalidParameter);
+        piece_id: &str,
+    ) -> Result<Option<ReadStorageSource>> {
+        let piece = self.wait_for_piece_finished(piece_id).await?;
+        if self.cache.contains_piece(task_id, piece_id).await {
+            return Ok(None);
         }
-        let file = self.content.open_task_read_source(task_id).await?;
-        if file.opened_length() != content_length {
-            return Err(Error::InvalidParameter);
+        let Some(task) = self.get_task(task_id)? else {
+            return Ok(None);
+        };
+        let (Some(piece_length), Some(content_length)) = (task.piece_length, task.content_length)
+        else {
+            return Ok(None);
+        };
+        if piece_length == 0
+            || content_length == 0
+            || self.piece_id(task_id, piece.number) != piece_id
+            || u64::from(piece.number).checked_mul(piece_length) != Some(piece.offset)
+            || piece.offset >= content_length
+            || piece.length != piece_length.min(content_length - piece.offset)
+        {
+            return Ok(None);
         }
-        let mut completed = Vec::new();
-        let mut requested = None;
-        // Bound each RocksDB query; a large Task never requires a full Task
-        // scan. The registration policy supplies a bounded region byte cap.
-        let mut cursor = first;
-        while cursor < end {
-            let batch_end = end.min(cursor + 256);
-            let ids: Vec<_> = (cursor..batch_end)
-                .map(|number| self.piece_id(task_id, number as u32))
-                .collect();
-            let refs: Vec<_> = ids.iter().map(String::as_str).collect();
-            let pieces = self.metadata.get_pieces_by_ids(&refs)?;
-            for (index, piece) in pieces.into_iter().enumerate() {
-                let Some(piece) = piece.filter(Piece::is_finished) else {
-                    continue;
-                };
-                let number = cursor + index as u64;
-                let offset = number
-                    .checked_mul(piece_length)
-                    .ok_or(Error::InvalidParameter)?;
-                let length = piece_length.min(content_length - offset);
-                if u64::from(piece.number) != number
-                    || piece.offset != offset
-                    || piece.length != length
-                {
-                    return Err(Error::InvalidParameter);
-                }
-                if self.cache.contains_piece(task_id, &ids[index]).await {
-                    // A preallocated file is not evidence that cached bytes
-                    // have been persisted in this inode.
-                    continue;
-                }
-                completed.push(offset..offset + length);
-                if piece.number == piece_number {
-                    requested = Some(piece);
-                }
+        // Preserve the existing mmap upload accounting around source opening.
+        self.metadata.upload_task_started(task_id);
+        let file = match self.content.open_task_read_source(task_id).await {
+            Ok(file) if file.opened_length() == content_length => {
+                self.metadata.upload_task_finished(task_id);
+                file
             }
-            cursor = batch_end;
-        }
-        let piece =
-            requested.ok_or_else(|| Error::PieceNotFound(self.piece_id(task_id, piece_number)))?;
-        Ok(ReadStorageSource {
+            _ => {
+                self.metadata.upload_task_failed(task_id);
+                return Ok(None);
+            }
+        };
+        Ok(Some(ReadStorageSource {
             file,
             piece,
             piece_length,
-            completed,
-        })
+        }))
+    }
+
+    /// Only called on a cache miss. Task.finished_at alone is insufficient:
+    /// a successful Range download also sets it. Reuse existing Piece records
+    /// and require exactly the canonical, completed, on-disk file coverage.
+    pub(crate) async fn file_is_complete_for_cache(
+        &self,
+        task_id: &str,
+        source: &ReadStorageSource,
+    ) -> Result<bool> {
+        let length = source.file.opened_length();
+        let mut pieces = self.get_pieces(task_id)?;
+        if pieces.len() as u64 != length.div_ceil(source.piece_length) {
+            return Ok(false);
+        }
+        pieces.sort_unstable_by_key(|piece| piece.number);
+        for (number, piece) in pieces.iter().enumerate() {
+            let offset = number as u64 * source.piece_length;
+            if u64::from(piece.number) != number as u64
+                || !piece.is_finished()
+                || piece.offset != offset
+                || piece.length != source.piece_length.min(length - offset)
+                || self
+                    .cache
+                    .contains_piece(task_id, &self.piece_id(task_id, piece.number))
+                    .await
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -132,7 +110,7 @@ mod tests {
         .await
         .unwrap();
         storage
-            .download_task_started(TASK, 8, 40, None)
+            .download_task_started(TASK, 8, 19, None)
             .await
             .unwrap();
         (dir, storage)
@@ -140,17 +118,19 @@ mod tests {
 
     async fn finish(storage: &Storage, number: u32, byte: u8) {
         let id = storage.piece_id(TASK, number);
+        let offset = u64::from(number) * 8;
+        let length = 8.min(19 - offset);
         storage
-            .download_piece_started(&id, number, u64::from(number) * 8, 8)
+            .download_piece_started(&id, number, offset, length)
             .await
             .unwrap();
-        let mut stream = futures::stream::iter([Ok(Bytes::from(vec![byte; 8]))]);
+        let mut stream = futures::stream::iter([Ok(Bytes::from(vec![byte; length as usize]))]);
         storage
             .download_piece_from_source_finished(
                 &id,
                 TASK,
-                u64::from(number) * 8,
-                8,
+                offset,
+                length,
                 &mut stream,
                 Duration::from_secs(2),
             )
@@ -158,117 +138,78 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn snapshot_uses_only_completed_disk_pieces_in_target_window() {
-        let (_dir, storage) = storage().await;
-        finish(&storage, 0, 1).await;
-        finish(&storage, 2, 2).await;
-        let snapshot = storage.read_source_snapshot(TASK, 2, 16).await.unwrap();
-        assert_eq!(snapshot.piece.number, 2);
-        assert_eq!(snapshot.piece_length, 8);
-        assert_eq!(snapshot.file.opened_length(), 40);
-        assert_eq!(snapshot.completed, vec![16..24]);
-        assert!(matches!(
-            storage.read_source_snapshot(TASK, 3, 16).await,
-            Err(Error::PieceNotFound(_))
-        ));
-        let first = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        assert_eq!(first.completed, vec![0..8]);
-        // Malformed finished metadata must not authorize a different range.
-        let invalid = storage.piece_id(TASK, 1);
+    async fn source(storage: &Storage) -> ReadStorageSource {
         storage
-            .metadata
-            .download_piece_started(&invalid, 1, 7, 8)
-            .unwrap();
-        storage
-            .metadata
-            .download_piece_finished(&invalid, 7, 8, "", None)
-            .unwrap();
-        assert!(matches!(
-            storage.read_source_snapshot(TASK, 0, 16).await,
-            Err(Error::InvalidParameter)
-        ));
-    }
-
-    #[tokio::test]
-    async fn snapshot_fd_survives_gc_and_same_task_recreation_without_holding_gc_guard() {
-        let (_dir, storage) = storage().await;
-        finish(&storage, 0, 1).await;
-        let old = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), storage.delete_task(TASK))
-            .await
-            .unwrap();
-        assert!(old.file.is_unlinked().unwrap());
-        assert!(matches!(
-            storage.read_source_snapshot(TASK, 0, 16).await,
-            Err(Error::TaskNotFound(_))
-        ));
-        storage
-            .download_task_started(TASK, 8, 40, None)
-            .await
-            .unwrap();
-        finish(&storage, 0, 2).await;
-        let new = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        assert_ne!(old.file.identity(), new.file.identity());
-        // SAFETY: completed bytes in the unlinked old inode are immutable.
-        let mapped = unsafe { old.file.map_range(0, 8) }.unwrap();
-        assert_eq!(mapped.as_slice(), &[1; 8]);
-    }
-
-    #[tokio::test]
-    async fn cancelled_gc_caller_still_invalidates_before_next_snapshot() {
-        let (_dir, storage) = storage().await;
-        let storage = Arc::new(storage);
-        finish(&storage, 0, 1).await;
-        let old = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        let gate = storage.task_file_lifecycle.gate(TASK);
-        let held = gate.clone().read_owned().await;
-        let delete_storage = storage.clone();
-        let caller = tokio::spawn(async move { delete_storage.delete_task(TASK).await });
-        // Tokio's fair RwLock rejects new readers once the writer is queued.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while gate.try_read().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        let reader_storage = storage.clone();
-        let reader =
-            tokio::spawn(async move { reader_storage.read_source_snapshot(TASK, 0, 16).await });
-        drop(held);
-        let result = tokio::time::timeout(Duration::from_secs(2), reader)
+            .read_cache_source(TASK, &storage.piece_id(TASK, 0))
             .await
             .unwrap()
-            .unwrap();
-        assert!(matches!(result, Err(Error::TaskNotFound(_))));
-        assert!(old.file.is_unlinked().unwrap());
-        assert!(storage.content.open_task_read_source(TASK).await.is_err());
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn task_recreation_detaches_residual_inode_and_discards_stale_completion() {
+    async fn range_finished_flag_does_not_authorize_incomplete_file() {
         let (_dir, storage) = storage().await;
         finish(&storage, 0, 1).await;
-        let old = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        // Simulate GC deleting Task metadata but leaving file/Piece metadata.
-        storage.metadata.delete_task(TASK).unwrap();
-        storage.prepare_download_task(TASK).unwrap();
+        storage.download_task_finished(TASK).unwrap();
+        assert!(storage.get_task(TASK).unwrap().unwrap().is_finished());
+        assert!(!storage
+            .file_is_complete_for_cache(TASK, &source(&storage).await)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn complete_file_accepts_short_final_piece_and_rejects_unfinished_or_malformed_records() {
+        let (_dir, storage) = storage().await;
+        for number in 0..3 {
+            finish(&storage, number, number as u8 + 1).await;
+        }
+        let source = source(&storage).await;
+        assert!(storage
+            .file_is_complete_for_cache(TASK, &source)
+            .await
+            .unwrap());
+        let id = storage.piece_id(TASK, 2);
+        storage.metadata.delete_piece(&id).unwrap();
         storage
-            .download_task_started(TASK, 8, 40, None)
+            .metadata
+            .download_piece_started(&id, 2, 16, 3)
+            .unwrap();
+        assert!(!storage
+            .file_is_complete_for_cache(TASK, &source)
+            .await
+            .unwrap());
+        storage
+            .metadata
+            .download_piece_finished(&id, 15, 3, "", None)
+            .unwrap();
+        assert!(!storage
+            .file_is_complete_for_cache(TASK, &source)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_remains_independent_and_recreated_file_has_distinct_cache_identity() {
+        let (_dir, storage) = storage().await;
+        for number in 0..3 {
+            finish(&storage, number, 1).await;
+        }
+        let old = source(&storage).await;
+        storage.delete_task(TASK).await;
+        assert!(old.file.is_unlinked().unwrap());
+        storage
+            .download_task_started(TASK, 8, 19, None)
             .await
             .unwrap();
-        assert!(old.file.is_unlinked().unwrap());
-        assert!(matches!(
-            storage.read_source_snapshot(TASK, 0, 16).await,
-            Err(Error::PieceNotFound(_))
-        ));
         finish(&storage, 0, 2).await;
-        let new = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
+        let new = source(&storage).await;
         assert_ne!(old.file.identity(), new.file.identity());
-        // SAFETY: recreation detached the old inode before any new writes.
+        assert!(!storage
+            .file_is_complete_for_cache(TASK, &new)
+            .await
+            .unwrap());
+        // SAFETY: completed old bytes are retained by this open, unlinked inode.
         assert_eq!(
             unsafe { old.file.map_range(0, 8) }.unwrap().as_slice(),
             &[1; 8]
@@ -276,40 +217,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_metadata_cannot_recreate_missing_content_or_resize_old_inode() {
-        let (_dir, storage) = storage().await;
-        finish(&storage, 0, 1).await;
-        let old = storage.read_source_snapshot(TASK, 0, 16).await.unwrap();
-        assert!(storage
-            .download_task_started(TASK, 16, 80, None)
+    async fn memory_cached_piece_does_not_authorize_preallocated_disk_bytes() {
+        let (_dir, mut storage) = storage().await;
+        for number in 0..3 {
+            finish(&storage, number, 1).await;
+        }
+        let source = source(&storage).await;
+        storage.cache.put_task(TASK, 19).await;
+        let id = storage.piece_id(TASK, 1);
+        storage
+            .cache
+            .write_piece(TASK, &id, Bytes::from_static(&[2; 8]))
             .await
-            .is_err());
-        assert_eq!(old.file.file_length().unwrap(), 40);
-        storage.content.delete_task(TASK).await.unwrap();
-        assert!(storage
-            .download_task_started(TASK, 8, 40, None)
+            .unwrap();
+        assert!(storage.cache.contains_piece(TASK, &id).await);
+        assert!(!storage
+            .file_is_complete_for_cache(TASK, &source)
             .await
-            .is_err());
-        assert!(storage.content.open_task_read_source(TASK).await.is_err());
+            .unwrap());
+        assert!(storage
+            .read_cache_source(TASK, &id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
-    async fn failed_residual_unlink_does_not_publish_new_task_metadata() {
+    async fn missing_or_wrong_sized_content_uses_piece_path() {
         let (_dir, storage) = storage().await;
-        storage.delete_task(TASK).await;
-        // A directory at the content path deterministically makes unlink fail,
-        // including when tests run as root.
-        let path = storage
-            .content
-            .dir
-            .join(crate::content::DEFAULT_TASK_DIR)
-            .join(&TASK[..3])
-            .join(TASK);
-        tokio::fs::create_dir(&path).await.unwrap();
+        finish(&storage, 0, 1).await;
+        storage.content.delete_task(TASK).await.unwrap();
         assert!(storage
-            .download_task_started(TASK, 8, 40, None)
+            .read_cache_source(TASK, &storage.piece_id(TASK, 0))
             .await
-            .is_err());
-        assert!(storage.get_task(TASK).unwrap().is_none());
+            .unwrap()
+            .is_none());
+        storage.content.create_task(TASK, 8).await.unwrap();
+        assert!(storage
+            .read_cache_source(TASK, &storage.piece_id(TASK, 0))
+            .await
+            .unwrap()
+            .is_none());
     }
 }
