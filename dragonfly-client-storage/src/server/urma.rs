@@ -898,6 +898,7 @@ impl UrmaServerHandler {
         };
         collect_upload_piece_traffic_metrics(pending.completed_length);
         info!(
+            task_id = %locator.task_id,
             piece_id,
             source_cached,
             source_id = ?pending.source_id,
@@ -927,8 +928,9 @@ impl UrmaServerHandler {
         // Cached completion instead releases only this transfer's lease; the
         // physical Source remains registered until cache eviction.
         let revoke_start = Instant::now();
-        unsafe { parent.revoke_and_finish(pending).await }.map_err(client_error)?;
+        unsafe { parent.finish(pending).await }.map_err(client_error)?;
         info!(
+            task_id = %locator.task_id,
             piece_id,
             source_cached,
             revoke_ns = revoke_start.elapsed().as_nanos() as u64,

@@ -562,6 +562,19 @@ impl ParentTransfer {
         ))
     }
 
+    /// Complete the owned transfer using its source lifetime policy.
+    ///
+    /// # Safety
+    /// The exact Child transfer is drained. Dedicated sources additionally
+    /// require the provider revocation proof used by revoke_and_finish.
+    pub(crate) async unsafe fn finish(self, pending: PendingSourceCompletion) -> Result<()> {
+        if self.cached_lease.is_some() {
+            unsafe { self.finish_cached(pending).await }
+        } else {
+            unsafe { self.revoke_and_finish(pending).await }
+        }
+    }
+
     /// Executes unregister/release and sends Done or Cancelled after the
     /// caller supplies the external provider revocation proof.
     ///
@@ -570,10 +583,7 @@ impl ParentTransfer {
     /// this exact source generation must have ceased and be unable to resume.
     /// ReadDone, CancelDrained, EOF or timeout alone do not satisfy this
     /// contract.
-    pub(crate) async unsafe fn revoke_and_finish(
-        mut self,
-        pending: PendingSourceCompletion,
-    ) -> Result<()> {
+    async unsafe fn revoke_and_finish(mut self, pending: PendingSourceCompletion) -> Result<()> {
         let lease = self
             .source_lease
             .as_mut()
@@ -618,17 +628,7 @@ impl ParentTransfer {
     /// The cooperative Child drain has been protocol validated and the exact
     /// transfer cannot resume READ work. The cached capability itself may stay
     /// live; physical retirement still requires provider-backed revocation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Storage cached policy follows independent reclamation"
-        )
-    )]
-    pub(crate) async unsafe fn finish_cached(
-        mut self,
-        pending: PendingSourceCompletion,
-    ) -> Result<()> {
+    async unsafe fn finish_cached(mut self, pending: PendingSourceCompletion) -> Result<()> {
         if self.identity != pending.identity || self.source_lease.is_some() {
             return Err(protocol("cached completion transfer mismatch"));
         }

@@ -321,7 +321,7 @@ async fn run_parent(device: &str, eid_index: u32, listener: &TcpListener) -> Res
     // state machine closed the import before sending the matching ReadDone.
     // This proves this test's cooperative lifetime; it does not establish the
     // provider-wide stale-descriptor revocation property used by production.
-    unsafe { parent.revoke_and_finish(pending).await }?;
+    unsafe { parent.finish(pending).await }?;
 
     // Done is queued on the control writer. Keep the lane alive until the
     // Child exits so dropping it cannot race delivery of the terminal frame.

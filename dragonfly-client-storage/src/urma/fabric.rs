@@ -1645,7 +1645,7 @@ mod tests {
             let (parent, pending) = publishing.await.map_err(|failure| failure.error).unwrap();
             // SAFETY: mock transport has no native accesses; the protocol has
             // validated this exact ReadDone/CancelDrained identity/generation.
-            let mut finishing = Box::pin(unsafe { parent.finish_cached(pending) });
+            let mut finishing = Box::pin(unsafe { parent.finish(pending) });
             let FabricCommand::ReleaseCachedSourceLease {
                 lease,
                 transfer,
