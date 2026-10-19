@@ -3,7 +3,7 @@
 //! Parent and Child can run on separate hosts so each endpoint owns an
 //! independent real URMA context, EID, and RM Jetty. The Parent hosts a boxed
 //! in-memory source, the Child owns a fabric-registered destination, and TCP
-//! carries the production version-5 control protocol. With no explicit role,
+//! carries the production version-6 control protocol. With no explicit role,
 //! the test also starts a local Child process for providers that support RM
 //! loopback. This covers handshake, Child-side peer import, transfer routing,
 //! READ completion, publication, CPU consumption, recycle, and native shutdown.
@@ -58,6 +58,7 @@ const EXACT_TEST_NAME: &str = "urma::read_session_harness::rm_read_memory_to_mem
 fn read_budget() -> ReadRuntimeConfig {
     let cap = |bytes: u64, entries| ReadCapacity { bytes, entries };
     ReadRuntimeConfig {
+        provider_revocation_validated: true,
         source_workers: 0,
         budget: ReadBudget {
             total: cap(4 * 1024 * 1024, 8),
@@ -133,7 +134,7 @@ async fn run_child(device: &str, eid_index: u32, address: &str) -> Result<()> {
         metadata_generation: 1,
     };
     let control = lane.register(identity)?;
-    // SAFETY: The version-5 handshake generation-binds the authenticated peer
+    // SAFETY: The version-6 handshake generation-binds the authenticated peer
     // descriptor and this process exclusively owns the destination Piece.
     let transfer = ChildTransfer::new(
         fabric.clone(),

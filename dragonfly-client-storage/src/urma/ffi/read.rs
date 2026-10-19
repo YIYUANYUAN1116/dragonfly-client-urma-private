@@ -9,6 +9,7 @@ pub(crate) mod source;
 /// Version 1 represents only pinned, non-cacheable, read-only/plain-token source
 /// Segments with no provider extension. An eventual exporter must reject any
 /// context it cannot represent exactly, rather than silently dropping attributes.
+#[derive(Clone)]
 pub(crate) struct ReadDescriptor {
     pub(crate) version: u32,
     pub(crate) eid: [u8; EID_SIZE],
@@ -35,6 +36,12 @@ pub(crate) struct ReadToken(u32);
 impl ReadToken {
     pub(crate) fn new(value: u32) -> Self {
         Self(value)
+    }
+
+    /// Reissues this cached source's capability for another authenticated
+    /// transfer. It remains valid until physical revocation, not lease release.
+    pub(crate) fn for_cached_transfer(&self) -> Self {
+        Self(self.0)
     }
 
     /// Consumes the bearer token for authenticated DFUR wire publication.

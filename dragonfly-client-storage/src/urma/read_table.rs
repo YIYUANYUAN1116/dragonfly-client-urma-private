@@ -90,6 +90,7 @@ pub(crate) enum ChildCreation<R> {
 pub(crate) struct ChildSpec {
     pub(crate) allocation_bytes: u64,
     pub(crate) piece_length: u64,
+    pub(crate) source_offset: u64,
     pub(crate) jetty_id: u32,
     pub(crate) max_outstanding: usize,
 }
@@ -118,6 +119,7 @@ pub(crate) enum ChildAdmission {
 pub(crate) struct ReadOwners<K, R: ChildResources> {
     registry: ReadOwnerRegistry<ReadBundle<K, R>>,
     source_cache: super::read_source_cache::ReadSourceCache,
+    cached_source_offers: BTreeMap<ReadOwnerId, super::runtime::ReadSourceOffer>,
     routes: BTreeMap<u64, ReadRoute>,
     // Only IDs are queued; resources and WR permits stay with their owners.
     blocked_children: BTreeSet<ReadOwnerId>,
@@ -130,6 +132,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         Ok(Self {
             registry: ReadOwnerRegistry::new(budget)?,
             source_cache: super::read_source_cache::ReadSourceCache::new(),
+            cached_source_offers: BTreeMap::new(),
             routes: BTreeMap::new(),
             blocked_children: BTreeSet::new(),
             progress_watchers: BTreeMap::new(),
@@ -263,39 +266,240 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         self.registry.reserve(peer, ReadDirection::Source, bytes)
     }
 
-    /// Owner-side entry for the upcoming cached registration command. It does
+    /// Owner-side entry for the cached registration command. It does
     /// not dispatch native work. Only register=true may dispatch; failures to
     /// dispatch must resolve through reject_worker_source, not drop the claim.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cached Fabric command follows the Region Offer change"
-        )
-    )]
-    pub(crate) fn claim_cached_worker_source(
+    pub(crate) fn claim_cached_source(
         &mut self,
         request: super::read_source_cache::CacheRequest<'_>,
         now: std::time::Instant,
     ) -> Result<super::read_source_cache::CacheClaim, super::read_source_cache::CacheError> {
-        let claim = self.source_cache.claim(&mut self.registry, request, now)?;
+        let claim = match self.source_cache.claim(&mut self.registry, request, now) {
+            Ok(claim) => claim,
+            Err(error) => {
+                if matches!(
+                    error,
+                    super::read_source_cache::CacheError::Registry(OwnerError::Capacity)
+                ) {
+                    // Start one LRU eviction; do not return its charge before
+                    // native cleanup. The caller still receives Capacity and
+                    // may retry after lifecycle progress or use fallback.
+                    if let Some(id) = self.source_cache.idle_candidates(now).first().copied() {
+                        self.source_cache.retire(&mut self.registry, id)?;
+                    }
+                }
+                return Err(error);
+            }
+        };
         if claim.register {
             self.source_cache.start_registration(claim.source)?;
         }
         Ok(claim)
     }
 
+    pub(crate) fn cached_sources_present(&self) -> bool {
+        !self.source_cache.is_empty()
+    }
+
+    pub(crate) fn cached_source_files(
+        &self,
+    ) -> Vec<(ReadOwnerId, std::sync::Weak<crate::content::ReadSourceFile>)> {
+        self.source_cache.scan_files()
+    }
+
+    pub(crate) fn retire_idle_cached_sources(&mut self, before: std::time::Instant) {
+        for id in self.source_cache.idle_candidates(before) {
+            if let Err(error) = self.source_cache.retire(&mut self.registry, id) {
+                tracing::error!(source_id = ?id, %error, "cache idle retirement failed");
+            }
+        }
+    }
+
+    pub(crate) fn retire_unlinked_cached_sources(&mut self, ids: Vec<ReadOwnerId>) {
+        for id in ids {
+            // A delayed scan may refer to an already cleaned entry. IDs do not
+            // recycle, so it cannot retire a replacement file's Source.
+            if self.source_cache.contains(id) {
+                if let Err(error) = self.source_cache.retire(&mut self.registry, id) {
+                    tracing::error!(source_id = ?id, %error, "cache unlink retirement failed");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cached_cleanup_candidates(&self) -> Vec<ReadOwnerId> {
+        self.source_cache.cleanup_candidates(&self.registry)
+    }
+
+    pub(crate) fn acquire_cached_source_lease(
+        &mut self,
+        source: ReadOwnerId,
+        peer: ReadPeer,
+        transfer: super::read_protocol::ReadTransferIdentity,
+        piece: std::ops::Range<u64>,
+    ) -> Result<super::runtime::ReadCachedLeaseOffer, super::read_source_cache::CacheError> {
+        use super::read_source_cache::CacheError;
+        let offer = self
+            .cached_source_offers
+            .get(&source)
+            .ok_or(CacheError::InvalidState)?
+            .for_cached_transfer();
+        let source_offset = piece
+            .start
+            .checked_sub(self.source_cache.range(source)?.start)
+            .ok_or(CacheError::IdentityMismatch)?;
+        let lease = self.source_cache.acquire(
+            &mut self.registry,
+            source,
+            peer,
+            transfer,
+            piece,
+            std::time::Instant::now(),
+        )?;
+        Ok(super::runtime::ReadCachedLeaseOffer {
+            lease,
+            offer,
+            source_offset,
+        })
+    }
+
+    /// Store validated credentials before a Ready notification becomes visible.
+    pub(crate) fn store_cached_source_offer(
+        &mut self,
+        id: ReadOwnerId,
+        offer: super::runtime::ReadSourceOffer,
+    ) -> Result<(), OwnerError> {
+        let range = self.source_cache.range(id).map_err(cache_owner_error)?;
+        if offer.id.0 != id
+            || offer.descriptor.length != range.end - range.start
+            || self.cached_source_offers.contains_key(&id)
+        {
+            return Err(OwnerError::WrongProof);
+        }
+        self.cached_source_offers.insert(id, offer);
+        Ok(())
+    }
+
+    /// # Safety
+    /// The pre-reserved cached range is immutable and provider validated.
+    pub(crate) unsafe fn register_cached_source(
+        &mut self,
+        id: ReadOwnerId,
+        runtime: &mut NativeRuntime,
+        backing: ReadBacking<K>,
+        token: ReadToken,
+    ) -> super::Result<()> {
+        use super::ffi::read::source::{ReadSource, SourceRegistration};
+        self.registry
+            .validate_source_reservation(id, backing.len())
+            .map_err(|error| super::Error::Protocol(error.to_string()))?;
+        // SAFETY: the caller supplies exact immutable backing/provider facts;
+        // the original physical reservation remains the sole byte charge.
+        let (source, mut error) = match unsafe { ReadSource::register(runtime, backing, &token) } {
+            SourceRegistration::Registered(source) => (source, None),
+            SourceRegistration::Uncertain { source, error } => (source, Some(error)),
+            SourceRegistration::Rejected { error, backing } => {
+                drop(backing);
+                self.reject_worker_source(id)
+                    .map_err(|error| super::Error::Protocol(error.to_string()))?;
+                return Err(super::native_error("register_cached_source", error));
+            }
+        };
+        let owner = SourceOwner::worker_source(source, error.is_some());
+        if error.is_none() {
+            match owner.descriptor() {
+                Ok(descriptor) => {
+                    if let Err(failure) = self.store_cached_source_offer(
+                        id,
+                        super::runtime::ReadSourceOffer {
+                            id: super::runtime::ReadSourceId(id),
+                            descriptor,
+                            token,
+                            register_stages: owner.register_stages().unwrap_or_default(),
+                        },
+                    ) {
+                        error = Some(FfiError::Contract(
+                            "cached descriptor identity/range mismatch",
+                        ));
+                        tracing::error!(%failure, "cached source credentials rejected; retaining owner");
+                    }
+                }
+                Err(failure) => error = Some(failure),
+            }
+        }
+        if let Err((failure, owner)) = self.source_cache.registered(
+            &mut self.registry,
+            id,
+            ReadBundle::Source(owner),
+            error.is_some(),
+        ) {
+            std::mem::forget(owner);
+            return Err(super::Error::Protocol(failure.to_string()));
+        }
+        match error {
+            None => Ok(()),
+            Some(error) => Err(super::native_error("register_cached_source", error)),
+        }
+    }
+
+    pub(crate) fn expose_cached_source_lease(
+        &mut self,
+        lease: super::read_source_cache::CacheLease,
+        generation: u64,
+    ) -> Result<(), super::read_source_cache::CacheError> {
+        self.source_cache.expose(lease, generation)
+    }
+
+    pub(crate) fn abandon_cached_source_lease(
+        &mut self,
+        lease: super::read_source_cache::CacheLease,
+    ) -> Result<(), super::read_source_cache::CacheError> {
+        self.source_cache
+            .abandon(&mut self.registry, lease, std::time::Instant::now())
+    }
+
+    /// # Safety
+    /// The exact transfer has drained under release_drained's contract.
+    pub(crate) unsafe fn release_cached_source_lease(
+        &mut self,
+        lease: super::read_source_cache::CacheLease,
+        transfer: super::read_protocol::ReadTransferIdentity,
+        generation: u64,
+    ) -> Result<(), super::read_source_cache::CacheError> {
+        unsafe {
+            self.source_cache.release_drained(
+                &mut self.registry,
+                lease,
+                transfer,
+                generation,
+                std::time::Instant::now(),
+            )
+        }
+    }
+
     pub(crate) fn reject_worker_source(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
         if self.source_cache.contains(id) {
             // SAFETY: this existing entry is only used for a known native
             // rejection or a job that failed dispatch before native execution.
-            return unsafe {
+            let result = unsafe {
                 self.source_cache
                     .registration_rejected(&mut self.registry, id)
             }
             .map_err(cache_owner_error);
+            if result.is_ok() {
+                self.cached_source_offers.remove(&id);
+            }
+            return result;
         }
         self.registry.release_unused_reservation(id)
+    }
+
+    pub(crate) fn cached_registration_lost(&mut self, id: ReadOwnerId) -> Result<(), OwnerError> {
+        // No worker ownership bundle was returned. Do not manufacture a ready
+        // worker slot or dispatch cleanup through a worker that has disappeared.
+        self.source_cache
+            .registration_lost(&mut self.registry, id)
+            .map_err(cache_owner_error)
     }
     pub(crate) fn attach_worker_source(
         &mut self,
@@ -365,6 +569,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.source_cache
                 .observe_cleanup(&self.registry, id)
                 .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+            if !self.source_cache.contains(id) {
+                self.cached_source_offers.remove(&id);
+            }
         }
         result
     }
@@ -410,6 +617,9 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
             self.source_cache
                 .observe_cleanup(&self.registry, id)
                 .map_err(|error| ReapError::Registry(cache_owner_error(error)))?;
+            if !self.source_cache.contains(id) {
+                self.cached_source_offers.remove(&id);
+            }
         }
         result
     }
@@ -427,6 +637,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
         factory: impl FnOnce() -> ChildCreation<R>,
     ) -> ChildAdmission {
         if spec.piece_length == 0
+            || spec.source_offset.checked_add(spec.piece_length).is_none()
             || spec.piece_length > spec.allocation_bytes
             || spec.max_outstanding == 0
             || spec.jetty_id == 0
@@ -465,6 +676,7 @@ impl<K, R: ChildResources> ReadOwners<K, R> {
                 id,
                 spec.jetty_id,
                 spec.piece_length,
+                spec.source_offset,
                 spec.max_outstanding,
                 resources,
             )
@@ -728,6 +940,265 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     #[test]
+    fn lost_cached_worker_retains_ownerless_reservation_and_blocks_cleanup_dispatch() {
+        use super::super::read_source_cache::CacheRequest;
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let (mut owners, _) = credited_setup(8, 4);
+        let claim = owners
+            .claim_cached_source(
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file,
+                    piece_length: 8,
+                    max_region_bytes: 64,
+                    piece_offset: 0,
+                    completed: &[0..64],
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        owners.cached_registration_lost(claim.source).unwrap();
+        assert_eq!(owners.usage().quarantined_bytes, 64);
+        assert_eq!(
+            owners.worker_source(claim.source),
+            Err(OwnerError::NotActive)
+        );
+        assert_eq!(
+            owners.reject_worker_source(claim.source),
+            Err(OwnerError::NotRetiring)
+        );
+        owners.begin_shutdown();
+        assert_eq!(owners.usage().source_bytes, 64);
+        assert!(!owners.drained());
+    }
+
+    #[test]
+    fn cached_sync_native_preflight_rejection_releases_existing_reservation() {
+        use super::super::{
+            ffi::read::source::ReadSourceMemory,
+            read_source_cache::{CacheRequest, CacheState},
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let (mut owners, _) = credited_setup(8, 4);
+        let claim = owners
+            .claim_cached_source(
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file,
+                    piece_length: 8,
+                    max_region_bytes: 64,
+                    piece_offset: 0,
+                    completed: &[0..64],
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let mut native = NativeRuntime::without_native();
+        // SAFETY: the closed native runtime rejects before any native call.
+        let result = unsafe {
+            owners.register_cached_source(
+                claim.source,
+                &mut native,
+                ReadBacking::new(ReadSourceMemory::Bytes(vec![1; 64].into_boxed_slice()), ()),
+                ReadToken::new(7),
+            )
+        };
+        assert!(result.is_err());
+        assert_eq!(*claim.updates.borrow(), CacheState::Released);
+        assert!(owners.drained());
+        assert!(owners.cached_source_offers.is_empty());
+    }
+
+    #[test]
+    fn cache_pressure_retires_lru_idle_source_without_returning_its_budget_early() {
+        use super::super::{
+            read_protocol::ReadTransferIdentity,
+            read_registry::VerifiedRetirement,
+            read_source_cache::{CacheError, CacheRequest, CacheState},
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, [1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let (mut owners, _) = credited_setup(8, 4);
+        let now = std::time::Instant::now();
+        let request = |task| CacheRequest {
+            kind: PieceKind::Piece,
+            task,
+            file: file.clone(),
+            piece_length: 8,
+            max_region_bytes: 64,
+            piece_offset: 0,
+            completed: &[0..64],
+        };
+        let mut claims = Vec::new();
+        for (index, task) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let claim = owners
+                .claim_cached_source(
+                    request(task),
+                    now + std::time::Duration::from_millis(index as u64),
+                )
+                .unwrap();
+            owners.attach_worker_source(claim.source, 0, false).unwrap();
+            claims.push(claim);
+        }
+        // The oldest Source is still used by a request, so evict b, not a.
+        let lease = owners
+            .source_cache
+            .acquire(
+                &mut owners.registry,
+                claims[0].source,
+                PEER,
+                ReadTransferIdentity {
+                    session_generation: 1,
+                    transfer_id: 1,
+                    metadata_generation: 1,
+                },
+                0..8,
+                now,
+            )
+            .unwrap();
+        let pressure_time = now + std::time::Duration::from_secs(1);
+        assert!(matches!(
+            owners.claim_cached_source(request("e"), pressure_time),
+            Err(CacheError::Registry(OwnerError::Capacity))
+        ));
+        assert_eq!(*claims[0].updates.borrow(), CacheState::Ready);
+        assert_eq!(*claims[1].updates.borrow(), CacheState::Retiring);
+        assert_eq!(*claims[2].updates.borrow(), CacheState::Ready);
+        assert_eq!(owners.usage().source_bytes, 256);
+        assert_eq!(owners.cached_cleanup_candidates(), vec![claims[1].source]);
+        // SAFETY: this test models worker metadata with no native resources.
+        let proof = unsafe { VerifiedRetirement::new(claims[1].source) };
+        owners
+            .complete_worker_cleanup(claims[1].source, Ok(ReapDecision::Retired(proof)))
+            .unwrap();
+        assert_eq!(owners.usage().source_bytes, 192);
+        let retry = owners
+            .claim_cached_source(request("e"), pressure_time)
+            .unwrap();
+        assert!(retry.register);
+        assert_eq!(owners.usage().source_bytes, 256);
+        owners.abandon_cached_source_lease(lease).unwrap();
+        owners.reject_worker_source(retry.source).unwrap();
+        owners.begin_shutdown();
+        for index in [0, 2, 3] {
+            // SAFETY: no native resources exist in this metadata-only test.
+            let proof = unsafe { VerifiedRetirement::new(claims[index].source) };
+            owners
+                .complete_worker_cleanup(claims[index].source, Ok(ReapDecision::Retired(proof)))
+                .unwrap();
+        }
+        assert!(owners.drained());
+    }
+
+    #[test]
+    fn cached_credentials_are_validated_before_leasing_and_removed_after_verified_cleanup() {
+        use super::super::{
+            read_protocol::ReadTransferIdentity,
+            read_registry::VerifiedRetirement,
+            read_source_cache::CacheRequest,
+            runtime::{ReadSourceId, ReadSourceOffer},
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = ReadSourceFile::open(&path).unwrap();
+        let (mut owners, _) = credited_setup(8, 4);
+        let claim = owners
+            .claim_cached_source(
+                CacheRequest {
+                    kind: PieceKind::Piece,
+                    task: "task",
+                    file,
+                    piece_length: 8,
+                    max_region_bytes: 64,
+                    piece_offset: 0,
+                    completed: &[0..64],
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let identity = ReadTransferIdentity {
+            session_generation: 1,
+            transfer_id: 2,
+            metadata_generation: 3,
+        };
+        assert!(owners
+            .acquire_cached_source_lease(claim.source, PEER, identity, 8..16)
+            .is_err());
+        let offer = |length| ReadSourceOffer {
+            id: ReadSourceId(claim.source),
+            descriptor: ReadDescriptor {
+                version: 1,
+                eid: [1; 16],
+                uasid: 1,
+                va: 4096,
+                length,
+                token_id: 1,
+                access: 2,
+                token_policy: 0,
+            },
+            token: ReadToken::new(7),
+            register_stages: Default::default(),
+        };
+        assert_eq!(
+            owners.store_cached_source_offer(claim.source, offer(32)),
+            Err(OwnerError::WrongProof)
+        );
+        owners
+            .store_cached_source_offer(claim.source, offer(64))
+            .unwrap();
+        assert!(owners
+            .acquire_cached_source_lease(claim.source, PEER, identity, 8..16)
+            .is_err());
+        owners.attach_worker_source(claim.source, 0, false).unwrap();
+        let leased = owners
+            .acquire_cached_source_lease(claim.source, PEER, identity, 8..16)
+            .unwrap();
+        assert_eq!(leased.source_offset, 8);
+        assert_eq!(leased.offer.descriptor.length, 64);
+        assert_eq!(leased.offer.token.into_wire_value(), 7);
+        assert_eq!(owners.usage().source_bytes, 64);
+        owners.abandon_cached_source_lease(leased.lease).unwrap();
+        owners.drain_peer(PEER).unwrap();
+        let replacement = ReadPeer {
+            id: PEER.id,
+            generation: PEER.generation + 1,
+        };
+        owners.activate_peer(replacement).unwrap();
+        assert!(owners
+            .acquire_cached_source_lease(claim.source, PEER, identity, 8..16)
+            .is_err());
+        let replacement_lease = owners
+            .acquire_cached_source_lease(claim.source, replacement, identity, 8..16)
+            .unwrap();
+        owners
+            .abandon_cached_source_lease(replacement_lease.lease)
+            .unwrap();
+        owners.retire(claim.source).unwrap();
+        // SAFETY: only worker metadata exists in this device-free test.
+        let proof = unsafe { VerifiedRetirement::new(claim.source) };
+        owners
+            .complete_worker_cleanup(claim.source, Ok(ReapDecision::Retired(proof)))
+            .unwrap();
+        assert!(owners.cached_source_offers.is_empty());
+        assert!(owners.drained());
+    }
+
+    #[test]
     fn cached_worker_registration_shares_budget_and_blocks_native_cleanup_until_all_leases_end() {
         use super::super::{
             read_protocol::ReadTransferIdentity,
@@ -755,8 +1226,8 @@ mod tests {
         };
         owners.activate_peer(other).unwrap();
         let now = std::time::Instant::now();
-        let first = owners.claim_cached_worker_source(request(), now).unwrap();
-        let second = owners.claim_cached_worker_source(request(), now).unwrap();
+        let first = owners.claim_cached_source(request(), now).unwrap();
+        let second = owners.claim_cached_source(request(), now).unwrap();
         assert!(first.register);
         assert!(!second.register);
         assert_eq!(first.source, second.source);
@@ -846,11 +1317,11 @@ mod tests {
         };
         let (mut owners, _) = credited_setup(8, 4);
         let now = std::time::Instant::now();
-        let rejected = owners.claim_cached_worker_source(request(), now).unwrap();
+        let rejected = owners.claim_cached_source(request(), now).unwrap();
         owners.reject_worker_source(rejected.source).unwrap();
         assert_eq!(*rejected.updates.borrow(), CacheState::Released);
         assert!(owners.drained());
-        let late = owners.claim_cached_worker_source(request(), now).unwrap();
+        let late = owners.claim_cached_source(request(), now).unwrap();
         owners.begin_shutdown();
         assert_eq!(*late.updates.borrow(), CacheState::Retiring);
         assert!(!owners.attach_worker_source(late.source, 3, false).unwrap());
@@ -905,6 +1376,7 @@ mod tests {
     const SPEC: ChildSpec = ChildSpec {
         allocation_bytes: 8,
         piece_length: 4,
+        source_offset: 0,
         jetty_id: 7,
         max_outstanding: 2,
     };
@@ -1381,6 +1853,10 @@ mod tests {
     fn invalid_spec_and_shutdown_never_invoke_factory() {
         let mut owners = setup();
         for spec in [
+            ChildSpec {
+                source_offset: u64::MAX,
+                ..SPEC
+            },
             ChildSpec {
                 allocation_bytes: 3,
                 ..SPEC

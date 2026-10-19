@@ -12,6 +12,7 @@ pub(crate) struct ReadChildRequest {
     pub(crate) peer_id: u16,
     pub(crate) allocation_bytes: u64,
     pub(crate) piece_length: u64,
+    pub(crate) source_offset: u64,
     pub(crate) max_outstanding: usize,
     pub(crate) descriptor: ReadDescriptor,
     pub(crate) token: ReadToken,
@@ -49,6 +50,44 @@ pub(crate) struct ReadSourceRequest {
     pub(crate) token: ReadToken,
 }
 
+pub(crate) struct ReadCachedLeaseRequest {
+    pub(crate) source: ReadSourceId,
+    pub(crate) peer_id: u16,
+    /// Snapshot from the registration/lookup response, not the current peer
+    /// found after a potentially long registration wait.
+    pub(crate) peer_generation: u8,
+    pub(crate) transfer: super::read_protocol::ReadTransferIdentity,
+    /// Absolute file range, matching the cache's registered file range. This
+    /// is distinct from the Segment-relative source_offset in a wire Offer.
+    pub(crate) piece: std::ops::Range<u64>,
+}
+
+pub(crate) struct ReadCachedSourceRequest {
+    pub(crate) peer_id: u16,
+    pub(crate) kind: crate::rendezvous::PieceKind,
+    pub(crate) task: String,
+    pub(crate) file: std::sync::Arc<crate::content::ReadSourceFile>,
+    pub(crate) piece_length: u64,
+    pub(crate) max_region_bytes: u64,
+    pub(crate) piece_offset: u64,
+    /// Completion evidence for this opened file, provided by Storage.
+    pub(crate) completed: Vec<std::ops::Range<u64>>,
+    pub(crate) token: ReadToken,
+}
+
+pub(crate) struct ReadCachedSource {
+    pub(crate) source: ReadSourceId,
+    pub(crate) peer_generation: u8,
+    pub(crate) range: std::ops::Range<u64>,
+    pub(crate) updates: tokio::sync::watch::Receiver<super::read_source_cache::CacheState>,
+}
+
+pub(crate) struct ReadCachedLeaseOffer {
+    pub(crate) lease: super::read_source_cache::CacheLease,
+    pub(crate) offer: ReadSourceOffer,
+    pub(crate) source_offset: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadSourceId(pub(crate) ReadOwnerId);
 
@@ -59,6 +98,19 @@ pub(crate) struct ReadSourceOffer {
     pub(crate) token: ReadToken,
     /// Diagnostic sub-phase timings of the native registration behind this offer.
     pub(crate) register_stages: ReadSourceStages,
+}
+
+impl ReadSourceOffer {
+    pub(crate) fn for_cached_transfer(&self) -> Self {
+        Self {
+            id: self.id,
+            descriptor: self.descriptor.clone(),
+            token: self.token.for_cached_transfer(),
+            // Lease acquisition performs no new native registration. Do not
+            // report the original pin timings again for every cache hit.
+            register_stages: ReadSourceStages::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,12 +173,14 @@ impl ReadRuntimeConfig {
             max_outstanding_per_piece: read.max_outstanding_per_piece as usize,
             buffer_alignment: 4096,
             source_workers: read.source_workers as usize,
+            provider_revocation_validated: read.provider_revocation_validated,
         })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadRuntimeConfig {
+    pub(crate) provider_revocation_validated: bool,
     pub(crate) source_workers: usize,
     pub(crate) budget: ReadBudget,
     pub(crate) max_outstanding_per_peer: usize,
@@ -228,6 +282,10 @@ mod native {
         thread,
         time::{Duration, Instant},
     };
+
+    // Internal cached-policy defaults until Storage configuration is exposed.
+    // This is independent of peer-session or control-connection lifetime.
+    const SOURCE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(420);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum JfcKind {
@@ -428,6 +486,11 @@ mod native {
         source_workers: Option<super::super::read_source_workers::SourceWorkers>,
         orphan_sources: super::super::read_source_workers::OrphanSources,
         orphan_children: super::super::read_source_workers::OrphanSources,
+        cached_cleanup: super::super::read_source_workers::OrphanSources,
+        cache_scanner: Option<super::super::read_cache_maintenance::FileScanner>,
+        next_cache_scan: Instant,
+        next_cache_maintenance: Instant,
+        cached_revocation_validated: bool,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -493,6 +556,7 @@ mod native {
                 };
             debug_assert_eq!(send_jfc.kind(), JfcKind::Send);
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
+            let cached_revocation_validated = config.read.provider_revocation_validated;
             let read = {
                 let read = config.read;
                 let credits = match ReadWrCredits::new(
@@ -547,6 +611,11 @@ mod native {
                 source_workers: None,
                 orphan_sources: Default::default(),
                 orphan_children: Default::default(),
+                cached_cleanup: Default::default(),
+                cache_scanner: None,
+                next_cache_scan: Instant::now(),
+                next_cache_maintenance: Instant::now(),
+                cached_revocation_validated,
                 _not_send_sync: PhantomData,
             })
         }
@@ -678,6 +747,7 @@ mod native {
             let spec = ChildSpec {
                 allocation_bytes: request.allocation_bytes,
                 piece_length: request.piece_length,
+                source_offset: request.source_offset,
                 jetty_id,
                 max_outstanding: request.max_outstanding,
             };
@@ -837,6 +907,100 @@ mod native {
                 .is_some_and(|workers| workers.pending())
                 || self.orphan_sources.pending()
                 || self.orphan_children.pending()
+                || self.cached_cleanup.pending()
+        }
+
+        pub(crate) fn cached_sources_present(&self) -> bool {
+            self.read.owners.cached_sources_present()
+        }
+
+        /// Metadata decisions remain on this owner; fstat is delegated and
+        /// neither idle time nor unlink is treated as remote drain evidence.
+        pub(crate) fn maintain_cached_sources(&mut self) {
+            let now = Instant::now();
+            // Avoid walking cache metadata on each hot READ post/CQ iteration.
+            if self.accepting && now < self.next_cache_maintenance {
+                return;
+            }
+            self.next_cache_maintenance = now + Duration::from_millis(10);
+            if let Some(scanner) = &mut self.cache_scanner {
+                match scanner.poll() {
+                    Ok(Some(result)) => {
+                        self.read
+                            .owners
+                            .retire_unlinked_cached_sources(result.unlinked);
+                        for (id, error) in result.errors {
+                            tracing::warn!(source_id = ?id, %error, "cache file scan failed; no unlink inferred");
+                        }
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        if self.accepting {
+                            tracing::warn!(%error, "cache scanner unavailable; idle cleanup remains active");
+                        }
+                        scanner.stop();
+                        // Do not repeatedly log a dead inspector. A fresh one
+                        // can start on a subsequent registration command.
+                        self.cache_scanner = None;
+                    }
+                }
+            }
+            if now >= self.next_cache_scan {
+                self.next_cache_scan = now + Duration::from_secs(1);
+                if let Some(before) = now.checked_sub(SOURCE_CACHE_IDLE_TIMEOUT) {
+                    self.read.owners.retire_idle_cached_sources(before);
+                }
+                if self.accepting {
+                    if let Some(scanner) = &mut self.cache_scanner {
+                        if let Err(error) = scanner.submit(self.read.owners.cached_source_files()) {
+                            tracing::warn!(%error, "cache file scan submission failed");
+                        }
+                    }
+                }
+            }
+            if !self.cached_revocation_validated {
+                return;
+            }
+            for id in self.read.owners.cached_cleanup_candidates() {
+                self.cached_cleanup.track(id, true, now);
+            }
+            for id in self.cached_cleanup.due(now) {
+                if !self.read.owners.contains(id) {
+                    self.cached_cleanup.retired(id);
+                    continue;
+                }
+                self.cached_cleanup.dispatched(id);
+                if let Some(workers) = &mut self.source_workers {
+                    let worker = self.read.owners.worker_source(id);
+                    // SAFETY: only known successful registration, retired
+                    // admission and zero identity-validated leases/operations
+                    // reach this queue. The deployment gate supplies the
+                    // additional stale-capability revocation contract; worker
+                    // cleanup releases backing only after unregister succeeds.
+                    let submitted = worker.as_ref().is_ok_and(|&worker| unsafe {
+                        workers.cached_cleanup(
+                            id,
+                            worker,
+                            UnregisterPermit::new(id),
+                            SourceRevoked::new(id),
+                        )
+                    });
+                    if !submitted {
+                        self.cached_cleanup.failed(id, now, true);
+                        tracing::warn!(source_id = ?id, ?worker, "cached source cleanup unavailable; retaining resources");
+                    }
+                } else {
+                    // SAFETY: same drained-known-source and validated provider
+                    // contract as above. Baseline workers=0 calls native here.
+                    let result = unsafe { self.release_read_source_after_revoke(ReadSourceId(id)) };
+                    if matches!(result, Ok(true)) {
+                        self.cached_cleanup.retired(id);
+                    } else {
+                        let terminal = self.cached_cleanup.failed(id, now, false);
+                        tracing::warn!(source_id = ?id, terminal, ?result, "cached source cleanup incomplete");
+                    }
+                }
+            }
         }
         pub(crate) fn abandon_read_source(&mut self, id: ReadSourceId, ready: bool) {
             if self.retire_read_source(id).is_ok() {
@@ -845,6 +1009,81 @@ mod native {
                     tracing::warn!(source_id = ?id, "source retained without automatic revocation proof");
                 }
             }
+        }
+
+        pub(crate) fn acquire_cached_source_lease(
+            &mut self,
+            request: ReadCachedLeaseRequest,
+        ) -> Result<ReadCachedLeaseOffer> {
+            if !self.accepting {
+                return Err(Error::Protocol("cached source admission stopped".into()));
+            }
+            let peer = self
+                .peers
+                .get(&request.peer_id)
+                .filter(|peer| !peer.is_draining() && peer.generation() == request.peer_generation)
+                .ok_or_else(|| Error::Protocol("cached source peer unavailable".into()))?;
+            self.read
+                .owners
+                .acquire_cached_source_lease(
+                    request.source.0,
+                    ReadPeer {
+                        id: request.peer_id,
+                        generation: peer.generation(),
+                    },
+                    request.transfer,
+                    request.piece,
+                )
+                .map_err(|error| Error::Protocol(error.to_string()))
+        }
+
+        pub(crate) fn expose_cached_source_lease(
+            &mut self,
+            lease: super::super::read_source_cache::CacheLease,
+            generation: u64,
+        ) -> Result<()> {
+            let expected = lease.peer();
+            if !self.accepting
+                || !self.peers.get(&expected.id).is_some_and(|peer| {
+                    peer.generation() == expected.generation && !peer.is_draining()
+                })
+            {
+                return Err(Error::Protocol(
+                    "cached source peer stopped before publication".into(),
+                ));
+            }
+            self.read
+                .owners
+                .expose_cached_source_lease(lease, generation)
+                .map_err(|error| Error::Protocol(error.to_string()))
+        }
+
+        pub(crate) fn abandon_cached_source_lease(
+            &mut self,
+            lease: super::super::read_source_cache::CacheLease,
+        ) {
+            // A lost release reply may be followed by this guard. An already
+            // removed opaque lease cannot affect another transfer/generation.
+            match self.read.owners.abandon_cached_source_lease(lease) {
+                Ok(()) | Err(super::super::read_source_cache::CacheError::Missing) => {}
+                Err(error) => tracing::warn!(%error, "cached source lease abandonment retained"),
+            }
+        }
+
+        /// # Safety
+        /// This exact transfer is drained; see ReadSourceCache::release_drained.
+        pub(crate) unsafe fn release_cached_source_lease(
+            &mut self,
+            lease: super::super::read_source_cache::CacheLease,
+            transfer: super::super::read_protocol::ReadTransferIdentity,
+            generation: u64,
+        ) -> Result<()> {
+            unsafe {
+                self.read
+                    .owners
+                    .release_cached_source_lease(lease, transfer, generation)
+            }
+            .map_err(|error| Error::Protocol(error.to_string()))
         }
         pub(crate) fn abandon_read_child(&mut self, id: ReadChildId) {
             if !self.read.owners.contains(id.0) {
@@ -905,6 +1144,118 @@ mod native {
                 }
                 let _ = reply.send(Err(Error::Protocol("source workers unavailable".into())));
             }
+        }
+
+        /// # Safety
+        /// Completion evidence belongs to this exact opened immutable file;
+        /// provider registration and revocation gates are deployment validated.
+        pub(crate) unsafe fn submit_cached_source_registration(
+            &mut self,
+            request: ReadCachedSourceRequest,
+            reply: tokio::sync::oneshot::Sender<Result<ReadCachedSource>>,
+        ) {
+            if !self.accepting || !self.cached_revocation_validated {
+                let _ = reply.send(Err(Error::Protocol(
+                    "cached source admission stopped or provider revocation not validated".into(),
+                )));
+                return;
+            }
+            if self.cache_scanner.is_none() {
+                match super::super::read_cache_maintenance::FileScanner::start() {
+                    Ok(scanner) => self.cache_scanner = Some(scanner),
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            let peer_generation = self
+                .peers
+                .get(&request.peer_id)
+                .filter(|peer| !peer.is_draining())
+                .map(|peer| peer.generation());
+            let claim = (|| {
+                if !self.accepting || peer_generation.is_none() {
+                    return Err(Error::Protocol("cached source peer unavailable".into()));
+                }
+                self.read
+                    .owners
+                    .claim_cached_source(
+                        super::super::read_source_cache::CacheRequest {
+                            kind: request.kind,
+                            task: &request.task,
+                            file: request.file,
+                            piece_length: request.piece_length,
+                            max_region_bytes: request.max_region_bytes,
+                            piece_offset: request.piece_offset,
+                            completed: &request.completed,
+                        },
+                        Instant::now(),
+                    )
+                    .map_err(|error| Error::Protocol(error.to_string()))
+            })();
+            let claim = match claim {
+                Ok(claim) => claim,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            if claim.register {
+                if let Some(workers) = &mut self.source_workers {
+                    if workers
+                        .register_file(claim.source, claim.file, claim.range.clone(), request.token)
+                        .is_err()
+                    {
+                        let _ = self.read.owners.reject_worker_source(claim.source);
+                    }
+                } else {
+                    // Baseline sourceWorkers=0 remains synchronous. There is no
+                    // shared Storage/Fabric mutex held across mmap or native calls.
+                    let mapped = unsafe {
+                        claim
+                            .file
+                            .map_range(claim.range.start, claim.range.end - claim.range.start)
+                    };
+                    match mapped {
+                        Ok(mapped) => {
+                            if let Some(native) = self.native.as_mut() {
+                                let backing = ReadBacking::new(
+                                    super::super::ffi::read::source::ReadSourceMemory::Mapped(
+                                        mapped,
+                                    ),
+                                    (),
+                                );
+                                let result = unsafe {
+                                    self.read.owners.register_cached_source(
+                                        claim.source,
+                                        native,
+                                        backing,
+                                        request.token,
+                                    )
+                                };
+                                if let Err(error) = result {
+                                    tracing::warn!(source_id = ?claim.source, %error, "cached source registration retained or rejected");
+                                }
+                            } else {
+                                let _ = self.read.owners.reject_worker_source(claim.source);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = self.read.owners.reject_worker_source(claim.source);
+                            tracing::warn!(source_id = ?claim.source, %error, "cached source mapping rejected");
+                        }
+                    }
+                }
+            }
+            // No resource guard: the cache owns the physical registration even
+            // when the first caller disappears before or after this reply.
+            let _ = reply.send(Ok(ReadCachedSource {
+                source: ReadSourceId(claim.source),
+                peer_generation: peer_generation.expect("validated requesting peer"),
+                range: claim.range,
+                updates: claim.updates,
+            }));
         }
         pub(crate) unsafe fn submit_source_cleanup(
             &mut self,
@@ -973,6 +1324,10 @@ mod native {
                                 let _ = owners.reject_worker_source(completion.id);
                                 Err(native_error("register_read_source", error))
                             }
+                            Registration::BackingRejected(error) => {
+                                let _ = owners.reject_worker_source(completion.id);
+                                Err(Error::Protocol(format!("source mapping rejected: {error}")))
+                            }
                             Registration::Uncertain(error) => {
                                 match owners.attach_worker_source(
                                     completion.id,
@@ -1014,6 +1369,56 @@ mod native {
                         };
                         let _ = reply.send(result);
                     }
+                    (Outcome::Register(registration), Reply::CachedRegister) => {
+                        match registration {
+                            Registration::Ready {
+                                descriptor,
+                                token,
+                                stages,
+                            } => {
+                                let credentials = owners.store_cached_source_offer(
+                                    completion.id,
+                                    ReadSourceOffer {
+                                        id: ReadSourceId(completion.id),
+                                        descriptor,
+                                        token,
+                                        register_stages: stages,
+                                    },
+                                );
+                                let uncertain = credentials.is_err();
+                                if let Err(error) = credentials {
+                                    tracing::error!(source_id = ?completion.id, %error, "cached source credentials rejected; retaining owner");
+                                }
+                                if let Err(error) = owners.attach_worker_source(
+                                    completion.id,
+                                    completion.worker,
+                                    uncertain,
+                                ) {
+                                    tracing::error!(source_id = ?completion.id, %error, "cached source worker result retained");
+                                }
+                            }
+                            Registration::Rejected(error) => {
+                                let _ = owners.reject_worker_source(completion.id);
+                                tracing::warn!(source_id = ?completion.id, ?error, "cached source registration rejected");
+                            }
+                            Registration::BackingRejected(error) => {
+                                let _ = owners.reject_worker_source(completion.id);
+                                tracing::warn!(source_id = ?completion.id, %error, "cached source mapping rejected");
+                            }
+                            Registration::Uncertain(error) => {
+                                let _ = owners.attach_worker_source(
+                                    completion.id,
+                                    completion.worker,
+                                    true,
+                                );
+                                tracing::warn!(source_id = ?completion.id, ?error, "cached source registration uncertain; retaining backing");
+                            }
+                        }
+                    }
+                    (Outcome::Lost, Reply::CachedRegister) => {
+                        let _ = owners.cached_registration_lost(completion.id);
+                        tracing::warn!(source_id = ?completion.id, "cached source worker lost; retaining backing and budget");
+                    }
                     (Outcome::Cleanup(result), Reply::Cleanup(reply)) => {
                         let result = owners
                             .complete_worker_cleanup(completion.id, result)
@@ -1041,6 +1446,26 @@ mod native {
                             tracing::warn!(source_id = ?completion.id, source_worker_index = completion.worker,
                                 terminal, error = ?result, "unpublished source cleanup incomplete");
                         }
+                    }
+                    (Outcome::Cleanup(result), Reply::CachedCleanup) => {
+                        let result = owners.complete_worker_cleanup(completion.id, result);
+                        if matches!(result, Ok(true)) {
+                            self.cached_cleanup.retired(completion.id);
+                        } else {
+                            let terminal =
+                                self.cached_cleanup
+                                    .failed(completion.id, Instant::now(), false);
+                            tracing::warn!(source_id = ?completion.id, terminal, ?result, "cached worker cleanup incomplete");
+                        }
+                    }
+                    (Outcome::Lost, Reply::CachedCleanup) => {
+                        let _ = owners.complete_worker_cleanup(
+                            completion.id,
+                            Err(ffi::FfiError::Contract("cached source cleanup worker lost")),
+                        );
+                        self.cached_cleanup
+                            .failed(completion.id, Instant::now(), true);
+                        tracing::warn!(source_id = ?completion.id, "cached cleanup worker lost; resources retained");
                     }
                     (Outcome::Lost, Reply::OrphanCleanup) => {
                         let _ = owners.complete_worker_cleanup(
@@ -1372,13 +1797,19 @@ mod native {
             }
             self.accepting = false;
             self.read.begin_shutdown();
+            if let Some(scanner) = &mut self.cache_scanner {
+                scanner.stop();
+            }
             progress(self);
+            self.next_cache_maintenance = Instant::now();
+            self.maintain_cached_sources();
             let mut failures = Vec::new();
             // Resolve every dispatched creation before closing the context. A
             // wedged worker is not joined synchronously: retain the whole Runtime.
             let source_deadline = deadline_after(Duration::from_secs(5));
             while self.source_work_pending() && !deadline_expired(source_deadline) {
                 self.poll_source_workers();
+                self.maintain_cached_sources();
                 progress(self);
                 let _ = self.poll_once();
                 thread::sleep(Duration::from_micros(100));
@@ -1388,28 +1819,6 @@ mod native {
                     failures: vec!["READ lifecycle work still pending; runtime retained".into()],
                 });
             }
-            if let Some(workers) = &mut self.source_workers {
-                workers.stop();
-            }
-            while self
-                .source_workers
-                .as_ref()
-                .is_some_and(|workers| !workers.stopped())
-                && !deadline_expired(source_deadline)
-            {
-                thread::sleep(Duration::from_micros(100));
-            }
-            if let Some(workers) = &mut self.source_workers {
-                if !workers.stopped() {
-                    return Err(Error::Shutdown {
-                        failures: vec!["source workers did not stop; runtime retained".into()],
-                    });
-                }
-                if let Err(error) = workers.join() {
-                    failures.push(error.to_string());
-                }
-            }
-
             let peer_ids = self.peers.keys().copied().collect::<Vec<_>>();
             for peer_id in peer_ids {
                 if let Err(error) = self.abort_peer_target(peer_id) {
@@ -1417,9 +1826,14 @@ mod native {
                 }
             }
             let drain_deadline = deadline_after(Duration::from_secs(1));
-            while !self.peers.is_empty() && !deadline_expired(drain_deadline) {
+            while (!self.peers.is_empty()
+                || self.cached_sources_present()
+                || self.source_work_pending())
+                && !deadline_expired(drain_deadline)
+            {
                 progress(self);
                 self.poll_source_workers();
+                self.maintain_cached_sources();
                 if let Err(error) = self.poll_once() {
                     push_unique_failure(&mut failures, error.to_string());
                 }
@@ -1445,6 +1859,7 @@ mod native {
                 {
                     progress(self);
                     self.poll_source_workers();
+                    self.maintain_cached_sources();
                     if let Err(error) = self.poll_once() {
                         push_unique_failure(&mut failures, error.to_string());
                     }
@@ -1466,7 +1881,49 @@ mod native {
             if self.peers.is_empty()
                 && self.completions.endpoint_ready_to_close()
                 && self.read.drained()
+                && !self.source_work_pending()
             {
+                // Workers stay alive through late registrations and the last
+                // cached lease completion. Stop only after all physical owners
+                // and lifecycle operations have safely drained.
+                let source_deadline = deadline_after(Duration::from_secs(5));
+                if let Some(workers) = &mut self.source_workers {
+                    workers.stop();
+                }
+                while self
+                    .source_workers
+                    .as_ref()
+                    .is_some_and(|workers| !workers.stopped())
+                    && !deadline_expired(source_deadline)
+                {
+                    thread::sleep(Duration::from_micros(100));
+                }
+                if let Some(workers) = &mut self.source_workers {
+                    if !workers.stopped() {
+                        return Err(Error::Shutdown {
+                            failures: vec!["source workers did not stop; runtime retained".into()],
+                        });
+                    }
+                    if let Err(error) = workers.join() {
+                        failures.push(error.to_string());
+                    }
+                }
+
+                while self
+                    .cache_scanner
+                    .as_ref()
+                    .is_some_and(|scanner| !scanner.stopped())
+                    && !deadline_expired(source_deadline)
+                {
+                    thread::sleep(Duration::from_micros(100));
+                }
+                if let Some(scanner) = &mut self.cache_scanner {
+                    if let Err(error) = scanner.join() {
+                        return Err(Error::Shutdown {
+                            failures: vec![error.to_string()],
+                        });
+                    }
+                }
                 if let Some(mut endpoint) = self.endpoint.take() {
                     if let Err(error) = endpoint.jetty.close() {
                         failures.push(error.to_string());
@@ -1512,6 +1969,12 @@ mod native {
                 }
             }
 
+            if !self.read.drained() || self.source_work_pending() {
+                push_unique_failure(
+                    &mut failures,
+                    "READ lifecycle not drained; runtime retained".into(),
+                );
+            }
             if failures.is_empty() {
                 ACTIVE.store(false, Ordering::Release);
                 Ok(())
@@ -1575,6 +2038,212 @@ mod native {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod maintenance_tests {
+        use super::*;
+        use crate::urma::{
+            read_protocol::ReadTransferIdentity,
+            read_source_cache::{CacheClaim, CacheRequest, CacheState},
+            read_source_workers::SourceWorkers,
+        };
+        use crate::{content::ReadSourceFile, rendezvous::PieceKind};
+        use std::sync::{Arc, Mutex};
+
+        fn runtime(events: Arc<Mutex<Vec<&'static str>>>) -> UrmaRuntime {
+            let read = ReadRuntimeConfig::try_from_config(
+                &dragonfly_client_config::dfdaemon::UrmaReadServer::default(),
+            )
+            .unwrap();
+            UrmaRuntime {
+                capability: super::super::tests::capability_for_depths(16, 16),
+                max_payload_size: 0,
+                endpoint_config: JettyConfig {
+                    send_depth: 16,
+                    recv_depth: 16,
+                    max_send_sge: 1,
+                    max_recv_sge: 1,
+                    token: 0,
+                    tp_type: crate::urma::TpType::Ctp,
+                },
+                recv_jfc: None,
+                send_jfc: None,
+                native: None,
+                endpoint: None,
+                accepting: true,
+                poisoned: false,
+                peer_ids: PeerIdAllocator::new(),
+                peers: HashMap::new(),
+                completions: CompletionRouter::new(16).unwrap(),
+                read: RuntimeReadState {
+                    owners: ReadOwners::new(read.budget).unwrap(),
+                    credits: ReadWrCredits::new(16, 16).unwrap(),
+                    max_outstanding_per_piece: 8,
+                    buffer_alignment: 4096,
+                    destination_pool: Rc::new(std::cell::RefCell::new(ReadBufferPool::new(
+                        read.budget.destination.bytes,
+                    ))),
+                },
+                source_workers: Some(SourceWorkers::cache_test_worker(events)),
+                orphan_sources: Default::default(),
+                orphan_children: Default::default(),
+                cached_cleanup: Default::default(),
+                cache_scanner: None,
+                next_cache_scan: Instant::now(),
+                next_cache_maintenance: Instant::now(),
+                cached_revocation_validated: true,
+                _not_send_sync: PhantomData,
+            }
+        }
+
+        fn register(runtime: &mut UrmaRuntime) -> (tempfile::TempDir, CacheClaim) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("task");
+            std::fs::write(&path, [1; 64]).unwrap();
+            let claim = runtime
+                .read
+                .owners
+                .claim_cached_source(
+                    CacheRequest {
+                        kind: PieceKind::Piece,
+                        task: "task",
+                        file: ReadSourceFile::open(&path).unwrap(),
+                        piece_length: 8,
+                        max_region_bytes: 64,
+                        piece_offset: 0,
+                        completed: &[0..64],
+                    },
+                    Instant::now(),
+                )
+                .unwrap();
+            assert!(runtime
+                .source_workers
+                .as_mut()
+                .unwrap()
+                .register_file(
+                    claim.source,
+                    claim.file.clone(),
+                    claim.range.clone(),
+                    ReadToken::new(1),
+                )
+                .is_ok());
+            (dir, claim)
+        }
+
+        fn registered(runtime: &mut UrmaRuntime, claim: &CacheClaim) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while *claim.updates.borrow() != CacheState::Ready {
+                assert!(Instant::now() < deadline);
+                runtime.poll_source_workers();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn shutdown_cleans_ready_and_late_registered_cache_before_stopping_worker() {
+            for wait_for_ready in [false, true] {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let mut runtime = runtime(events.clone());
+                let (_dir, claim) = register(&mut runtime);
+                if wait_for_ready {
+                    registered(&mut runtime, &claim);
+                }
+                runtime.shutdown().unwrap();
+                assert_eq!(*claim.updates.borrow(), CacheState::Released);
+                assert_eq!(
+                    *events.lock().unwrap(),
+                    vec!["registered", "cleaned", "worker stopped"]
+                );
+            }
+        }
+
+        #[test]
+        fn unlink_scan_drives_cached_native_cleanup_without_storage_gc_callback() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut runtime = runtime(events.clone());
+            let (dir, claim) = register(&mut runtime);
+            registered(&mut runtime, &claim);
+            runtime.cache_scanner =
+                Some(crate::urma::read_cache_maintenance::FileScanner::start().unwrap());
+            let path = dir.path().join("task");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, [2; 64]).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while *claim.updates.borrow() != CacheState::Released {
+                assert!(Instant::now() < deadline, "unlink cleanup stalled");
+                runtime.poll_source_workers();
+                runtime.maintain_cached_sources();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(runtime.read.owners.usage().source_bytes, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), vec![2; 64]);
+            runtime.shutdown().unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["registered", "cleaned", "worker stopped"]
+            );
+        }
+
+        #[test]
+        fn maintenance_waits_for_live_lease_and_provider_gate_before_native_cleanup() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut runtime = runtime(events.clone());
+            let (_dir, claim) = register(&mut runtime);
+            registered(&mut runtime, &claim);
+            let peer = ReadPeer {
+                id: 1,
+                generation: 1,
+            };
+            runtime.read.owners.activate_peer(peer).unwrap();
+            let transfer = ReadTransferIdentity {
+                session_generation: 1,
+                transfer_id: 1,
+                metadata_generation: 1,
+            };
+            let lease = runtime
+                .read
+                .owners
+                .acquire_cached_source_lease(claim.source, peer, transfer, 0..8)
+                .unwrap()
+                .lease;
+            runtime
+                .read
+                .owners
+                .expose_cached_source_lease(lease, 1)
+                .unwrap();
+            runtime
+                .read
+                .owners
+                .retire_unlinked_cached_sources(vec![claim.source]);
+            runtime.maintain_cached_sources();
+            assert!(!runtime.source_work_pending());
+            assert_eq!(*events.lock().unwrap(), vec!["registered"]);
+            assert_eq!(runtime.read.owners.usage().source_bytes, 64);
+            // SAFETY: mock backing has no native grant or remote accesses.
+            unsafe {
+                runtime
+                    .read
+                    .owners
+                    .release_cached_source_lease(lease, transfer, 1)
+                    .unwrap();
+            }
+            runtime.cached_revocation_validated = false;
+            runtime.next_cache_maintenance = Instant::now();
+            runtime.maintain_cached_sources();
+            assert!(!runtime.source_work_pending());
+            assert_eq!(*events.lock().unwrap(), vec!["registered"]);
+            runtime.cached_revocation_validated = true;
+            runtime.next_cache_maintenance = Instant::now();
+            runtime.maintain_cached_sources();
+            assert!(runtime.source_work_pending());
+            runtime.shutdown().unwrap();
+            assert_eq!(*claim.updates.borrow(), CacheState::Released);
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["registered", "cleaned", "worker stopped"]
+            );
+        }
     }
 
     fn push_unique_failure(failures: &mut Vec<String>, failure: String) {
@@ -1677,7 +2346,7 @@ pub(crate) use native::UrmaRuntime;
 mod tests {
     use super::*;
 
-    fn capability_for_depths(send: u32, recv: u32) -> UrmaDeviceCapability {
+    pub(super) fn capability_for_depths(send: u32, recv: u32) -> UrmaDeviceCapability {
         UrmaDeviceCapability {
             transport_type: 0,
             transport_modes: crate::urma::TransportMode::Rm as u32,

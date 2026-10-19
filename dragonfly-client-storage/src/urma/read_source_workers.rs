@@ -29,6 +29,7 @@ pub(crate) enum Registration {
         stages: ReadSourceStages,
     },
     Rejected(FfiError),
+    BackingRejected(String),
     Uncertain(FfiError),
 }
 // Constructed inside its thread, so Backend itself need not move native sources.
@@ -109,6 +110,13 @@ enum Job {
         backing: ReadBacking<()>,
         token: ReadToken,
     },
+    RegisterFile {
+        submitted: Instant,
+        id: ReadOwnerId,
+        file: std::sync::Arc<crate::content::ReadSourceFile>,
+        range: std::ops::Range<u64>,
+        token: ReadToken,
+    },
     Cleanup {
         submitted: Instant,
         id: ReadOwnerId,
@@ -129,8 +137,11 @@ pub(crate) struct Completion {
 }
 pub(crate) enum Reply {
     Register(ResourceReply<ReadSourceAdmission>),
+    /// The cache owns this operation, not the first request's reply/guard.
+    CachedRegister,
     Cleanup(oneshot::Sender<Result<bool>>),
     OrphanCleanup,
+    CachedCleanup,
 }
 struct Pending {
     worker: usize,
@@ -143,7 +154,8 @@ struct Worker {
 }
 /// Owner-only bookkeeping; entries hold identities, never native resources.
 /// Source callers allow automatic cleanup only for definitely registered,
-/// unpublished offers; Child callers allow it only after consumer abandonment.
+/// unpublished offers; cached callers additionally require all leases drained
+/// and the provider revocation gate. Child callers require consumer abandonment.
 #[derive(Default)]
 pub(crate) struct OrphanSources {
     entries: BTreeMap<ReadOwnerId, Orphan>,
@@ -203,6 +215,70 @@ pub(crate) struct SourceWorkers {
     stopping: bool,
 }
 impl SourceWorkers {
+    #[cfg(test)]
+    pub(crate) fn cache_test_worker(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Self {
+        struct Backend {
+            sources: BTreeMap<ReadOwnerId, ReadBacking<()>>,
+            events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for Backend {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push("worker stopped");
+                assert!(
+                    self.sources.is_empty(),
+                    "worker stopped before cache cleanup"
+                );
+            }
+        }
+        impl LocalBackend for Backend {
+            fn register(
+                &mut self,
+                id: ReadOwnerId,
+                backing: ReadBacking<()>,
+                token: ReadToken,
+            ) -> Registration {
+                self.events.lock().unwrap().push("registered");
+                let length = backing.len();
+                self.sources.insert(id, backing);
+                Registration::Ready {
+                    descriptor: ReadDescriptor {
+                        version: 1,
+                        eid: [1; 16],
+                        uasid: 1,
+                        va: 4096,
+                        length,
+                        token_id: 1,
+                        access: 2,
+                        token_policy: 0,
+                    },
+                    token,
+                    stages: Default::default(),
+                }
+            }
+            fn cleanup(
+                &mut self,
+                id: ReadOwnerId,
+                _permit: UnregisterPermit,
+                revoked: Option<SourceRevoked>,
+            ) -> std::result::Result<ReapDecision, FfiError> {
+                assert!(revoked.is_some());
+                assert!(self.sources.remove(&id).is_some());
+                self.events.lock().unwrap().push("cleaned");
+                // SAFETY: mock backing has no native registration or remote access.
+                Ok(ReapDecision::Retired(unsafe {
+                    super::read_registry::VerifiedRetirement::new(id)
+                }))
+            }
+        }
+        Self::start_factories(vec![move || Backend {
+            sources: BTreeMap::new(),
+            events,
+        }])
+        .unwrap()
+    }
+
     pub(crate) fn start(contexts: Vec<SourceContext>) -> Result<Self> {
         Self::start_factories(
             contexts
@@ -244,6 +320,38 @@ impl SourceWorkers {
                                 "register",
                                 Outcome::Register(backend.register(id, backing, token)),
                             ),
+                            Job::RegisterFile {
+                                id,
+                                file,
+                                range,
+                                token,
+                                submitted,
+                            } => {
+                                // SAFETY: the unsafe cached registration command
+                                // supplies immutable completed bytes; this exact
+                                // opened file is retained by cache and worker.
+                                let mapped = range
+                                    .end
+                                    .checked_sub(range.start)
+                                    .ok_or(dragonfly_client_core::Error::InvalidParameter)
+                                    .and_then(|length| unsafe {
+                                        file.map_range(range.start, length)
+                                    });
+                                let outcome = match mapped {
+                                    Ok(mapped) => backend.register(
+                                        id,
+                                        ReadBacking::new(
+                                            super::ffi::read::source::ReadSourceMemory::Mapped(
+                                                mapped,
+                                            ),
+                                            (),
+                                        ),
+                                        token,
+                                    ),
+                                    Err(error) => Registration::BackingRejected(error.to_string()),
+                                };
+                                (id, submitted, "register", Outcome::Register(outcome))
+                            }
                             Job::Cleanup {
                                 id,
                                 permit,
@@ -312,7 +420,44 @@ impl SourceWorkers {
         token: ReadToken,
         reply: ResourceReply<ReadSourceAdmission>,
     ) -> std::result::Result<(), Reply> {
-        let reply = Reply::Register(reply);
+        self.enqueue_registration(
+            id,
+            Job::Register {
+                id,
+                backing,
+                token,
+                submitted: Instant::now(),
+            },
+            Reply::Register(reply),
+        )
+    }
+
+    pub(crate) fn register_file(
+        &mut self,
+        id: ReadOwnerId,
+        file: std::sync::Arc<crate::content::ReadSourceFile>,
+        range: std::ops::Range<u64>,
+        token: ReadToken,
+    ) -> std::result::Result<(), Reply> {
+        self.enqueue_registration(
+            id,
+            Job::RegisterFile {
+                id,
+                file,
+                range,
+                token,
+                submitted: Instant::now(),
+            },
+            Reply::CachedRegister,
+        )
+    }
+
+    fn enqueue_registration(
+        &mut self,
+        id: ReadOwnerId,
+        job: Job,
+        reply: Reply,
+    ) -> std::result::Result<(), Reply> {
         if self.stopping || self.pending.contains_key(&id) {
             return Err(reply);
         }
@@ -323,16 +468,7 @@ impl SourceWorkers {
             return Err(reply);
         };
         self.next = (worker + 1) % self.workers.len();
-        if self.workers[worker]
-            .tx
-            .send(Job::Register {
-                id,
-                backing,
-                token,
-                submitted: Instant::now(),
-            })
-            .is_err()
-        {
+        if self.workers[worker].tx.send(job).is_err() {
             self.workers[worker].failed = true;
             return Err(reply); // No native call occurred; caller releases reservation.
         }
@@ -358,6 +494,16 @@ impl SourceWorkers {
         revoked: SourceRevoked,
     ) -> bool {
         self.enqueue_cleanup(id, worker, permit, Some(revoked), Reply::OrphanCleanup)
+            .is_ok()
+    }
+    pub(crate) fn cached_cleanup(
+        &mut self,
+        id: ReadOwnerId,
+        worker: usize,
+        permit: UnregisterPermit,
+        revoked: SourceRevoked,
+    ) -> bool {
+        self.enqueue_cleanup(id, worker, permit, Some(revoked), Reply::CachedCleanup)
             .is_ok()
     }
     fn enqueue_cleanup(
@@ -482,6 +628,7 @@ mod tests {
         entered: mpsc::Sender<thread::ThreadId>,
         cleanup_attempts: AtomicUsize,
         mode: AtomicUsize, // 0 success, 1 uncertain, 2 clean reject, 3 panic
+        mapped_bytes: Mutex<Vec<Vec<u8>>>,
     }
     impl Gate {
         fn unblock(&self) {
@@ -514,6 +661,15 @@ mod tests {
                 return Registration::Rejected(FfiError::Status(-12));
             }
             let length = backing.len();
+            let (memory, keepalive) = backing.into_parts();
+            if let super::super::ffi::read::source::ReadSourceMemory::Mapped(mapped) = &memory {
+                self.gate
+                    .mapped_bytes
+                    .lock()
+                    .unwrap()
+                    .push(mapped.as_slice().to_vec());
+            }
+            let backing = ReadBacking::new(memory, keepalive);
             self.sources.insert(id, backing);
             if mode == 1 {
                 return Registration::Uncertain(FfiError::Status(-5));
@@ -560,6 +716,7 @@ mod tests {
             entered: tx,
             cleanup_attempts: AtomicUsize::new(0),
             mode: AtomicUsize::new(0),
+            mapped_bytes: Mutex::new(Vec::new()),
         });
         let factories = (0..count)
             .map(|_| {
@@ -641,6 +798,70 @@ mod tests {
         }
         pool.join().unwrap();
     }
+    #[test]
+    fn cached_mapping_uses_opened_inode_after_unlink_and_path_replacement() {
+        let (mut pool, gate, entered) = setup(1);
+        let first = id();
+        let receiver = submit(&mut pool, first);
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, (0u8..64).collect::<Vec<_>>()).unwrap();
+        let file = crate::content::ReadSourceFile::open(&path).unwrap();
+        let mut registry = registry();
+        let source = registry.reserve_source(16).unwrap();
+        assert!(pool
+            .register_file(source, file, 8..24, ReadToken::new(9))
+            .is_ok());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![255; 64]).unwrap();
+        gate.unblock();
+        let results = wait(&mut pool, 2);
+        assert!(results
+            .iter()
+            .any(|(completion, reply)| completion.id == source
+                && matches!(reply, Reply::CachedRegister)
+                && matches!(
+                    completion.outcome,
+                    Outcome::Register(Registration::Ready { .. })
+                )));
+        assert_eq!(
+            *gate.mapped_bytes.lock().unwrap(),
+            vec![(8u8..24).collect::<Vec<_>>()]
+        );
+        drop(receiver);
+        finish(&mut pool);
+        registry.release_unused_reservation(source).unwrap();
+    }
+
+    #[test]
+    fn cached_mapping_rejection_does_not_enter_native_backend() {
+        let (mut pool, _gate, entered) = setup(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 8]).unwrap();
+        let file = crate::content::ReadSourceFile::open(&path).unwrap();
+        let mut registry = registry();
+        let source = registry.reserve_source(8).unwrap();
+        assert!(pool
+            .register_file(source, file, 8..16, ReadToken::new(9))
+            .is_ok());
+        let results = wait(&mut pool, 1);
+        assert!(matches!(
+            results.as_slice(),
+            [(
+                Completion {
+                    outcome: Outcome::Register(Registration::BackingRejected(_)),
+                    ..
+                },
+                Reply::CachedRegister
+            )]
+        ));
+        assert!(entered.try_recv().is_err());
+        registry.release_unused_reservation(source).unwrap();
+        finish(&mut pool);
+    }
+
     #[test]
     fn completion_sent_after_exit_snapshot_is_preserved_before_lost_detection() {
         let completed_id = id();

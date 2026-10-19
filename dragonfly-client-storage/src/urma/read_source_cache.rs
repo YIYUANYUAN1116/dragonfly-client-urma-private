@@ -93,6 +93,11 @@ pub(crate) struct CacheLease {
     peer: ReadPeer,
     transfer: ReadTransferIdentity,
 }
+impl CacheLease {
+    pub(crate) fn peer(self) -> ReadPeer {
+        self.peer
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeaseState {
@@ -113,6 +118,9 @@ struct Region {
     file: Arc<ReadSourceFile>,
     state: CacheState,
     registration_pending: bool,
+    /// Only a known successful registration may use automatic cleanup. A
+    /// failed/lost registration needs separate grant rollback evidence.
+    registration_succeeded: bool,
     changed: watch::Sender<CacheState>,
     leases: BTreeMap<ReadSourceLeaseId, LeaseEntry>,
     /// Updated when a lease is acquired/released, not when a waiter polls.
@@ -148,6 +156,15 @@ impl ReadSourceCache {
 
     pub(crate) fn contains(&self, id: ReadOwnerId) -> bool {
         self.regions.contains_key(&id)
+    }
+
+    pub(crate) fn range(&self, id: ReadOwnerId) -> Result<Range<u64>, CacheError> {
+        Ok(self
+            .regions
+            .get(&id)
+            .ok_or(CacheError::Missing)?
+            .range
+            .clone())
     }
 
     /// No native call or await occurs between selecting a range, charging it,
@@ -231,6 +248,7 @@ impl ReadSourceCache {
                         file: request.file.clone(),
                         state: CacheState::Reserved,
                         registration_pending: false,
+                        registration_succeeded: false,
                         changed,
                         leases: BTreeMap::new(),
                         last_used: now,
@@ -282,6 +300,7 @@ impl ReadSourceCache {
             return Err((error.into(), owner));
         }
         region.registration_pending = false;
+        region.registration_succeeded = !uncertain;
         if uncertain {
             // The reservation was validated by attach; the entry still exists.
             registry
@@ -391,6 +410,9 @@ impl ReadSourceCache {
         lease: CacheLease,
         segment_generation: u64,
     ) -> Result<(), CacheError> {
+        if !self.accepting {
+            return Err(CacheError::Shutdown);
+        }
         let entry = self.lease_mut(lease)?;
         if segment_generation == 0 || entry.state != LeaseState::Unpublished {
             return Err(CacheError::InvalidState);
@@ -558,6 +580,37 @@ impl ReadSourceCache {
             .collect();
         idle.sort_unstable();
         idle.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// Weak handles keep a queued filesystem scan from extending cache backing
+    /// lifetime. The scanner must never call native APIs or interpret errors as
+    /// unlink evidence.
+    pub(crate) fn scan_files(&self) -> Vec<(ReadOwnerId, std::sync::Weak<ReadSourceFile>)> {
+        self.regions
+            .iter()
+            .map(|(&id, region)| (id, Arc::downgrade(&region.file)))
+            .collect()
+    }
+
+    /// Software drain is a precondition, not revocation proof. Runtime must
+    /// additionally enforce the deployment's provider revocation contract.
+    pub(crate) fn cleanup_candidates<T>(
+        &self,
+        registry: &ReadOwnerRegistry<T>,
+    ) -> Vec<ReadOwnerId> {
+        self.regions
+            .iter()
+            .filter(|(id, region)| {
+                region.registration_succeeded
+                    && region.leases.is_empty()
+                    && self.check_cleanup(registry, **id).is_ok()
+            })
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     pub(crate) fn begin_shutdown<T>(
@@ -1121,5 +1174,42 @@ mod tests {
         assert!(f.registry.drained());
         assert!(f.cache.regions.is_empty());
         assert!(f.cache.transfers.is_empty());
+    }
+
+    #[test]
+    fn automatic_cleanup_requires_known_registration_and_every_lease_drained() {
+        let mut f = Fixture::new();
+        let ready = f.claim(0, &[0..16]).source;
+        let uncertain = f.claim(16, &[16..32]).source;
+        let lost = f.claim(32, &[32..48]).source;
+        f.ready(ready);
+        f.cache.start_registration(uncertain).unwrap();
+        f.cache
+            .registered(&mut f.registry, uncertain, 7, true)
+            .unwrap();
+        f.cache.start_registration(lost).unwrap();
+        f.cache.registration_lost(&mut f.registry, lost).unwrap();
+        let a = f.lease(ready, A, 1, 0..8);
+        let b = f.lease(ready, B, 2, 8..16);
+        f.cache.expose(a, 10).unwrap();
+        f.cache.expose(b, 20).unwrap();
+        f.cache.retire(&mut f.registry, ready).unwrap();
+        assert!(f.cache.cleanup_candidates(&f.registry).is_empty());
+        f.drain(a, 10);
+        assert!(f.cache.cleanup_candidates(&f.registry).is_empty());
+        f.cache.abandon(&mut f.registry, b, f.now).unwrap();
+        assert!(f.cache.cleanup_candidates(&f.registry).is_empty());
+        f.drain(b, 20);
+        assert_eq!(f.cache.cleanup_candidates(&f.registry), vec![ready]);
+        assert_eq!(f.registry.usage().source_bytes, 48);
+        assert!(f
+            .registry
+            .reap_with(ready, |_| Err::<ReapDecision, _>(()))
+            .is_err());
+        f.cache.observe_cleanup(&f.registry, ready).unwrap();
+        // A cleanup failure may be retried; registration uncertainty cannot.
+        assert_eq!(f.cache.cleanup_candidates(&f.registry), vec![ready]);
+        f.clean(ready);
+        assert_eq!(f.registry.usage().source_bytes, 32);
     }
 }

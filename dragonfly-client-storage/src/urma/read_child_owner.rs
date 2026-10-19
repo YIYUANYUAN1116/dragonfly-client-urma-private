@@ -229,7 +229,8 @@ impl<K> NativeChild<K> {
     ) -> super::read_table::ChildCreation<Self> {
         use super::read_table::ChildCreation;
         if spec.piece_length == 0
-            || descriptor.length != spec.piece_length
+            || spec.source_offset > descriptor.length
+            || spec.piece_length > descriptor.length - spec.source_offset
             || spec.allocation_bytes < spec.piece_length
             || max_read_size == 0
         {
@@ -408,6 +409,7 @@ pub(crate) struct ChildOwner<R: ChildResources> {
     id: ReadOwnerId,
     jetty: u32,
     piece_length: u64,
+    source_offset: u64,
     posted_bytes: u64,
     retired_bytes: u64,
     accepted_wr_count: u64,
@@ -435,15 +437,19 @@ impl<R: ChildResources> ChildOwner<R> {
         id: ReadOwnerId,
         jetty: u32,
         piece_length: u64,
+        source_offset: u64,
         max_outstanding: usize,
         resources: R,
     ) -> Self {
         // Invalid configuration closes posting rather than dropping native owners.
-        let invalid = piece_length == 0 || max_outstanding == 0;
+        let invalid = piece_length == 0
+            || max_outstanding == 0
+            || source_offset.checked_add(piece_length).is_none();
         Self {
             id,
             jetty,
             piece_length,
+            source_offset,
             posted_bytes: 0,
             retired_bytes: 0,
             accepted_wr_count: 0,
@@ -535,7 +541,7 @@ impl<R: ChildResources> ChildOwner<R> {
         let context = READ_CONTEXT_PREFIX | u64::from(sequence);
         let request = ReadRequest {
             local_offset: self.posted_bytes,
-            remote_offset: self.posted_bytes,
+            remote_offset: self.source_offset + self.posted_bytes,
             length,
             user_ctx: context,
         };
@@ -713,6 +719,8 @@ mod tests {
         fail_close: bool,
         fail_import: bool,
         post_timing: Option<ReadPostTiming>,
+        remote_base: u64,
+        offsets: Vec<(u64, u64, u32)>,
     }
     struct Mock(Rc<RefCell<Trace>>);
     impl ChildResources for Mock {
@@ -725,7 +733,8 @@ mod tests {
             let mut t = self.0.borrow_mut();
             t.contexts.push(r.user_ctx);
             t.events.push("post");
-            assert_eq!(r.local_offset, r.remote_offset);
+            assert_eq!(r.local_offset + t.remote_base, r.remote_offset);
+            t.offsets.push((r.local_offset, r.remote_offset, r.length));
             let wr = (r.user_ctx, t.post_timing);
             Ok(match t.mode {
                 1 => ChildPost::Uncertain(wr, FfiError::Status(-1)),
@@ -783,6 +792,16 @@ mod tests {
         ReadOwnerId,
         Rc<RefCell<Trace>>,
     ) {
+        setup_at(0)
+    }
+
+    fn setup_at(
+        source_offset: u64,
+    ) -> (
+        ReadOwnerRegistry<ChildOwner<Mock>>,
+        ReadOwnerId,
+        Rc<RefCell<Trace>>,
+    ) {
         let cap = |bytes, entries| ReadCapacity { bytes, entries };
         let mut registry = ReadOwnerRegistry::new(ReadBudget {
             total: cap(128, 4),
@@ -801,11 +820,40 @@ mod tests {
         let id = registry
             .reserve(peer, ReadDirection::Destination, 8)
             .unwrap();
-        let trace = Rc::new(RefCell::new(Trace::default()));
+        let trace = Rc::new(RefCell::new(Trace {
+            remote_base: source_offset,
+            ..Default::default()
+        }));
         // SAFETY: Mock owns no native memory; matching reservation exists.
-        let owner = unsafe { ChildOwner::new(id, 42, 8, 2, Mock(trace.clone())) };
+        let owner = unsafe { ChildOwner::new(id, 42, 8, source_offset, 2, Mock(trace.clone())) };
         assert!(registry.attach(id, owner).is_ok());
         (registry, id, trace)
+    }
+
+    #[test]
+    fn region_reads_use_remote_piece_offset_and_piece_sized_local_destination() {
+        let (mut registry, id, trace) = setup_at(24);
+        let owner = registry.active_owner(id).unwrap();
+        let first = owner.post(4).unwrap();
+        let second = owner.post(4).unwrap();
+        assert!(owner.post(1).is_err());
+        assert_eq!(trace.borrow().offsets, vec![(0, 24, 4), (4, 28, 4)]);
+        assert_eq!(registry.usage().destination_bytes, 8);
+        let owner = registry.active_owner(id).unwrap();
+        owner.complete(completion(id, second, true)).unwrap();
+        owner.complete(completion(id, first, true)).unwrap();
+        assert!(owner.read_succeeded());
+        registry.retire(id).unwrap();
+        assert_eq!(registry.reap_with(id, |owner| owner.reap()), Ok(true));
+    }
+
+    #[test]
+    fn overflowing_remote_piece_range_never_posts() {
+        let (mut registry, id, trace) = setup_at(u64::MAX - 3);
+        assert!(registry.active_owner(id).unwrap().post(4).is_err());
+        assert!(trace.borrow().offsets.is_empty());
+        registry.retire(id).unwrap();
+        assert_eq!(registry.reap_with(id, |owner| owner.reap()), Ok(true));
     }
     fn completion(id: ReadOwnerId, context: u64, success: bool) -> ReadRetired {
         // SAFETY: Mock WRs have no DMA and are immediately retired.

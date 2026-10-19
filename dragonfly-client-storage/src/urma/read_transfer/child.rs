@@ -323,6 +323,7 @@ impl ChildTransfer {
                 peer_id: self.lane_id,
                 allocation_bytes: self.allocation_bytes,
                 piece_length: self.piece_length,
+                source_offset: offer.source_offset,
                 max_outstanding: self.max_outstanding,
                 descriptor,
                 token,

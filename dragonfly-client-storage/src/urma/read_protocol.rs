@@ -14,7 +14,7 @@ use crate::{
 use std::collections::{HashSet, VecDeque};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) const READ_DFUR_VERSION: u8 = 5;
+pub(crate) const READ_DFUR_VERSION: u8 = 6;
 pub(crate) const READ_DESCRIPTOR_VERSION: u32 = 1;
 const EID_LENGTH: usize = 16;
 
@@ -154,6 +154,10 @@ pub(crate) struct ReadSegmentOffer {
     pub(crate) uasid: u32,
     pub(crate) va: u64,
     pub(crate) length: u64,
+    /// Piece start relative to the registered Segment VA, not the file offset.
+    pub(crate) source_offset: u64,
+    /// Bytes authorized for this transfer/destination; may be smaller than the Region.
+    pub(crate) piece_length: u64,
     pub(crate) token_id: u32,
     pub(crate) access: u32,
     pub(crate) token_policy: u32,
@@ -174,6 +178,8 @@ impl std::fmt::Debug for ReadSegmentOffer {
         f.debug_struct("ReadSegmentOffer")
             .field("descriptor_version", &self.descriptor_version)
             .field("length", &self.length)
+            .field("source_offset", &self.source_offset)
+            .field("piece_length", &self.piece_length)
             .field("piece_offset", &self.piece_offset)
             .field("digest", &self.digest)
             .field("segment_generation", &self.segment_generation)
@@ -183,9 +189,15 @@ impl std::fmt::Debug for ReadSegmentOffer {
 }
 
 impl ReadSegmentOffer {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.descriptor_version != READ_DESCRIPTOR_VERSION
             || self.length == 0
+            || self.piece_length == 0
+            || self.source_offset > self.length
+            || self.piece_length > self.length - self.source_offset
+            || self.source_offset > self.piece_offset
+            || self.piece_offset.checked_add(self.piece_length).is_none()
+            || self.va.checked_add(self.length).is_none()
             || self.segment_generation == 0
             || self.effective_max_read_size == 0
         {
@@ -200,6 +212,8 @@ impl ReadSegmentOffer {
         payload.extend_from_slice(&self.uasid.to_be_bytes());
         payload.extend_from_slice(&self.va.to_be_bytes());
         payload.extend_from_slice(&self.length.to_be_bytes());
+        payload.extend_from_slice(&self.source_offset.to_be_bytes());
+        payload.extend_from_slice(&self.piece_length.to_be_bytes());
         payload.extend_from_slice(&self.token_id.to_be_bytes());
         payload.extend_from_slice(&self.access.to_be_bytes());
         payload.extend_from_slice(&self.token_policy.to_be_bytes());
@@ -220,6 +234,8 @@ impl ReadSegmentOffer {
             uasid: reader.u32()?,
             va: reader.u64()?,
             length: reader.u64()?,
+            source_offset: reader.u64()?,
+            piece_length: reader.u64()?,
             token_id: reader.u32()?,
             access: reader.u32()?,
             token_policy: reader.u32()?,
@@ -517,7 +533,7 @@ fn decode_generation(reader: &mut WireReader<'_>) -> Result<Option<u64>> {
 pub(crate) enum ParentAction {
     RegisterSource,
     WaitForChildDrain,
-    RevokeSource,
+    FinishSource,
     SendDone { segment_generation: u64 },
     SendCancelled { segment_generation: Option<u64> },
     DuplicateTerminal,
@@ -529,8 +545,8 @@ enum ParentPhase {
     RegisteringSource,
     Offered(u64),
     WaitingCancelDrain(u64),
-    RevokingSuccess(u64),
-    RevokingCancel(Option<u64>),
+    ReleasingSuccess(u64),
+    ReleasingCancel(Option<u64>),
     TerminalSuccess(u64),
     TerminalCancel(Option<u64>),
 }
@@ -578,8 +594,8 @@ impl ParentReadState {
                 && *completed_length == self.length
                 && *read_wr_count != 0 =>
             {
-                self.phase = ParentPhase::RevokingSuccess(*expected);
-                Ok(ParentAction::RevokeSource)
+                self.phase = ParentPhase::ReleasingSuccess(*expected);
+                Ok(ParentAction::FinishSource)
             }
             (
                 ParentPhase::AwaitingBufferReady | ParentPhase::RegisteringSource,
@@ -588,8 +604,8 @@ impl ParentReadState {
                     ..
                 },
             ) => {
-                self.phase = ParentPhase::RevokingCancel(None);
-                Ok(ParentAction::RevokeSource)
+                self.phase = ParentPhase::ReleasingCancel(None);
+                Ok(ParentAction::FinishSource)
             }
             (
                 ParentPhase::Offered(expected),
@@ -624,8 +640,8 @@ impl ParentReadState {
                     ..
                 },
             ) if expected == received && accepted_wr_count == retired_wr_count => {
-                self.phase = ParentPhase::RevokingCancel(Some(*expected));
-                Ok(ParentAction::RevokeSource)
+                self.phase = ParentPhase::ReleasingCancel(Some(*expected));
+                Ok(ParentAction::FinishSource)
             }
             // A generation-less CancelDrained only proves the Child had no
             // accepted WR when it drained before seeing the late Offer. The
@@ -667,15 +683,18 @@ impl ParentReadState {
         Ok(())
     }
 
-    pub(crate) fn source_released(&mut self) -> Result<ParentAction> {
+    /// The adapter must finish the dedicated source revocation or the cached
+    /// transfer lease release before acknowledging the Child. This state
+    /// machine itself provides neither native retirement nor a drain proof.
+    pub(crate) fn source_lease_released(&mut self) -> Result<ParentAction> {
         match self.phase {
-            ParentPhase::RevokingSuccess(generation) => {
+            ParentPhase::ReleasingSuccess(generation) => {
                 self.phase = ParentPhase::TerminalSuccess(generation);
                 Ok(ParentAction::SendDone {
                     segment_generation: generation,
                 })
             }
-            ParentPhase::RevokingCancel(generation) => {
+            ParentPhase::ReleasingCancel(generation) => {
                 self.phase = ParentPhase::TerminalCancel(generation);
                 Ok(ParentAction::SendCancelled {
                     segment_generation: generation,
@@ -859,7 +878,7 @@ impl ChildReadState {
 
     fn validate_offer(&self, offer: &ReadSegmentOffer) -> Result<()> {
         offer.validate()?;
-        if offer.length != self.length || offer.effective_max_read_size > self.max_read_size {
+        if offer.piece_length != self.length || offer.effective_max_read_size > self.max_read_size {
             return Err(protocol("SegmentOffer length or READ limit mismatch"));
         }
         Ok(())
@@ -939,6 +958,8 @@ mod tests {
             uasid: 4,
             va: 0x1000,
             length: 64 * 1024,
+            source_offset: 0,
+            piece_length: 64 * 1024,
             token_id: 5,
             access: 1,
             token_policy: 0,
@@ -1016,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_parent_and_child_lifecycle_requires_revoke_before_done() {
+    fn normal_parent_and_child_lifecycle_requires_source_completion_before_done() {
         let mut parent = ParentReadState::new(ID, 64 * 1024).unwrap();
         let mut child = ChildReadState::new(ID, 64 * 1024, 4096).unwrap();
         assert_eq!(
@@ -1043,10 +1064,10 @@ mod tests {
                     read_wr_count: 16,
                 })
                 .unwrap(),
-            ParentAction::RevokeSource
+            ParentAction::FinishSource
         );
         assert_eq!(
-            parent.source_released().unwrap(),
+            parent.source_lease_released().unwrap(),
             ParentAction::SendDone {
                 segment_generation: 11
             }
@@ -1060,6 +1081,73 @@ mod tests {
             child.on_frame(&done).unwrap(),
             ChildAction::DuplicateTerminal
         );
+    }
+
+    #[test]
+    fn region_offer_round_trips_and_child_completes_only_the_requested_piece() {
+        let mut region = offer(11);
+        region.length = 1024 * 1024;
+        region.source_offset = 128 * 1024;
+        region.piece_offset = 256 * 1024;
+        let frame = ReadFrame::SegmentOffer {
+            identity: ID,
+            offer: region.clone(),
+        };
+        let (kind, payload) = frame.encode().unwrap();
+        assert_eq!(ReadFrame::decode(kind, &payload).unwrap(), frame);
+        let mut child = ChildReadState::new(ID, region.piece_length, 4096).unwrap();
+        assert_eq!(child.on_frame(&frame).unwrap(), ChildAction::StartRead);
+        assert!(child.read_finished(region.length, 256).is_err());
+        assert_eq!(
+            child.read_finished(region.piece_length, 16).unwrap(),
+            ChildAction::SendReadDone {
+                segment_generation: 11
+            }
+        );
+    }
+
+    #[test]
+    fn region_offer_rejects_piece_bounds_file_overflow_and_address_overflow() {
+        let valid = offer(11);
+        let mut invalid = Vec::new();
+        let mut candidate = valid.clone();
+        candidate.piece_length = 0;
+        invalid.push(candidate);
+        let mut candidate = valid.clone();
+        candidate.source_offset = candidate.length + 1;
+        invalid.push(candidate);
+        let mut candidate = valid.clone();
+        candidate.source_offset = 1;
+        invalid.push(candidate);
+        let mut candidate = valid.clone();
+        candidate.length *= 2;
+        candidate.source_offset = candidate.piece_offset + 1;
+        invalid.push(candidate);
+        let mut candidate = valid.clone();
+        candidate.piece_offset = u64::MAX;
+        invalid.push(candidate);
+        let mut candidate = valid.clone();
+        candidate.va = u64::MAX - candidate.length + 1;
+        invalid.push(candidate);
+        for candidate in invalid {
+            assert!(candidate.validate().is_err());
+            let mut child = ChildReadState::new(ID, valid.piece_length, 4096).unwrap();
+            assert!(child
+                .on_frame(&ReadFrame::SegmentOffer {
+                    identity: ID,
+                    offer: candidate
+                })
+                .is_err());
+        }
+        let mut mismatch = valid.clone();
+        mismatch.piece_length /= 2;
+        let mut child = ChildReadState::new(ID, valid.piece_length, 4096).unwrap();
+        assert!(child
+            .on_frame(&ReadFrame::SegmentOffer {
+                identity: ID,
+                offer: mismatch
+            })
+            .is_err());
     }
 
     #[test]
@@ -1177,10 +1265,10 @@ mod tests {
                     retired_wr_count: 0,
                 })
                 .unwrap(),
-            ParentAction::RevokeSource
+            ParentAction::FinishSource
         );
         assert_eq!(
-            parent.source_released().unwrap(),
+            parent.source_lease_released().unwrap(),
             ParentAction::SendCancelled {
                 segment_generation: Some(21)
             }
@@ -1262,10 +1350,10 @@ mod tests {
                     retired_wr_count: 4,
                 })
                 .unwrap(),
-            ParentAction::RevokeSource
+            ParentAction::FinishSource
         );
         assert_eq!(
-            parent.source_released().unwrap(),
+            parent.source_lease_released().unwrap(),
             ParentAction::SendCancelled {
                 segment_generation: Some(21)
             }

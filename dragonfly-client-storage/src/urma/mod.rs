@@ -11,6 +11,7 @@ mod error;
 pub mod fabric;
 pub(crate) mod ffi;
 mod lane;
+mod read_cache_maintenance;
 mod read_child_owner;
 pub(crate) mod read_control;
 pub(crate) mod read_handoff;
@@ -18,17 +19,8 @@ pub(crate) mod read_protocol;
 pub(crate) mod read_registry;
 #[cfg(test)]
 mod read_session_harness;
-mod read_source_lease;
-// The Region Offer and Runtime command integration follow this owner-side
-// state machine. Keep it private and the current Piece path active until then.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "cached Runtime integration is staged behind the Region Offer change"
-    )
-)]
 mod read_source_cache;
+mod read_source_lease;
 mod read_source_owner;
 mod read_source_workers;
 mod read_table;

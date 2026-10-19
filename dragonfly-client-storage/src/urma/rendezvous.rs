@@ -1,4 +1,4 @@
-//! DFUR v4 discovery over TCP. Bulk transfer uses the separate v5 READ lane.
+//! DFUR v4 discovery over TCP. Bulk transfer uses the separate v6 READ lane.
 
 use super::lane::{TpType, TransportMode};
 pub use crate::rendezvous::PieceKind;
@@ -89,7 +89,7 @@ impl UrmaCapability {
 pub struct UrmaAdvertisement {
     pub capability: UrmaCapability,
     pub port: u16,
-    /// Rendezvous port serving the RM-READ data plane (DFUR version 5). Zero
+    /// Rendezvous port serving the RM-READ data plane (DFUR version 6). Zero
     /// means the parent has no READ capability. A READ-only parent sets
     /// this to its READ listener port.
     pub read_port: u16,

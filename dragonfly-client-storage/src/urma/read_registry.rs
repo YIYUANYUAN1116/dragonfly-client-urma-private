@@ -216,6 +216,23 @@ impl<T> ReadOwnerRegistry<T> {
         self.registry_id
     }
 
+    pub(crate) fn validate_source_reservation(
+        &self,
+        id: ReadOwnerId,
+        bytes: u64,
+    ) -> Result<(), OwnerError> {
+        let entry = self.entries.get(&id).ok_or(OwnerError::UnknownOwner)?;
+        if entry.direction != ReadDirection::Source || entry.bytes != bytes {
+            return Err(OwnerError::InvalidSize);
+        }
+        if entry.owner.is_some()
+            || !matches!(entry.state, OwnerState::Reserved | OwnerState::Retiring)
+        {
+            return Err(OwnerError::NotActive);
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(budget: ReadBudget) -> Result<Self, OwnerError> {
         let bytes = budget.destination.bytes.checked_add(budget.source.bytes);
         let entries = budget

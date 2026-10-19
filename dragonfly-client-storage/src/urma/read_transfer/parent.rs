@@ -1,12 +1,12 @@
 //! Parent-side RM READ transfer of one Piece.
 //!
-//! Registers and publishes an immutable source, waits for Child drain, then
-//! releases it only with caller-supplied provider revocation evidence. Wire
-//! cancellation, EOF and timeout never substitute for that evidence.
+//! Publishes an immutable source and validates Child drain. Dedicated sources
+//! require provider revocation before release; cached transfers release only
+//! their own lease. EOF and timeout never substitute for the required proof.
 
 use super::protocol;
 use crate::urma::{
-    fabric::UrmaFabricHandle,
+    fabric::{ReadCachedSourceLease, UrmaFabricHandle},
     ffi::read::source::ReadSourceStages,
     read_control::ReadTransferControl,
     read_handoff::ResourceGuard,
@@ -15,7 +15,10 @@ use crate::urma::{
         ReadTransferIdentity,
     },
     read_source_lease::SourceLease,
-    runtime::{ReadSourceAdmission, ReadSourceId, ReadSourceOffer, ReadSourceRequest},
+    runtime::{
+        ReadCachedLeaseRequest, ReadCachedSourceRequest, ReadSourceAdmission, ReadSourceId,
+        ReadSourceOffer, ReadSourceRequest,
+    },
     Error, Result,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,34 +39,41 @@ fn wire_offer(
     segment_generation: u64,
     effective_max_read_size: u32,
     piece_offset: u64,
+    source_range: std::ops::Range<u64>,
     digest: String,
 ) -> Result<(ReadSourceId, ReadSegmentOffer)> {
     if segment_generation == 0 || effective_max_read_size == 0 {
         return Err(protocol("invalid READ source publication limits"));
     }
     let descriptor = offer.descriptor;
-    Ok((
-        offer.id,
-        ReadSegmentOffer {
-            descriptor_version: descriptor.version,
-            eid: descriptor.eid,
-            uasid: descriptor.uasid,
-            va: descriptor.va,
-            length: descriptor.length,
-            token_id: descriptor.token_id,
-            access: descriptor.access,
-            token_policy: descriptor.token_policy,
-            token: offer.token.into_wire_value(),
-            segment_generation,
-            effective_max_read_size,
-            piece_offset,
-            digest,
-        },
-    ))
+    let piece_length = source_range
+        .end
+        .checked_sub(source_range.start)
+        .ok_or_else(|| protocol("invalid cached Piece range"))?;
+    let wire = ReadSegmentOffer {
+        descriptor_version: descriptor.version,
+        eid: descriptor.eid,
+        uasid: descriptor.uasid,
+        va: descriptor.va,
+        length: descriptor.length,
+        source_offset: source_range.start,
+        piece_length,
+        token_id: descriptor.token_id,
+        access: descriptor.access,
+        token_policy: descriptor.token_policy,
+        token: offer.token.into_wire_value(),
+        segment_generation,
+        effective_max_read_size,
+        piece_offset,
+        digest,
+    };
+    wire.validate()?;
+    Ok((offer.id, wire))
 }
 
-/// Parent adapter stops at the explicit provider-revocation gate. The caller
-/// must not turn ReadDone into the unsafe proof required by source release.
+/// Parent adapter keeps transfer completion distinct from physical retirement.
+/// Dedicated source release requires the provider gate; cached completion
+/// releases its transfer lease and leaves the physical source cache-owned.
 #[derive(Clone, Copy)]
 pub(crate) enum SourceState {
     Registered,
@@ -78,10 +88,13 @@ pub(crate) struct ParentTransfer {
     state: ParentReadState,
     identity: ReadTransferIdentity,
     piece_offset: u64,
+    piece_length: u64,
+    locator: ReadPieceLocator,
     digest: String,
     effective_max_read_size: u32,
     awaiting_buffer_ready: bool,
     source_lease: Option<SourceLease>,
+    cached_lease: Option<ReadCachedSourceLease>,
     on_source_state: Option<std::sync::Arc<dyn Fn(ReadSourceId, SourceState) + Send + Sync>>,
 }
 
@@ -94,7 +107,7 @@ pub(crate) enum ParentTerminal {
     Cancelled,
 }
 
-pub(crate) struct PendingSourceRevoke {
+pub(crate) struct PendingSourceCompletion {
     identity: ReadTransferIdentity,
     pub(crate) source_id: ReadSourceId,
     pub(crate) segment_generation: u64,
@@ -170,10 +183,13 @@ impl ParentTransfer {
                 state,
                 identity,
                 piece_offset,
+                piece_length: accepted_length,
+                locator: request.clone(),
                 digest,
                 effective_max_read_size,
                 awaiting_buffer_ready: false,
                 source_lease: None,
+                cached_lease: None,
                 on_source_state: None,
             },
             request,
@@ -211,7 +227,7 @@ impl ParentTransfer {
         mut self,
         request: ReadSourceRequest,
         completion_timeout: Duration,
-    ) -> std::result::Result<(Self, PendingSourceRevoke), ParentTransportFailure> {
+    ) -> std::result::Result<(Self, PendingSourceCompletion), ParentTransportFailure> {
         let fail =
             |error: Error, retained_source: Option<RetainedSourceOwner>| ParentTransportFailure {
                 error,
@@ -258,12 +274,109 @@ impl ParentTransfer {
             }
             Err(error) => return Err(fail(error, None)),
         };
-        let register_stages = offer.register_stages;
         let source_id = offer.id;
         self.guard_source(source_id, true);
+        if offer.descriptor.length != self.piece_length {
+            return Err(ParentTransportFailure {
+                error: protocol("dedicated source must match the exact Piece"),
+                retained_source: Some(RetainedSourceOwner {
+                    source_id,
+                    segment_generation: None,
+                }),
+            });
+        }
+        self.publish_offer_and_wait(offer, 0, register_ns, completion_timeout)
+            .await
+    }
+
+    /// Publishes one lease on a cache-owned physical source. Request loss never
+    /// transfers the whole source to the per-lane retained-source ledger.
+    /// # Safety
+    /// Storage evidence belongs to the exact immutable file instance; all
+    /// completion/range/provider and authenticated lane requirements apply.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Storage cached policy is enabled after independent cache reclamation"
+        )
+    )]
+    pub(crate) async unsafe fn publish_cached_and_wait_read_done(
+        mut self,
+        request: ReadCachedSourceRequest,
+        completion_timeout: Duration,
+    ) -> std::result::Result<(Self, PendingSourceCompletion), ParentTransportFailure> {
+        let fail = |error| ParentTransportFailure {
+            error,
+            retained_source: None,
+        };
+        let piece_end = self
+            .piece_offset
+            .checked_add(self.piece_length)
+            .ok_or_else(|| fail(protocol("cached Piece file range overflow")))?;
+        if request.peer_id != self.lane_id
+            || request.kind != self.locator.kind
+            || request.task != self.locator.task_id
+            || request.piece_offset != self.piece_offset
+            || piece_end > request.file.opened_length()
+            || request
+                .piece_length
+                .min(request.file.opened_length() - self.piece_offset)
+                != self.piece_length
+            || self.awaiting_buffer_ready
+        {
+            return Err(fail(protocol(
+                "cached source request differs from accepted Piece",
+            )));
+        }
+        let started = std::time::Instant::now();
+        // SAFETY: supplied by the method's Storage/provider/lane contract.
+        let source = unsafe {
+            self.fabric
+                .register_cached_source(request, completion_timeout)
+                .await
+        }
+        .map_err(fail)?;
+        if source.range.start > self.piece_offset || source.range.end < piece_end {
+            return Err(fail(protocol("cached source does not cover this Piece")));
+        }
+        let lease = unsafe {
+            self.fabric
+                .acquire_cached_source_lease(ReadCachedLeaseRequest {
+                    source: source.source,
+                    peer_id: self.lane_id,
+                    peer_generation: source.peer_generation,
+                    transfer: self.identity,
+                    piece: self.piece_offset..piece_end,
+                })
+                .await
+        }
+        .map_err(fail)?;
+        let source_offset = lease.source_offset;
+        let offer = lease.offer.for_cached_transfer();
+        self.cached_lease = Some(lease);
+        self.publish_offer_and_wait(
+            offer,
+            source_offset,
+            started.elapsed().as_nanos() as u64,
+            completion_timeout,
+        )
+        .await
+    }
+
+    async fn publish_offer_and_wait(
+        mut self,
+        offer: ReadSourceOffer,
+        source_offset: u64,
+        register_ns: u64,
+        completion_timeout: Duration,
+    ) -> std::result::Result<(Self, PendingSourceCompletion), ParentTransportFailure> {
+        let register_stages = offer.register_stages;
+        let source_id = offer.id;
+        let cached = self.cached_lease.is_some();
         let unpublished = |error: Error| ParentTransportFailure {
             error,
-            retained_source: Some(RetainedSourceOwner {
+            retained_source: (!cached).then_some(RetainedSourceOwner {
                 source_id,
                 segment_generation: None,
             }),
@@ -277,20 +390,31 @@ impl ParentTransfer {
             segment_generation,
             self.effective_max_read_size,
             self.piece_offset,
+            source_offset
+                ..source_offset
+                    .checked_add(self.piece_length)
+                    .ok_or_else(|| unpublished(protocol("cached source Piece range overflow")))?,
             self.digest.clone(),
         ) {
             Ok(offer) => offer,
             Err(error) => return Err(unpublished(error)),
         };
-        let exposed_guard = self
-            .on_source_state
-            .is_none()
-            .then(|| self.fabric.retained_source_guard(source_id));
-        self.source_lease
-            .as_mut()
-            .ok_or_else(|| unpublished(protocol("Parent source lease missing")))?
-            .expose(segment_generation, exposed_guard)
-            .map_err(unpublished)?;
+        if let Some(lease) = &self.cached_lease {
+            self.fabric
+                .expose_cached_source_lease(lease, segment_generation)
+                .await
+                .map_err(unpublished)?;
+        } else {
+            let exposed_guard = self
+                .on_source_state
+                .is_none()
+                .then(|| self.fabric.retained_source_guard(source_id));
+            self.source_lease
+                .as_mut()
+                .ok_or_else(|| unpublished(protocol("Parent source lease missing")))?
+                .expose(segment_generation, exposed_guard)
+                .map_err(unpublished)?;
+        }
         let deadline = Instant::now() + completion_timeout;
         let send_result = tokio::time::timeout_at(
             deadline,
@@ -308,7 +432,7 @@ impl ParentTransfer {
         if let Some(error) = send_error {
             return Err(ParentTransportFailure {
                 error,
-                retained_source: Some(RetainedSourceOwner {
+                retained_source: (!cached).then_some(RetainedSourceOwner {
                     source_id,
                     segment_generation: Some(segment_generation),
                 }),
@@ -317,7 +441,7 @@ impl ParentTransfer {
         if let Err(error) = self.state.offer_published(segment_generation) {
             return Err(ParentTransportFailure {
                 error,
-                retained_source: Some(RetainedSourceOwner {
+                retained_source: (!cached).then_some(RetainedSourceOwner {
                     source_id,
                     segment_generation: Some(segment_generation),
                 }),
@@ -325,7 +449,7 @@ impl ParentTransfer {
         }
         let published = |error: Error| ParentTransportFailure {
             error,
-            retained_source: Some(RetainedSourceOwner {
+            retained_source: (!cached).then_some(RetainedSourceOwner {
                 source_id,
                 segment_generation: Some(segment_generation),
             }),
@@ -376,7 +500,7 @@ impl ParentTransfer {
                 }
             };
             match self.state.on_frame(&frame) {
-                Ok(ParentAction::RevokeSource) => {
+                Ok(ParentAction::FinishSource) => {
                     break (terminal, completed_length, read_wr_count)
                 }
                 Ok(_) | Err(_) => {
@@ -386,24 +510,21 @@ impl ParentTransfer {
                 }
             }
         };
-        self.source_lease
-            .as_mut()
-            .ok_or_else(|| published(protocol("Parent source lease missing")))?
-            .child_drained(self.identity, segment_generation)
-            .map_err(published)?;
-        if let Err(error) = self.fabric.retire_read_source(source_id).await {
-            return Err(ParentTransportFailure {
-                error,
-                retained_source: Some(RetainedSourceOwner {
-                    source_id,
-                    segment_generation: Some(segment_generation),
-                }),
-            });
+        if !cached {
+            self.source_lease
+                .as_mut()
+                .ok_or_else(|| published(protocol("Parent source lease missing")))?
+                .child_drained(self.identity, segment_generation)
+                .map_err(published)?;
+            self.fabric
+                .retire_read_source(source_id)
+                .await
+                .map_err(published)?;
         }
         let identity = self.identity;
         Ok((
             self,
-            PendingSourceRevoke {
+            PendingSourceCompletion {
                 identity,
                 source_id,
                 segment_generation,
@@ -427,7 +548,7 @@ impl ParentTransfer {
     /// contract.
     pub(crate) async unsafe fn revoke_and_finish(
         mut self,
-        pending: PendingSourceRevoke,
+        pending: PendingSourceCompletion,
     ) -> Result<()> {
         let lease = self
             .source_lease
@@ -466,7 +587,46 @@ impl ParentTransfer {
         if let Some(callback) = &self.on_source_state {
             callback(pending.source_id, SourceState::Released);
         }
-        match self.state.source_released()? {
+        self.send_terminal(pending).await
+    }
+
+    /// # Safety
+    /// The cooperative Child drain has been protocol validated and the exact
+    /// transfer cannot resume READ work. The cached capability itself may stay
+    /// live; physical retirement still requires provider-backed revocation.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Storage cached policy follows independent reclamation"
+        )
+    )]
+    pub(crate) async unsafe fn finish_cached(
+        mut self,
+        pending: PendingSourceCompletion,
+    ) -> Result<()> {
+        if self.identity != pending.identity || self.source_lease.is_some() {
+            return Err(protocol("cached completion transfer mismatch"));
+        }
+        let lease = self
+            .cached_lease
+            .as_mut()
+            .ok_or_else(|| protocol("cached source lease missing"))?;
+        if lease.offer.id != pending.source_id {
+            return Err(protocol("cached completion source mismatch"));
+        }
+        // SAFETY: caller supplies the exact per-transfer drain contract. This
+        // releases only the lease, not Segment/backing or its physical budget.
+        unsafe {
+            self.fabric
+                .release_cached_source_lease(lease, pending.identity, pending.segment_generation)
+                .await?
+        };
+        self.send_terminal(pending).await
+    }
+
+    async fn send_terminal(mut self, pending: PendingSourceCompletion) -> Result<()> {
+        match self.state.source_lease_released()? {
             ParentAction::SendDone { segment_generation } => {
                 if pending.terminal != ParentTerminal::Success
                     || segment_generation != pending.segment_generation

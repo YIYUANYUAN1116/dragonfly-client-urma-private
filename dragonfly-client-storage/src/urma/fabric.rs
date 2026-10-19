@@ -11,6 +11,7 @@ use super::read_handoff::{ResourceGuard, ResourceReply};
 use super::{
     lane::{JettyDescriptor, TransportMode},
     runtime::{
+        ReadCachedLeaseOffer, ReadCachedLeaseRequest, ReadCachedSource, ReadCachedSourceRequest,
         ReadChildAdmission, ReadChildId, ReadChildProgress, ReadChildRequest, ReadChildUpdate,
         ReadLeaseSpan, ReadSourceAdmission, ReadSourceId, ReadSourceRequest, RuntimeConfig,
         UrmaRuntime,
@@ -151,6 +152,10 @@ impl UrmaFabric {
 
         match startup_rx.recv_timeout(FABRIC_STARTUP_TIMEOUT) {
             Ok(Ok((transport_type, transport_modes, max_message_size, max_read_size))) => {
+                let command_tx = CommandSender {
+                    tx: command_tx,
+                    owner: Some(join.thread().clone()),
+                };
                 Ok(UrmaFabricHandle {
                     inner: Arc::new(FabricInner {
                         command_tx: Mutex::new(Some(command_tx)),
@@ -193,6 +198,126 @@ impl UrmaFabric {
 #[derive(Clone)]
 pub struct UrmaFabricHandle {
     inner: Arc<FabricInner>,
+}
+
+/// One cached transfer's lease. The cancellation guard never owns the physical
+/// source; the owner decides whether abandonment may release an unpublished
+/// lease or must retain an exposed one.
+pub(crate) struct ReadCachedSourceLease {
+    lease: super::read_source_cache::CacheLease,
+    guard: Option<ResourceGuard>,
+    pub(crate) offer: super::runtime::ReadSourceOffer,
+    pub(crate) source_offset: u64,
+}
+
+impl UrmaFabricHandle {
+    /// # Safety
+    /// Storage completion evidence matches this exact immutable opened file.
+    /// Native producer ownership belongs to the cache, including on timeout.
+    pub(crate) async unsafe fn register_cached_source(
+        &self,
+        request: ReadCachedSourceRequest,
+        completion_timeout: Duration,
+    ) -> Result<ReadCachedSource> {
+        if completion_timeout.is_zero() {
+            return Err(Error::Protocol("zero cached registration timeout".into()));
+        }
+        tokio::time::timeout(completion_timeout, async {
+            let mut source = self
+                .submit(|reply| FabricCommand::RegisterCachedSource { request, reply })
+                .await?;
+            loop {
+                let state = *source.updates.borrow_and_update();
+                match state {
+                    super::read_source_cache::CacheState::Ready => return Ok(source),
+                    super::read_source_cache::CacheState::Reserved
+                    | super::read_source_cache::CacheState::Registering => {
+                        source
+                            .updates
+                            .changed()
+                            .await
+                            .map_err(|_| fabric_stopped())?;
+                    }
+                    state => {
+                        return Err(Error::Protocol(format!(
+                            "cached source registration unavailable: {state:?}"
+                        )))
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::Protocol("cached source registration deadline expired".into()))?
+    }
+
+    /// # Safety
+    /// Authenticate this peer/transfer and prove Storage authorized the exact
+    /// Piece in this cached source. The Runtime enforces bounds and admission.
+    pub(crate) async unsafe fn acquire_cached_source_lease(
+        &self,
+        request: ReadCachedLeaseRequest,
+    ) -> Result<ReadCachedSourceLease> {
+        let acquired = self
+            .submit_resource(
+                |reply| FabricCommand::AcquireCachedSourceLease { request, reply },
+                |acquired| Abandoned::CachedSourceLease(acquired.lease),
+            )
+            .await?;
+        // No await between claiming the handoff and rearming its guard.
+        let guard = self.resource_guard(Abandoned::CachedSourceLease(acquired.lease));
+        Ok(ReadCachedSourceLease {
+            lease: acquired.lease,
+            guard: Some(guard),
+            offer: acquired.offer,
+            source_offset: acquired.source_offset,
+        })
+    }
+
+    /// Complete this owner transition before sending a SegmentOffer. Cancelling
+    /// this command may leave an exposed lease, which the guard safely retains.
+    pub(crate) async fn expose_cached_source_lease(
+        &self,
+        lease: &ReadCachedSourceLease,
+        generation: u64,
+    ) -> Result<()> {
+        if lease.guard.is_none() {
+            return Err(Error::Protocol(
+                "cached source lease already released".into(),
+            ));
+        }
+        self.submit_urgent(|reply| FabricCommand::ExposeCachedSourceLease {
+            lease: lease.lease,
+            generation,
+            reply,
+        })
+        .await
+    }
+
+    /// # Safety
+    /// This exact transfer must have drained under the cached lease contract.
+    /// No Segment/backing is freed by this operation. Keep the guard armed until
+    /// the owner confirms completion; reply loss conservatively abandons it.
+    pub(crate) async unsafe fn release_cached_source_lease(
+        &self,
+        lease: &mut ReadCachedSourceLease,
+        transfer: super::read_protocol::ReadTransferIdentity,
+        generation: u64,
+    ) -> Result<()> {
+        if lease.guard.is_none() {
+            return Err(Error::Protocol(
+                "cached source lease already released".into(),
+            ));
+        }
+        self.submit_urgent(|reply| FabricCommand::ReleaseCachedSourceLease {
+            lease: lease.lease,
+            transfer,
+            generation,
+            reply,
+        })
+        .await?;
+        lease.guard.take().expect("armed lease").disarm();
+        Ok(())
+    }
 }
 
 impl UrmaFabricHandle {
@@ -467,7 +592,7 @@ impl UrmaFabricHandle {
         reply_rx.await.map_err(|_| fabric_stopped())?
     }
 
-    fn command_sender(&self) -> Result<mpsc::UnboundedSender<CommandEnvelope>> {
+    fn command_sender(&self) -> Result<CommandSender> {
         self.inner
             .command_tx
             .lock()
@@ -505,8 +630,28 @@ impl UrmaFabricHandle {
     }
 }
 
+/// Wakes a parked cache owner on every command, including guard-driven cleanup.
+/// unpark's stored token closes the enqueue-before-park race.
+#[derive(Clone)]
+struct CommandSender {
+    tx: mpsc::UnboundedSender<CommandEnvelope>,
+    owner: Option<thread::Thread>,
+}
+impl CommandSender {
+    fn send(
+        &self,
+        command: CommandEnvelope,
+    ) -> std::result::Result<(), mpsc::error::SendError<CommandEnvelope>> {
+        self.tx.send(command)?;
+        if let Some(owner) = &self.owner {
+            owner.unpark();
+        }
+        Ok(())
+    }
+}
+
 struct FabricInner {
-    command_tx: Mutex<Option<mpsc::UnboundedSender<CommandEnvelope>>>,
+    command_tx: Mutex<Option<CommandSender>>,
     command_slots: Arc<Semaphore>,
     readiness: watch::Receiver<FabricReadiness>,
     runtime_config: RuntimeConfig,
@@ -536,11 +681,31 @@ pub(crate) enum Abandoned {
     Lane(u16),
     Child(ReadChildId),
     Source(ReadSourceId, bool),
+    CachedSourceLease(super::read_source_cache::CacheLease),
 }
 
 enum FabricCommand {
     Abandon {
         action: Abandoned,
+    },
+    AcquireCachedSourceLease {
+        request: ReadCachedLeaseRequest,
+        reply: ResourceReply<ReadCachedLeaseOffer>,
+    },
+    RegisterCachedSource {
+        request: ReadCachedSourceRequest,
+        reply: oneshot::Sender<Result<ReadCachedSource>>,
+    },
+    ExposeCachedSourceLease {
+        lease: super::read_source_cache::CacheLease,
+        generation: u64,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ReleaseCachedSourceLease {
+        lease: super::read_source_cache::CacheLease,
+        transfer: super::read_protocol::ReadTransferIdentity,
+        generation: u64,
+        reply: oneshot::Sender<Result<()>>,
     },
     CreateLane {
         reply: ResourceReply<(u16, Vec<u8>)>,
@@ -682,8 +847,24 @@ fn run_owner(
     let mut poisoned = None;
     loop {
         runtime.poll_source_workers();
+        runtime.maintain_cached_sources();
         if runtime.outstanding() == 0 && !runtime.source_work_pending() {
-            match command_rx.blocking_recv() {
+            // Cached sources need maintenance even without commands or CQEs.
+            // Keep the original blocking path when the cache is empty; an
+            // idle cache wakes at low frequency without polling the device CQ.
+            let command = if runtime.cached_sources_present() {
+                match command_rx.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        thread::park_timeout(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                }
+            } else {
+                command_rx.blocking_recv()
+            };
+            match command {
                 Some(envelope) => {
                     if let OwnerControl::Shutdown(reply) =
                         handle_command(envelope.command, &mut runtime, poisoned.as_deref())
@@ -756,6 +937,7 @@ fn handle_command(
                 }
                 Abandoned::Child(id) => runtime.abandon_read_child(id),
                 Abandoned::Source(id, ready) => runtime.abandon_read_source(id, ready),
+                Abandoned::CachedSourceLease(lease) => runtime.abandon_cached_source_lease(lease),
             }
             OwnerControl::Continue
         }
@@ -850,6 +1032,42 @@ fn handle_command(
                     let _ = reply.send(Err(error));
                 }
             }
+            OwnerControl::Continue
+        }
+        FabricCommand::AcquireCachedSourceLease { request, reply } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.acquire_cached_source_lease(request));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::RegisterCachedSource { request, reply } => {
+            match reject_if_poisoned(poisoned) {
+                Ok(()) => unsafe { runtime.submit_cached_source_registration(request, reply) },
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            OwnerControl::Continue
+        }
+        FabricCommand::ExposeCachedSourceLease {
+            lease,
+            generation,
+            reply,
+        } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.expose_cached_source_lease(lease, generation));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ReleaseCachedSourceLease {
+            lease,
+            transfer,
+            generation,
+            reply,
+        } => {
+            // SAFETY: only the unsafe Fabric facade constructs this command.
+            let _ = reply
+                .send(unsafe { runtime.release_cached_source_lease(lease, transfer, generation) });
             OwnerControl::Continue
         }
         FabricCommand::RetireReadSource { id, reply } => {
@@ -957,6 +1175,735 @@ fn join_owner(join: &Mutex<Option<JoinHandle<()>>>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_enqueued_before_owner_parks_preserves_wakeup() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (park_tx, park_rx) = std_mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std_mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            // The command is enqueued before this rendezvous permits parking.
+            park_rx.recv().unwrap();
+            thread::park();
+            done_tx.send(()).unwrap();
+        });
+        let sender = CommandSender {
+            tx,
+            owner: Some(join.thread().clone()),
+        };
+        sender
+            .send(CommandEnvelope::urgent(FabricCommand::Shutdown {
+                reply: None,
+            }))
+            .unwrap();
+        park_tx.send(()).unwrap();
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        // Always unblock/join on failure so the regression cannot hang tests.
+        join.thread().unpark();
+        join.join().unwrap();
+        assert!(result.is_ok(), "enqueue lost the owner's wake token");
+    }
+
+    fn lease_test_handle() -> (UrmaFabricHandle, mpsc::UnboundedReceiver<CommandEnvelope>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (_, readiness) = watch::channel(FabricReadiness::Ready);
+        let read = super::super::runtime::ReadRuntimeConfig::try_from_config(
+            &dragonfly_client_config::dfdaemon::UrmaReadServer::default(),
+        )
+        .unwrap();
+        (
+            UrmaFabricHandle {
+                inner: Arc::new(FabricInner {
+                    command_tx: Mutex::new(Some(CommandSender { tx, owner: None })),
+                    command_slots: Arc::new(Semaphore::new(1)),
+                    readiness,
+                    runtime_config: RuntimeConfig::new("test-only", 0, read),
+                    transport_type: 0,
+                    transport_modes: 0,
+                    max_message_size: 0,
+                    max_read_size: 4096,
+                    shutdown: AsyncMutex::new(()),
+                    join: Mutex::new(None),
+                }),
+            },
+            rx,
+        )
+    }
+
+    fn lease_test_cache() -> (
+        tempfile::TempDir,
+        super::super::read_source_cache::ReadSourceCache,
+        super::super::read_registry::ReadOwnerRegistry<u32>,
+        ReadSourceId,
+    ) {
+        use super::super::{
+            read_registry::{ReadBudget, ReadCapacity, ReadOwnerRegistry, ReadPeer},
+            read_source_cache::{CacheRequest, ReadSourceCache},
+        };
+        let cap = ReadCapacity {
+            bytes: 64,
+            entries: 8,
+        };
+        let mut registry = ReadOwnerRegistry::new(ReadBudget {
+            total: ReadCapacity {
+                bytes: 128,
+                entries: 16,
+            },
+            source: cap,
+            destination: cap,
+            per_peer_source: cap,
+            per_peer_destination: cap,
+            quarantine: cap,
+        })
+        .unwrap();
+        registry
+            .activate_peer(ReadPeer {
+                id: 1,
+                generation: 1,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, vec![1; 64]).unwrap();
+        let file = crate::content::ReadSourceFile::open(&path).unwrap();
+        let mut cache = ReadSourceCache::new();
+        let claim = cache
+            .claim(
+                &mut registry,
+                CacheRequest {
+                    kind: crate::rendezvous::PieceKind::Piece,
+                    task: "task",
+                    file,
+                    piece_length: 8,
+                    max_region_bytes: 64,
+                    piece_offset: 0,
+                    completed: &[0..64],
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        cache.start_registration(claim.source).unwrap();
+        cache
+            .registered(&mut registry, claim.source, 7, false)
+            .unwrap();
+        (dir, cache, registry, ReadSourceId(claim.source))
+    }
+
+    fn lease_test_offer(
+        lease: super::super::read_source_cache::CacheLease,
+        source: ReadSourceId,
+    ) -> ReadCachedLeaseOffer {
+        ReadCachedLeaseOffer {
+            lease,
+            source_offset: 0,
+            offer: super::super::runtime::ReadSourceOffer {
+                id: source,
+                descriptor: super::super::ffi::read::ReadDescriptor {
+                    version: 1,
+                    eid: [1; 16],
+                    uasid: 1,
+                    va: 4096,
+                    length: 64,
+                    token_id: 1,
+                    access: 1,
+                    token_policy: 0,
+                },
+                token: super::super::ffi::read::ReadToken::new(7),
+                register_stages: Default::default(),
+            },
+        }
+    }
+
+    fn lease_test_identity() -> super::super::read_protocol::ReadTransferIdentity {
+        super::super::read_protocol::ReadTransferIdentity {
+            session_generation: 1,
+            transfer_id: 2,
+            metadata_generation: 3,
+        }
+    }
+
+    async fn queued<F: std::future::Future + Unpin>(
+        pending: &mut F,
+        rx: &mut mpsc::UnboundedReceiver<CommandEnvelope>,
+    ) -> FabricCommand {
+        tokio::select! {
+            command = rx.recv() => command.expect("queued owner command").command,
+            _ = pending => panic!("request completed without an owner reply"),
+        }
+    }
+
+    fn abandoned_lease(command: FabricCommand) -> super::super::read_source_cache::CacheLease {
+        match command {
+            FabricCommand::Abandon {
+                action: Abandoned::CachedSourceLease(lease),
+            } => lease,
+            _ => panic!("expected lease abandonment, not physical source retirement"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_registration_reply_loss_keeps_producer_owned_by_cache() {
+        use super::super::{
+            read_registry::{ReapDecision, VerifiedRetirement},
+            read_source_cache::CacheRequest,
+        };
+        for cancel_before_reply in [true, false] {
+            let (dir, mut cache, mut registry, old) = lease_test_cache();
+            cache.retire(&mut registry, old.0).unwrap();
+            // SAFETY: this fixture has an integer owner and no native access.
+            registry
+                .reap_with(old.0, |_| {
+                    Ok::<_, ()>(ReapDecision::Retired(unsafe {
+                        VerifiedRetirement::new(old.0)
+                    }))
+                })
+                .unwrap();
+            cache.observe_cleanup(&registry, old.0).unwrap();
+            let (fabric, mut rx) = lease_test_handle();
+            let file = crate::content::ReadSourceFile::open(&dir.path().join("task")).unwrap();
+            let request = || ReadCachedSourceRequest {
+                peer_id: 1,
+                kind: crate::rendezvous::PieceKind::Piece,
+                task: "task".into(),
+                file: file.clone(),
+                piece_length: 8,
+                max_region_bytes: 64,
+                piece_offset: 0,
+                completed: vec![0..64],
+                token: super::super::ffi::read::ReadToken::new(9),
+            };
+            // SAFETY: immutable test file, mock owner, no provider access.
+            let mut registering = Box::pin(unsafe {
+                fabric.register_cached_source(request(), Duration::from_secs(3))
+            });
+            let FabricCommand::RegisterCachedSource {
+                request: command,
+                reply,
+            } = queued(&mut registering, &mut rx).await
+            else {
+                panic!("expected cache-owned registration");
+            };
+            let claim = cache
+                .claim(
+                    &mut registry,
+                    CacheRequest {
+                        kind: command.kind,
+                        task: &command.task,
+                        file: command.file,
+                        piece_length: command.piece_length,
+                        max_region_bytes: command.max_region_bytes,
+                        piece_offset: command.piece_offset,
+                        completed: &command.completed,
+                    },
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            assert!(claim.register);
+            cache.start_registration(claim.source).unwrap();
+            let result = ReadCachedSource {
+                source: ReadSourceId(claim.source),
+                peer_generation: 1,
+                range: claim.range,
+                updates: claim.updates,
+            };
+            if cancel_before_reply {
+                drop(registering);
+                assert!(reply.send(Ok(result)).is_err());
+            } else {
+                assert!(reply.send(Ok(result)).is_ok());
+                tokio::select! {
+                    _ = &mut registering => panic!("must wait while native registration is pending"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                drop(registering);
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(registry.usage().source_bytes, 64);
+            cache
+                .registered(&mut registry, claim.source, 7, false)
+                .unwrap();
+            // A later request can observe the completed registration, with no
+            // second producer and no guard tied to the departed first request.
+            let mut later = Box::pin(unsafe {
+                fabric.register_cached_source(request(), Duration::from_secs(3))
+            });
+            let FabricCommand::RegisterCachedSource { reply, .. } =
+                queued(&mut later, &mut rx).await
+            else {
+                panic!("expected cached lookup");
+            };
+            let hit = cache
+                .claim(
+                    &mut registry,
+                    CacheRequest {
+                        kind: crate::rendezvous::PieceKind::Piece,
+                        task: "task",
+                        file: file.clone(),
+                        piece_length: 8,
+                        max_region_bytes: 64,
+                        piece_offset: 0,
+                        completed: &[0..64],
+                    },
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            assert!(!hit.register);
+            assert!(reply
+                .send(Ok(ReadCachedSource {
+                    source: ReadSourceId(hit.source),
+                    peer_generation: 1,
+                    range: hit.range,
+                    updates: hit.updates
+                }))
+                .is_ok());
+            assert_eq!(later.await.unwrap().source, ReadSourceId(claim.source));
+            assert_eq!(registry.usage().source_entries, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_parent_publishes_region_and_finishes_only_its_lease() {
+        use super::super::{
+            read_control::ReadLaneControl,
+            read_protocol::{ReadFrame, ReadPieceLocator},
+            read_registry::ReadPeer,
+            read_source_cache::{CacheRequest, CacheState},
+            read_transfer::parent::ParentTransfer,
+        };
+        let (dir, mut cache, mut registry, source) = lease_test_cache();
+        registry
+            .activate_peer(ReadPeer {
+                id: 2,
+                generation: 1,
+            })
+            .unwrap();
+        let file = crate::content::ReadSourceFile::open(&dir.path().join("task")).unwrap();
+        let (fabric, mut rx) = lease_test_handle();
+        for peer_id in [1, 2] {
+            let identity = lease_test_identity();
+            let piece_offset = u64::from(peer_id) * 8;
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            let child_lane =
+                ReadLaneControl::spawn(client_stream, identity.session_generation, 2, 4).unwrap();
+            let parent_lane =
+                ReadLaneControl::spawn(server_stream, identity.session_generation, 2, 4).unwrap();
+            let mut child = child_lane.register(identity).unwrap();
+            let mut control = parent_lane.register(identity).unwrap();
+            child
+                .send(ReadFrame::BufferReady {
+                    identity,
+                    accepted_length: 8,
+                    request: ReadPieceLocator {
+                        kind: crate::rendezvous::PieceKind::Piece,
+                        task_id: "task".into(),
+                        piece_number: u32::from(peer_id),
+                    },
+                })
+                .await
+                .unwrap();
+            let ready = control.receive().await.unwrap();
+            let (parent, _) = ParentTransfer::accept(
+                fabric.clone(),
+                peer_id,
+                control,
+                ready,
+                piece_offset,
+                String::new(),
+                4096,
+            )
+            .unwrap();
+            let parent = parent.on_source_state(|_, _| {
+                panic!("cached source must not enter the dedicated per-lane cleanup ledger")
+            });
+            // SAFETY: immutable test file, integer owner, no native grants/READ.
+            let mut publishing = Box::pin(unsafe {
+                parent.publish_cached_and_wait_read_done(
+                    ReadCachedSourceRequest {
+                        peer_id,
+                        kind: crate::rendezvous::PieceKind::Piece,
+                        task: "task".into(),
+                        file: file.clone(),
+                        piece_length: 8,
+                        max_region_bytes: 64,
+                        piece_offset,
+                        completed: vec![0..64],
+                        token: super::super::ffi::read::ReadToken::new(7),
+                    },
+                    Duration::from_secs(3),
+                )
+            });
+            let FabricCommand::RegisterCachedSource { request, reply } =
+                queued(&mut publishing, &mut rx).await
+            else {
+                panic!("expected cached registration");
+            };
+            let claim = cache
+                .claim(
+                    &mut registry,
+                    CacheRequest {
+                        kind: request.kind,
+                        task: &request.task,
+                        file: request.file,
+                        piece_length: request.piece_length,
+                        max_region_bytes: request.max_region_bytes,
+                        piece_offset: request.piece_offset,
+                        completed: &request.completed,
+                    },
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            assert!(!claim.register);
+            assert_eq!(claim.source, source.0);
+            assert!(reply
+                .send(Ok(ReadCachedSource {
+                    source,
+                    peer_generation: 1,
+                    range: claim.range,
+                    updates: claim.updates
+                }))
+                .is_ok());
+            let FabricCommand::AcquireCachedSourceLease { request, reply } =
+                queued(&mut publishing, &mut rx).await
+            else {
+                panic!("expected lease acquisition");
+            };
+            let lease = cache
+                .acquire(
+                    &mut registry,
+                    source.0,
+                    ReadPeer {
+                        id: peer_id,
+                        generation: 1,
+                    },
+                    request.transfer,
+                    request.piece,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let mut offered = lease_test_offer(lease, source);
+            offered.source_offset = piece_offset;
+            assert!(reply.send(Ok(offered)).is_ok());
+            let FabricCommand::ExposeCachedSourceLease {
+                lease,
+                generation,
+                reply,
+            } = queued(&mut publishing, &mut rx).await
+            else {
+                panic!("expected exposure before wire publication");
+            };
+            cache.expose(lease, generation).unwrap();
+            reply.send(Ok(())).unwrap();
+            let frame = tokio::select! {
+                frame = child.receive() => frame.unwrap(),
+                _ = &mut publishing => panic!("Parent must wait for Child drain"),
+            };
+            let ReadFrame::SegmentOffer { offer, .. } = frame else {
+                panic!("expected Region Offer");
+            };
+            assert_eq!(
+                (
+                    offer.length,
+                    offer.source_offset,
+                    offer.piece_length,
+                    offer.piece_offset
+                ),
+                (64, piece_offset, 8, piece_offset)
+            );
+            assert_eq!(offer.segment_generation, generation);
+            if peer_id == 1 {
+                child
+                    .send(ReadFrame::ReadDone {
+                        identity,
+                        segment_generation: generation,
+                        completed_length: 8,
+                        read_wr_count: 1,
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                child
+                    .send(ReadFrame::Cancel {
+                        identity,
+                        segment_generation: Some(generation),
+                        reason: "cancelled before post".into(),
+                    })
+                    .await
+                    .unwrap();
+                child
+                    .send(ReadFrame::CancelDrained {
+                        identity,
+                        segment_generation: Some(generation),
+                        accepted_wr_count: 0,
+                        retired_wr_count: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (parent, pending) = publishing.await.map_err(|failure| failure.error).unwrap();
+            // SAFETY: mock transport has no native accesses; the protocol has
+            // validated this exact ReadDone/CancelDrained identity/generation.
+            let mut finishing = Box::pin(unsafe { parent.finish_cached(pending) });
+            let FabricCommand::ReleaseCachedSourceLease {
+                lease,
+                transfer,
+                generation,
+                reply,
+            } = queued(&mut finishing, &mut rx).await
+            else {
+                panic!("must release the lease, never unregister the shared source");
+            };
+            unsafe {
+                cache.release_drained(
+                    &mut registry,
+                    lease,
+                    transfer,
+                    generation,
+                    std::time::Instant::now(),
+                )
+            }
+            .unwrap();
+            reply.send(Ok(())).unwrap();
+            finishing.await.unwrap();
+            let terminal = child.receive().await.unwrap();
+            if peer_id == 1 {
+                assert!(matches!(terminal, ReadFrame::Done { .. }));
+            } else {
+                assert!(matches!(terminal, ReadFrame::Cancelled { .. }));
+            }
+            assert_eq!(registry.usage().source_bytes, 64);
+            assert_eq!(
+                registry
+                    .peer_usage(ReadPeer {
+                        id: peer_id,
+                        generation: 1
+                    })
+                    .source_bytes,
+                0
+            );
+            assert_eq!(
+                *cache
+                    .claim(
+                        &mut registry,
+                        CacheRequest {
+                            kind: crate::rendezvous::PieceKind::Piece,
+                            task: "task",
+                            file: file.clone(),
+                            piece_length: 8,
+                            max_region_bytes: 64,
+                            piece_offset,
+                            completed: &[0..64]
+                        },
+                        std::time::Instant::now()
+                    )
+                    .unwrap()
+                    .updates
+                    .borrow(),
+                CacheState::Ready
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_acquire_reply_loss_before_or_after_send_only_releases_its_lease() {
+        use super::super::read_registry::ReadPeer;
+        for cancel_stage in 0..3 {
+            let (_dir, mut cache, mut registry, source) = lease_test_cache();
+            let (fabric, mut rx) = lease_test_handle();
+            // SAFETY: device-free cache with integer owners and no remote accesses.
+            let mut acquire = Box::pin(unsafe {
+                fabric.acquire_cached_source_lease(ReadCachedLeaseRequest {
+                    source,
+                    peer_id: 1,
+                    peer_generation: 1,
+                    transfer: lease_test_identity(),
+                    piece: 0..8,
+                })
+            });
+            let FabricCommand::AcquireCachedSourceLease { request, reply } =
+                queued(&mut acquire, &mut rx).await
+            else {
+                panic!("expected acquire");
+            };
+            let lease = cache
+                .acquire(
+                    &mut registry,
+                    request.source.0,
+                    ReadPeer {
+                        id: 1,
+                        generation: 1,
+                    },
+                    request.transfer,
+                    request.piece,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            if cancel_stage == 0 {
+                drop(acquire);
+                assert!(reply.send(Ok(lease_test_offer(lease, source))).is_err());
+            } else {
+                assert!(reply.send(Ok(lease_test_offer(lease, source))).is_ok());
+                if cancel_stage == 1 {
+                    drop(acquire);
+                } else {
+                    drop(acquire.await.unwrap());
+                }
+            }
+            let lease = abandoned_lease(rx.recv().await.unwrap().command);
+            cache
+                .abandon(&mut registry, lease, std::time::Instant::now())
+                .unwrap();
+            assert_eq!(
+                registry
+                    .peer_usage(ReadPeer {
+                        id: 1,
+                        generation: 1
+                    })
+                    .source_bytes,
+                0
+            );
+            assert_eq!(registry.usage().source_bytes, 64);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_expose_cancel_retains_and_release_reply_loss_cannot_free_another_lease() {
+        use super::super::{
+            read_registry::{OwnerError, ReadPeer},
+            read_source_cache::CacheError,
+        };
+        for outcome in 0..3 {
+            let (_dir, mut cache, mut registry, source) = lease_test_cache();
+            let (fabric, mut rx) = lease_test_handle();
+            let peer = ReadPeer {
+                id: 1,
+                generation: 1,
+            };
+            // SAFETY: no native resources or remote accesses exist in this test.
+            let mut acquire = Box::pin(unsafe {
+                fabric.acquire_cached_source_lease(ReadCachedLeaseRequest {
+                    source,
+                    peer_id: 1,
+                    peer_generation: 1,
+                    transfer: lease_test_identity(),
+                    piece: 0..8,
+                })
+            });
+            let FabricCommand::AcquireCachedSourceLease { request, reply } =
+                queued(&mut acquire, &mut rx).await
+            else {
+                panic!("expected acquire");
+            };
+            let identity = cache
+                .acquire(
+                    &mut registry,
+                    source.0,
+                    peer,
+                    request.transfer,
+                    request.piece,
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            assert!(reply.send(Ok(lease_test_offer(identity, source))).is_ok());
+            let mut lease = acquire.await.unwrap();
+            let mut expose = Box::pin(fabric.expose_cached_source_lease(&lease, 11));
+            let FabricCommand::ExposeCachedSourceLease {
+                lease: identity,
+                generation,
+                reply,
+            } = queued(&mut expose, &mut rx).await
+            else {
+                panic!("expected expose");
+            };
+            cache.expose(identity, generation).unwrap();
+            if outcome == 0 {
+                // Exposure was processed but its caller was cancelled before
+                // receiving the reply. The subsequent lease guard must retain.
+                drop(expose);
+                drop(reply);
+                drop(lease);
+                let identity = abandoned_lease(rx.recv().await.unwrap().command);
+                cache
+                    .abandon(&mut registry, identity, std::time::Instant::now())
+                    .unwrap();
+                assert!(matches!(
+                    cache.check_cleanup(&registry, source.0),
+                    Err(CacheError::Registry(OwnerError::SourceBusy))
+                ));
+                assert_eq!(registry.peer_usage(peer).source_bytes, 8);
+            } else {
+                reply.send(Ok(())).unwrap();
+                expose.await.unwrap();
+                // SAFETY: test integer owners have no outstanding access.
+                let mut release = Box::pin(unsafe {
+                    fabric.release_cached_source_lease(&mut lease, lease_test_identity(), 11)
+                });
+                let FabricCommand::ReleaseCachedSourceLease {
+                    lease: identity,
+                    transfer,
+                    generation,
+                    reply,
+                } = queued(&mut release, &mut rx).await
+                else {
+                    panic!("expected release");
+                };
+                // SAFETY: no native registration or READ exists.
+                unsafe {
+                    cache.release_drained(
+                        &mut registry,
+                        identity,
+                        transfer,
+                        generation,
+                        std::time::Instant::now(),
+                    )
+                }
+                .unwrap();
+                reply.send(Ok(())).unwrap();
+                if outcome == 2 {
+                    release.await.unwrap();
+                    drop(lease);
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    assert_eq!(registry.peer_usage(peer).source_bytes, 0);
+                    assert_eq!(registry.usage().source_bytes, 64);
+                    continue;
+                }
+                drop(release);
+                let later = cache
+                    .acquire(
+                        &mut registry,
+                        source.0,
+                        peer,
+                        super::super::read_protocol::ReadTransferIdentity {
+                            transfer_id: 4,
+                            ..lease_test_identity()
+                        },
+                        8..16,
+                        std::time::Instant::now(),
+                    )
+                    .unwrap();
+                drop(lease);
+                let stale = abandoned_lease(rx.recv().await.unwrap().command);
+                assert!(matches!(
+                    cache.abandon(&mut registry, stale, std::time::Instant::now()),
+                    Err(CacheError::Missing)
+                ));
+                assert_eq!(registry.peer_usage(peer).source_bytes, 8);
+                cache
+                    .abandon(&mut registry, later, std::time::Instant::now())
+                    .unwrap();
+            }
+            assert_eq!(registry.usage().source_bytes, 64);
+        }
+    }
 
     #[test]
     fn zero_command_capacity_is_rejected_before_spawning() {

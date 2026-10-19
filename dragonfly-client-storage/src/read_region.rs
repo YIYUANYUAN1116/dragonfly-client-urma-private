@@ -83,9 +83,8 @@ impl ReadRegionLayout {
             .find(|range| range.start <= piece_offset && range.end >= piece_end)
             .ok_or_else(|| Error::Unsupported("READ Piece is not completely available".into()))?;
 
-        let window_start = piece_offset / self.window_length * self.window_length;
-        let window_end = window_start + self.window_length.min(self.file_length - window_start);
-        let mut selected = completed.start.max(window_start)..completed.end.min(window_end);
+        let window = self.window(piece_offset)?;
+        let mut selected = completed.start.max(window.start)..completed.end.min(window.end);
         for range in claimed {
             if range.start <= piece_offset && range.end >= piece_end {
                 return Ok(ReadRegionSelection::Covered(range));
@@ -105,6 +104,16 @@ impl ReadRegionLayout {
             return Err(Error::InvalidParameter);
         }
         Ok(ReadRegionSelection::Register(selected))
+    }
+
+    /// Storage only needs completion evidence in this fixed window, even for
+    /// multi-terabyte Tasks. Keep the window arithmetic shared with selection.
+    pub(crate) fn window(&self, piece_offset: u64) -> Result<Range<u64>> {
+        if piece_offset >= self.file_length || piece_offset % self.piece_length != 0 {
+            return Err(Error::InvalidParameter);
+        }
+        let start = piece_offset / self.window_length * self.window_length;
+        Ok(start..start + self.window_length.min(self.file_length - start))
     }
 
     fn checked_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>> {

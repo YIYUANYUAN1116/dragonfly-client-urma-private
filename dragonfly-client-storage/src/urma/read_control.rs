@@ -1,4 +1,4 @@
-//! Version 5 READ lane handshake and transfer dispatcher.
+//! Version 6 READ lane handshake and transfer dispatcher.
 //!
 //! Handshake ownership stays outside the dispatcher so native lane creation and
 //! rollback remain explicit. After handshake, one reader and writer task route
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_five_handshake_round_trips_and_echoes_session_generation() {
+    async fn handshake_round_trips_and_echoes_session_generation() {
         let frame = ReadHandshake::Connect {
             capability: capability(),
             session_generation: 41,
@@ -605,6 +605,26 @@ mod tests {
             descriptor: vec![4, 5, 6],
         };
         assert!(connected.validate_connected(&capability(), 41).is_err());
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_piece_only_version_five_before_admitting_a_lane() {
+        let frame = ReadHandshake::Connect {
+            capability: capability(),
+            session_generation: 41,
+            descriptor: vec![1, 2, 3],
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
+        write_handshake(&mut writer, &frame).await.unwrap();
+        let (kind, payload) =
+            read_envelope(&mut reader, MAGIC, READ_DFUR_VERSION, MAX_PAYLOAD_LENGTH)
+                .await
+                .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(MAX_PAYLOAD_LENGTH + 1024);
+        write_envelope(&mut writer, MAGIC, 5, kind, &payload, MAX_PAYLOAD_LENGTH)
+            .await
+            .unwrap();
+        assert!(read_handshake(&mut reader).await.is_err());
     }
 
     #[tokio::test]

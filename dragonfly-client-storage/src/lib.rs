@@ -38,6 +38,10 @@ use tokio_util::io::InspectReader;
 use tracing::{debug, error, info, instrument, warn};
 
 mod piece_notifier;
+mod task_file_lifecycle;
+
+#[cfg(all(feature = "urma", target_os = "linux"))]
+mod read_storage_source;
 
 #[cfg(all(feature = "urma", target_os = "linux"))]
 mod read_source_file;
@@ -84,10 +88,10 @@ pub struct Storage {
     config: Arc<Config>,
 
     /// Implements the metadata storage.
-    metadata: metadata::Metadata,
+    metadata: Arc<metadata::Metadata>,
 
     /// Implements the content storage.
-    content: content::Content,
+    content: Arc<content::Content>,
 
     /// Implements the cache storage.
     cache: cache::Cache,
@@ -95,6 +99,10 @@ pub struct Storage {
     /// Notifies the waiters of the in-flight pieces when their downloads
     /// complete.
     piece_notifier: PieceNotifier,
+
+    /// Ordinary Task create/delete and opened-file snapshots only. Never held
+    /// through network transfers or native registration/revocation.
+    task_file_lifecycle: task_file_lifecycle::TaskFileLifecycle,
 }
 
 /// Implements the storage.
@@ -109,10 +117,11 @@ impl Storage {
         fs::create_dir_all(&dir.join(DEFAULT_TMP_DIR)).await?;
         Ok(Storage {
             config,
-            metadata,
-            content,
+            metadata: Arc::new(metadata),
+            content: Arc::new(content),
             cache,
             piece_notifier: PieceNotifier::default(),
+            task_file_lifecycle: Default::default(),
         })
     }
 
@@ -171,10 +180,40 @@ impl Storage {
         content_length: u64,
         response_header: Option<HeaderMap>,
     ) -> Result<metadata::Task> {
-        self.content.create_task(id, content_length).await?;
-
-        self.metadata
-            .download_task_started(id, piece_length, content_length, response_header)
+        let gate = self.task_file_lifecycle.gate(id);
+        let metadata = self.metadata.clone();
+        let content = self.content.clone();
+        let mut cache = self.cache.clone();
+        let id = id.to_owned();
+        task_file_lifecycle::TaskFileLifecycle::mutate(gate, async move {
+            let existing = metadata.get_task(&id)?;
+            let unpublished = existing
+                .as_ref()
+                .is_none_or(|task| task.piece_length.is_none() || task.content_length.is_none());
+            if unpublished {
+                // A failed GC may leave either file bytes or Piece metadata.
+                // A new Task must not publish those as its completed content.
+                metadata.delete_pieces(&id)?;
+                match cache.delete_task(&id).await {
+                    Ok(()) | Err(Error::TaskNotFound(_)) => (),
+                    Err(error) => return Err(error),
+                }
+                content.reset_task_file(&id).await?;
+            } else if metadata.has_finished_pieces(&id)? {
+                let previous = existing.as_ref().expect("checked Task metadata");
+                if previous.piece_length != Some(piece_length)
+                    || previous.content_length != Some(content_length)
+                {
+                    return Err(Error::InvalidParameter);
+                }
+                // Do not silently recreate a file while keeping old completed
+                // Piece metadata, or resize a registered immutable inode.
+                content.validate_task_file(&id, content_length).await?;
+            }
+            content.create_task(&id, content_length).await?;
+            metadata.download_task_started(&id, piece_length, content_length, response_header)
+        })
+        .await?
     }
 
     /// Updates the metadata of the task when the task downloads finished.
@@ -222,22 +261,36 @@ impl Storage {
     /// Deletes the task metadatas, task content and piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub async fn delete_task(&self, id: &str) {
-        self.metadata
-            .delete_task(id)
-            .unwrap_or_else(|err| error!("delete task metadata failed: {}", err));
-
-        self.metadata.delete_pieces(id).unwrap_or_else(|err| {
-            error!("delete piece metadatas failed: {}", err);
-        });
-
-        self.content.delete_task(id).await.unwrap_or_else(|err| {
-            error!("delete task content failed: {}", err);
-        });
-
+        let gate = self.task_file_lifecycle.gate(id);
+        let metadata = self.metadata.clone();
+        let content = self.content.clone();
         let mut cache = self.cache.clone();
-        cache.delete_task(id).await.unwrap_or_else(|err| {
-            info!("delete task from cache failed: {}", err);
-        });
+        let id = id.to_owned();
+        if let Err(error) = task_file_lifecycle::TaskFileLifecycle::mutate(gate, async move {
+            if let Err(error) = metadata.delete_task(&id) {
+                // Keep the still-published Task coherent if invalidation fails.
+                // Deleting its Piece records/file here would let a retry reuse
+                // an old inode while cached readers still hold its capability.
+                error!(%error, "delete task metadata failed; preserving Task content");
+                return;
+            }
+
+            metadata.delete_pieces(&id).unwrap_or_else(|err| {
+                error!("delete piece metadatas failed: {}", err);
+            });
+
+            content.delete_task(&id).await.unwrap_or_else(|err| {
+                error!("delete task content failed: {}", err);
+            });
+
+            cache.delete_task(&id).await.unwrap_or_else(|err| {
+                info!("delete task from cache failed: {}", err);
+            });
+        })
+        .await
+        {
+            error!(%error, "delete Task lifecycle operation failed");
+        }
     }
 
     /// Hard links the persistent task content to the destination.

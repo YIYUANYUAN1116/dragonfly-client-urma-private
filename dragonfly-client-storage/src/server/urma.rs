@@ -463,7 +463,7 @@ fn allocate_read_token(space: &ReadTokenSpace) -> ClientResult<u32> {
     }
 }
 
-/// Builds the READ lane capability advertised during the version-5 handshake.
+/// Builds the READ lane capability advertised during the version-6 handshake.
 fn read_parent_config(
     read: &UrmaReadServer,
     fabric: &UrmaFabricHandle,
@@ -558,7 +558,7 @@ impl UrmaServerHandler {
         Ok(PieceSource::Reader(reader))
     }
 
-    /// Serves one RM-READ lane: version-5 handshake, Child-side Jetty import, and
+    /// Serves one RM-READ lane: version-6 handshake, Child-side Jetty import, and
     /// Child-initiated transfer admission. Only control frames use this TCP
     /// stream; Piece bytes move inside the registered READ budget.
     async fn handle_read_lane(
@@ -763,7 +763,7 @@ impl UrmaServerHandler {
         let source_copy_ns = source_copy_start.elapsed().as_nanos() as u64;
         let token = ReadToken::new(next_read_token()?);
 
-        // SAFETY: The version-5 handshake authenticated this lane and the
+        // SAFETY: The version-6 handshake authenticated this lane and the
         // accepted length was proven to match the immutable Storage Piece.
         let (parent, pending) = match unsafe {
             transfer.publish_and_wait_read_done(
