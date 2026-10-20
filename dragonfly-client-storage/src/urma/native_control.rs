@@ -49,6 +49,7 @@ pub(crate) struct NativeControl {
     next_context: u64,
     closing: bool,
     uncertain_buffer: bool,
+    last_error: Option<String>,
 }
 impl NativeControl {
     pub(crate) fn new() -> Result<(Self, mpsc::Receiver<Result<Vec<u8>>>)> {
@@ -70,6 +71,7 @@ impl NativeControl {
                 next_context: 1,
                 closing: false,
                 uncertain_buffer: false,
+                last_error: None,
             },
             rx,
         ))
@@ -197,10 +199,13 @@ impl NativeControl {
             }
         }
         if let Some(jetty) = &mut self.jetty {
-            let _ = jetty.mark_error();
+            if let Err(error) = jetty.mark_error() {
+                self.last_error = Some(format!("mark_error: {error:?}"));
+            }
         }
     }
     fn fail(&mut self, error: Error) {
+        self.last_error = Some(error.to_string());
         if !self.closing {
             tracing::debug!(control_id = self.id, %error, "URMA SEND/RECV control endpoint failed");
             if let Some(tx) = self.incoming.take() {
@@ -213,6 +218,18 @@ impl NativeControl {
             }
         }
         self.stop();
+    }
+    pub(crate) fn retirement_diagnostic(&self) -> String {
+        let rx = self.posted.values().filter(|f| f.slot != RX_SLOTS).count();
+        format!(
+            "control_id={} closing={} rx_wrs={} tx_wrs={} uncertain_buffer={} last_error={:?}",
+            self.id,
+            self.closing,
+            rx,
+            self.posted.len() - rx,
+            self.uncertain_buffer,
+            self.last_error,
+        )
     }
     fn deliver(&mut self, slot: usize, bytes: Vec<u8>) -> Result<()> {
         let Some(tx) = &self.incoming else {
@@ -337,22 +354,33 @@ impl NativeControl {
         }
         let result = (|| {
             if let Some(target) = &mut self.target {
-                target.close().map_err(err)?;
+                target
+                    .close()
+                    .map_err(|e| protocol(format!("control unimport target: {e:?}")))?;
             }
             if let Some(jetty) = &mut self.jetty {
-                jetty.close().map_err(err)?;
+                jetty
+                    .close()
+                    .map_err(|e| protocol(format!("control close jetty/JFR: {e:?}")))?;
             }
             if let Some(buffer) = &mut self.buffer {
-                buffer.close().map_err(err)?;
+                buffer
+                    .close()
+                    .map_err(|e| protocol(format!("control close buffer: {e:?}")))?;
             }
             if let Some(cq) = &mut self.recv_cq {
-                cq.close().map_err(err)?;
+                cq.close()
+                    .map_err(|e| protocol(format!("control close recv CQ: {e:?}")))?;
             }
             if let Some(cq) = &mut self.send_cq {
-                cq.close().map_err(err)?;
+                cq.close()
+                    .map_err(|e| protocol(format!("control close send CQ: {e:?}")))?;
             }
             Ok::<_, Error>(())
         })();
+        if let Err(error) = &result {
+            self.last_error = Some(error.to_string());
+        }
         ControlProgress {
             closed: result.is_ok(),
             events,
@@ -387,6 +415,17 @@ fn validate_work_completion(cqe: &CompletionRecord, receive: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_diagnostic_retains_errors_after_stop() {
+        let (mut control, _rx) = NativeControl::new().unwrap();
+        control.fail(protocol("fixture flush error"));
+        let diagnostic = control.retirement_diagnostic();
+        assert!(diagnostic.contains("closing=true rx_wrs=0 tx_wrs=0"));
+        assert!(diagnostic.contains("fixture flush error"));
+        control.stop();
+        assert_eq!(diagnostic, control.retirement_diagnostic());
+    }
 
     #[test]
     fn udma_send_and_recv_completions_do_not_use_the_wr_send_opcode() {

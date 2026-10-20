@@ -1937,6 +1937,12 @@ mod native {
                         self.outstanding(),
                         self.read.drained(),
                     ));
+                    for (&peer_id, control) in &self.controls {
+                        failures.push(format!(
+                            "PeerTarget {peer_id} blocked by SEND/RECV control: {}",
+                            control.retirement_diagnostic(),
+                        ));
+                    }
                 }
             }
 
