@@ -12,6 +12,8 @@ pub mod fabric;
 pub(crate) mod ffi;
 mod lane;
 mod native_control;
+#[cfg(test)]
+mod read_bandwidth_probe;
 mod read_child_owner;
 pub(crate) mod read_control;
 pub(crate) mod read_handoff;
