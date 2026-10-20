@@ -687,7 +687,7 @@ async fn native_probe(o: &Options) -> Result<()> {
 
 // C: production Fabric/cache/READ state machines; no Storage FD, pwrite, CRC
 // consumer or application Task commit in timed phases. Registration is hot.
-fn fabric(o: &Options) -> Result<UrmaFabricHandle> {
+fn cached_budget(o: &Options) -> ReadBudget {
     // A small file may be leased repeatedly by all concurrent Pieces. Peer
     // lease bytes must cover the window, not only the physical file size.
     let source = o.file_bytes.max(o.depth as u64 * o.piece) * 2;
@@ -696,19 +696,27 @@ fn fabric(o: &Options) -> Result<UrmaFabricHandle> {
         bytes,
         entries: 4096,
     };
+    let source = cap(source);
+    let destination = cap(destination);
+    ReadBudget {
+        total: ReadCapacity {
+            bytes: source.bytes + destination.bytes,
+            entries: source.entries + destination.entries,
+        },
+        source,
+        destination,
+        per_peer_source: source,
+        per_peer_destination: destination,
+        quarantine: source,
+    }
+}
+fn fabric(o: &Options) -> Result<UrmaFabricHandle> {
     UrmaFabric::start(
         RuntimeConfig::new(
             &o.device,
             o.eid,
             ReadRuntimeConfig {
-                budget: ReadBudget {
-                    total: cap(source + destination),
-                    source: cap(source),
-                    destination: cap(destination),
-                    per_peer_source: cap(source),
-                    per_peer_destination: cap(destination),
-                    quarantine: cap(source),
-                },
+                budget: cached_budget(o),
                 max_outstanding_per_peer: o.depth,
                 max_outstanding_per_piece: 1,
                 buffer_alignment: 4096,
@@ -1114,6 +1122,17 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
         threads: 32,
     };
     o.validate().unwrap();
+    let budget = cached_budget(&o);
+    assert_eq!(budget.total.entries, 8192);
+    assert!(super::read_registry::ReadOwnerRegistry::<()>::new(budget).is_ok());
+    // Reproduce the original probe configuration: both directions had 4096
+    // entries but their shared total was also only 4096. No provider needed.
+    let mut invalid = budget;
+    invalid.total.entries = 4096;
+    assert!(matches!(
+        super::read_registry::ReadOwnerRegistry::<()>::new(invalid),
+        Err(super::read_registry::OwnerError::InvalidBudget)
+    ));
     assert_eq!(o.pieces(), 32);
     assert_ne!(o.signature(false), o.signature(true));
     for change in [0, 1, 2, 3, 4, 5] {
