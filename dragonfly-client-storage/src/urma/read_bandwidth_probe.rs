@@ -329,6 +329,7 @@ impl Limit {
 struct Measurement {
     pieces: u64,
     elapsed: Duration,
+    native: Option<NativeObservation>,
 }
 impl Measurement {
     fn rates(&self, o: &Options) -> Result<(u64, f64, f64)> {
@@ -352,7 +353,111 @@ impl Measurement {
         println!("URMA_BW_RESULT mode={} completed_bytes={} completed_pieces={} elapsed_ns={} GiBps={:.4} Gbps={:.4} storage=false crc_timed=false drain_included=true",
             if cached { "C" } else { "B" }, bytes, self.pieces, self.elapsed.as_nanos(),
             gibps, gbps);
+        if let Some(native) = &self.native {
+            native.report(o, self.elapsed);
+        }
         Ok(())
+    }
+}
+
+// Counts accepted WRs until the owner polls their CQEs. This includes device
+// completions not yet polled, and is not hardware queue occupancy or NIC busy%.
+struct NativeObservation {
+    last: Instant,
+    depth: usize,
+    peak: usize,
+    area_ns: u128,
+    full_ns: u128,
+    zero_ns: u128,
+    window: usize,
+    posts: u64,
+    completions: u64,
+    polls: u64,
+    empty_polls: u64,
+    post_ns: u128,
+    post_max_ns: u128,
+    cqe_ns: u128,
+    cqe_min_ns: u128,
+    cqe_max_ns: u128,
+    refills: u64,
+    refill_ns: u128,
+    refill_max_ns: u128,
+}
+impl NativeObservation {
+    fn new(start: Instant, window: usize) -> Self {
+        Self {
+            last: start,
+            depth: 0,
+            peak: 0,
+            area_ns: 0,
+            full_ns: 0,
+            zero_ns: 0,
+            window,
+            posts: 0,
+            completions: 0,
+            polls: 0,
+            empty_polls: 0,
+            post_ns: 0,
+            post_max_ns: 0,
+            cqe_ns: 0,
+            cqe_min_ns: u128::MAX,
+            cqe_max_ns: 0,
+            refills: 0,
+            refill_ns: 0,
+            refill_max_ns: 0,
+        }
+    }
+    fn advance(&mut self, now: Instant) {
+        let ns = now.duration_since(self.last).as_nanos();
+        self.area_ns += ns * self.depth as u128;
+        if self.depth == self.window {
+            self.full_ns += ns;
+        }
+        if self.depth == 0 {
+            self.zero_ns += ns;
+        }
+        self.last = now;
+    }
+    fn posted(&mut self, started: Instant, returned: Instant, recycled: Option<Instant>) {
+        self.advance(started);
+        self.depth += 1;
+        self.peak = self.peak.max(self.depth);
+        self.posts += 1;
+        let ns = returned.duration_since(started).as_nanos();
+        self.post_ns += ns;
+        self.post_max_ns = self.post_max_ns.max(ns);
+        if let Some(recycled) = recycled {
+            let ns = started.duration_since(recycled).as_nanos();
+            self.refills += 1;
+            self.refill_ns += ns;
+            self.refill_max_ns = self.refill_max_ns.max(ns);
+        }
+    }
+    fn completed(&mut self, posted: Instant, observed: Instant) {
+        self.advance(observed);
+        self.depth -= 1;
+        self.completions += 1;
+        let ns = observed.duration_since(posted).as_nanos();
+        self.cqe_ns += ns;
+        self.cqe_min_ns = self.cqe_min_ns.min(ns);
+        self.cqe_max_ns = self.cqe_max_ns.max(ns);
+    }
+    fn polled(&mut self, count: usize) {
+        self.polls += 1;
+        self.empty_polls += u64::from(count == 0);
+    }
+    fn report(&self, o: &Options, elapsed: Duration) {
+        let ns = elapsed.as_nanos().max(1) as f64;
+        let mean_us = |total: u128, count: u64| total as f64 / count.max(1) as f64 / 1000.0;
+        println!("URMA_BW_NATIVE mode=B source_pattern={} wrs={} polls={} empty_polls={} empty_poll_pct={:.3} avg_unretired={:.3} peak_unretired={} full_window_pct={:.3} zero_unretired_pct={:.3} post_call_ms={:.3} post_call_mean_us={:.3} post_call_max_us={:.3} post_to_cqe_mean_us={:.3} post_to_cqe_min_us={:.3} post_to_cqe_max_us={:.3} refill_count={} refill_mean_us={:.3} refill_max_us={:.3} outstanding_scope=host-post-to-polled-cqe drain_included=true",
+            o.source_pattern.name(), self.completions, self.polls, self.empty_polls,
+            100.0 * self.empty_polls as f64 / self.polls.max(1) as f64,
+            self.area_ns as f64 / ns, self.peak, 100.0 * self.full_ns as f64 / ns,
+            100.0 * self.zero_ns as f64 / ns, self.post_ns as f64 / 1e6,
+            mean_us(self.post_ns, self.posts), self.post_max_ns as f64 / 1000.0,
+            mean_us(self.cqe_ns, self.completions), self.cqe_min_ns as f64 / 1000.0,
+            self.cqe_max_ns as f64 / 1000.0, self.refills,
+            mean_us(self.refill_ns, self.refills), self.refill_max_ns as f64 / 1000.0);
     }
 }
 
@@ -462,13 +567,14 @@ fn native_phase(
 ) -> Result<Measurement> {
     let start = Instant::now();
     let mut pending = HashMap::<u64, Pending>::new();
-    let mut free: VecDeque<_> = (0..o.depth).collect();
+    let mut free: VecDeque<_> = (0..o.depth).map(|slot| (slot, None)).collect();
+    let mut observation = NativeObservation::new(start, o.depth);
     let mut submitted = 0;
     let mut completed = 0;
     let jetty = checked(lane.jetty.local_ids())?.0;
     loop {
         while !free.is_empty() && limit.allows(start, Instant::now(), submitted) {
-            let slot = free.pop_front().unwrap();
+            let (slot, recycled) = free.pop_front().unwrap();
             let piece = o.native_piece(submitted, verify);
             let offset = piece * o.piece;
             let context = *next;
@@ -499,6 +605,7 @@ fn native_phase(
                     return checked(Err(error));
                 }
             };
+            observation.posted(wr.timing().started_at, wr.timing().returned_at, recycled);
             pending.insert(
                 context,
                 Pending {
@@ -518,12 +625,17 @@ fn native_phase(
         )?;
         let mut cqes = [CompletionRecord::default(); 16];
         let count = checked(lane.send.poll_into(&mut cqes))?;
+        observation.polled(count);
         // Busy poll intentionally matches perftest, unlike the Fabric owner.
         for cqe in cqes.iter().take(count) {
             let context = native_context(cqe, jetty)?;
             let item = pending
                 .remove(&context)
                 .ok_or_else(|| Error::Protocol("unknown/duplicate probe CQE".into()))?;
+            let observed = cqe
+                .observed_at
+                .ok_or_else(|| Error::Protocol("missing CQE host timestamp".into()))?;
+            observation.completed(item.wr.timing().started_at, observed);
             // SAFETY: exact live context on the matching send-CQ/Jetty proves
             // retirement; opcode/length are not populated for READ by udma.
             unsafe { item.wr.complete() };
@@ -538,13 +650,20 @@ fn native_phase(
                 )?;
             }
             completed += 1;
-            free.push_back(item.slot);
+            free.push_back((item.slot, Some(observed)));
         }
     }
     require(completed == submitted, "native phase lost completions")?;
+    require(
+        observation.depth == 0 && observation.posts == observation.completions,
+        "native observation lost WR retirement",
+    )?;
+    let end = Instant::now();
+    observation.advance(end);
     Ok(Measurement {
         pieces: completed,
-        elapsed: start.elapsed(),
+        elapsed: end.duration_since(start),
+        native: Some(observation),
     })
 }
 async fn native_probe(o: &Options) -> Result<()> {
@@ -935,6 +1054,7 @@ async fn cached_phase(
     Ok(Measurement {
         pieces: completed,
         elapsed: start.elapsed(),
+        native: None,
     })
 }
 async fn cached_probe(o: &Options) -> Result<()> {
@@ -1219,6 +1339,7 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     let measured = Measurement {
         pieces: 32,
         elapsed: Duration::from_millis(500),
+        native: None,
     };
     let (bytes, gibps, gbps) = measured.rates(&o).unwrap();
     assert_eq!(bytes, 1 << 30);
@@ -1226,11 +1347,57 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     assert!((gbps - 17.179869184).abs() < 1e-9);
     assert!(Measurement {
         pieces: 0,
-        elapsed: Duration::from_secs(1)
+        elapsed: Duration::from_secs(1),
+        native: None,
     }
     .rates(&o)
     .is_err());
 }
+#[test]
+fn bandwidth_probe_observation_weights_depth_and_refill_by_time() {
+    let start = Instant::now();
+    let at = |ns| start + Duration::from_nanos(ns);
+    let mut stats = NativeObservation::new(start, 2);
+    stats.posted(at(1000), at(2000), None);
+    stats.posted(at(3000), at(4000), None);
+    stats.polled(0);
+    stats.polled(1);
+    stats.completed(at(1000), at(5000));
+    stats.posted(at(6000), at(6500), Some(at(5000)));
+    stats.polled(2);
+    stats.completed(at(3000), at(7000));
+    stats.completed(at(6000), at(8000));
+    stats.advance(at(10000));
+    assert_eq!(
+        (stats.depth, stats.peak, stats.posts, stats.completions),
+        (0, 2, 3, 3)
+    );
+    assert_eq!((stats.polls, stats.empty_polls), (3, 1));
+    assert_eq!(
+        (stats.area_ns, stats.full_ns, stats.zero_ns),
+        (10000, 3000, 3000)
+    );
+    // Every accepted WR contributes its post-to-polled-CQE duration once;
+    // overlapping WR durations equal the time integral of unretired depth.
+    assert_eq!(stats.area_ns, stats.cqe_ns);
+    assert_eq!((stats.cqe_min_ns, stats.cqe_max_ns), (2000, 4000));
+    assert_eq!((stats.post_ns, stats.post_max_ns), (2500, 1000));
+    assert_eq!(
+        (stats.refills, stats.refill_ns, stats.refill_max_ns),
+        (1, 1000, 1000)
+    );
+
+    let mut batch = NativeObservation::new(start, 2);
+    batch.posted(at(0), at(100), None);
+    batch.posted(at(200), at(300), None);
+    // All CQEs from one poll share its host observation timestamp.
+    batch.completed(at(0), at(1000));
+    batch.completed(at(200), at(1000));
+    batch.advance(at(1100));
+    assert_eq!(batch.area_ns, batch.cqe_ns);
+    assert_eq!(batch.area_ns, 1800);
+}
+
 #[test]
 fn bandwidth_probe_read_cqe_uses_context_not_submit_opcode() {
     let mut cqe = CompletionRecord {
