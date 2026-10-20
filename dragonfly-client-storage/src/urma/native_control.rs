@@ -50,6 +50,7 @@ pub(crate) struct NativeControl {
     closing: bool,
     uncertain_buffer: bool,
     last_error: Option<String>,
+    destroy_attempted: bool,
 }
 impl NativeControl {
     pub(crate) fn new() -> Result<(Self, mpsc::Receiver<Result<Vec<u8>>>)> {
@@ -72,6 +73,7 @@ impl NativeControl {
                 closing: false,
                 uncertain_buffer: false,
                 last_error: None,
+                destroy_attempted: false,
             },
             rx,
         ))
@@ -198,7 +200,7 @@ impl NativeControl {
                 }));
             }
         }
-        if let Some(jetty) = &mut self.jetty {
+        if let Some(jetty) = self.jetty.as_mut().filter(|_| !self.destroy_attempted) {
             if let Err(error) = jetty.mark_error() {
                 self.last_error = Some(format!("mark_error: {error:?}"));
             }
@@ -308,6 +310,14 @@ impl NativeControl {
     /// Native CQ progress and cleanup stay on the same owner as READ. A
     /// non-closed endpoint retains ownership, including uncertain registration.
     pub(crate) fn progress(&mut self) -> ControlProgress {
+        // A failed provider destroy may have partially dismantled the endpoint.
+        // Retain everything and do not poll/retry through uncertain handles.
+        if self.destroy_attempted {
+            return ControlProgress {
+                closed: false,
+                events: 0,
+            };
+        }
         let mut events = 0;
         let result = (|| {
             if self.incoming.as_ref().is_some_and(|tx| tx.is_closed()) {
@@ -345,6 +355,32 @@ impl NativeControl {
         })();
         if let Err(error) = result {
             self.fail(error);
+        }
+        if self.closing
+            && !self.uncertain_buffer
+            && !self.posted.is_empty()
+            && self.posted.values().all(|f| f.slot != RX_SLOTS)
+        {
+            let result = (|| {
+                if let Some(target) = &mut self.target {
+                    target.close().map_err(err)?;
+                }
+                self.destroy_attempted = true;
+                self.jetty
+                    .as_mut()
+                    .ok_or_else(|| protocol("control endpoint missing"))?
+                    .destroy_control_recv_endpoint()
+                    .map_err(err)?;
+                // Synchronous native destruction is the retirement proof for
+                // these unused receives. The WR arena and buffer stayed alive.
+                for (_, flight) in self.posted.drain() {
+                    flight.wr.complete();
+                }
+                Ok::<_, Error>(())
+            })();
+            if let Err(error) = result {
+                self.last_error = Some(format!("destroy stopped RECV endpoint: {error}"));
+            }
         }
         if !self.closing || !self.posted.is_empty() || self.uncertain_buffer {
             return ControlProgress {

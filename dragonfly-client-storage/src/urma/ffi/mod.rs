@@ -490,6 +490,14 @@ impl JettyHandle {
         Ok((jetty_id, jfr_id))
     }
 
+    /// After success all native receive access is stopped. WR metadata must
+    /// remain owned until the caller releases it, before closing this wrapper.
+    pub(crate) fn destroy_control_recv_endpoint(&mut self) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        // SAFETY: unique owner; shim enforces ERROR, no targets, RECV-only WRs.
+        status_result(unsafe { sys::dfurma_control_destroy_recv_endpoint(jetty.as_ptr()) })
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
         let Some(jetty) = self.raw else {
             return Ok(());
@@ -503,7 +511,8 @@ impl JettyHandle {
     }
 }
 
-/// Owns C WR/SGE metadata until the matching CQE is consumed.
+/// Owns C WR/SGE metadata until CQE/flush retirement or successful destruction
+/// of a stopped, dedicated control receive endpoint proves no further DMA.
 pub(crate) struct WrHandle {
     raw: Option<NonNull<sys::dfurma_wr_t>>,
     _not_send_sync: PhantomData<Rc<()>>,
@@ -512,7 +521,8 @@ pub(crate) struct WrHandle {
 impl WrHandle {
     pub(crate) fn complete(mut self) {
         if let Some(raw) = self.raw.take() {
-            // SAFETY: Completion routing guarantees one call for the unique WR.
+            // SAFETY: Caller holds CQE/flush or control-endpoint destruction
+            // proof and consumes the unique WR exactly once.
             unsafe { sys::dfurma_wr_complete(raw.as_ptr()) };
         }
     }

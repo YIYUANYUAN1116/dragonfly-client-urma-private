@@ -231,6 +231,9 @@ int dfurma_jetty_create(dfurma_runtime_t *runtime,
 
 /* Moves both the Jetty and its owned shared JFR to ERROR. */
 int dfurma_jetty_mark_error(dfurma_jetty_t *jetty);
+/* Only for a stopped control endpoint with no targets or non-RECV WRs.
+ * Success destroys native Jetty/JFR; wrapper/WR arena remain for retirement. */
+int dfurma_control_destroy_recv_endpoint(dfurma_jetty_t *jetty);
 /* Returns the provider IDs used to route shared-JFC lifecycle completions. */
 int dfurma_jetty_local_ids(dfurma_jetty_t *jetty,
                            uint32_t *jetty_id, uint32_t *jfr_id);

@@ -83,6 +83,7 @@ struct dfurma_jetty {
     int jfr_error;
     uint32_t outstanding_wr_count;
     uint32_t target_count;
+    uint32_t control_recv_wr_count;
     dfurma_wr_t *wr_arena;
     dfurma_wr_t *free_wr;
     uint32_t wr_capacity;
@@ -813,13 +814,34 @@ int dfurma_target_unimport(dfurma_target_t *target)
     return 0;
 }
 
+/* Successful synchronous destruction, not ERROR state or a timeout, proves
+ * that unused posted RECV buffers cannot be touched again. Keep the wrapper
+ * and WR arena alive until Rust releases their accounting references. */
+int dfurma_control_destroy_recv_endpoint(dfurma_jetty_t *jetty)
+{
+    urma_status_t status;
+    if (jetty == NULL || jetty->runtime == NULL) return -EINVAL;
+    if (!jetty->jetty_error || !jetty->jfr_error || jetty->target_count != 0 ||
+        jetty->outstanding_wr_count != jetty->control_recv_wr_count) return -EBUSY;
+    if (jetty->jetty != NULL) {
+        status = urma_delete_jetty(jetty->jetty);
+        if (status != URMA_SUCCESS) return (int)status;
+        jetty->jetty = NULL;
+    }
+    if (jetty->jfr != NULL) {
+        status = urma_delete_jfr(jetty->jfr);
+        if (status != URMA_SUCCESS) return (int)status;
+        jetty->jfr = NULL;
+    }
+    return 0;
+}
+
 int dfurma_jetty_delete(dfurma_jetty_t *jetty)
 {
     urma_status_t status;
     dfurma_runtime_t *runtime;
 
-    if (jetty == NULL || jetty->runtime == NULL ||
-        (jetty->jetty == NULL && jetty->jfr == NULL)) {
+    if (jetty == NULL || jetty->runtime == NULL) {
         return -EINVAL;
     }
     if (jetty->target_count != 0 || jetty->outstanding_wr_count != 0) {
@@ -1370,6 +1392,7 @@ int dfurma_post_control_recv(dfurma_jetty_t *jetty, dfurma_segment_t *local,
         return (int)status;
     }
     dfurma_wr_posted(wr);
+    jetty->control_recv_wr_count++;
     *out = wr;
     return (int)status;
 }
@@ -1378,6 +1401,9 @@ void dfurma_wr_complete(dfurma_wr_t *wr)
 {
     if (wr == NULL) {
         return;
+    }
+    if (wr->recv_wr.src.num_sge != 0 && wr->jetty->control_recv_wr_count > 0) {
+        wr->jetty->control_recv_wr_count--;
     }
     if (wr->runtime->outstanding_wr_count > 0) {
         wr->runtime->outstanding_wr_count--;

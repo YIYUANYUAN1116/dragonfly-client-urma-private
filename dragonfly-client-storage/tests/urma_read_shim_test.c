@@ -13,6 +13,8 @@
 #define urma_unregister_seg test_unregister_source
 #define urma_get_seg_ctx test_get_seg_ctx
 #define urma_put_seg_ctx test_put_seg_ctx
+#define urma_delete_jetty test_delete_jetty
+#define urma_delete_jfr test_delete_jfr
 #include "../src/urma/ffi/shim.c"
 
 #include <assert.h>
@@ -35,6 +37,24 @@ static unsigned int token_frees;
 static unsigned int unregister_calls;
 static unsigned int context_frees;
 static int context_mode;
+static int destroy_failure;
+static unsigned int destroyed_jetty, destroyed_jfr;
+
+urma_status_t test_delete_jetty(urma_jetty_t *jetty)
+{
+    assert(jetty != NULL);
+    if (destroy_failure == 1) return URMA_FAIL;
+    destroyed_jetty++;
+    return URMA_SUCCESS;
+}
+
+urma_status_t test_delete_jfr(urma_jfr_t *jfr)
+{
+    assert(jfr != NULL);
+    if (destroy_failure == 2) return URMA_FAIL;
+    destroyed_jfr++;
+    return URMA_SUCCESS;
+}
 
 urma_status_t test_delete_context(urma_context_t *ctx)
 {
@@ -636,8 +656,48 @@ static void test_control_send_recv_retains_ambiguous_posts_and_rejects_bad_range
     }
 }
 
+static void test_control_unused_receives_require_successful_native_destruction(void)
+{
+    for (int failure = 0; failure <= 2; failure++) {
+        struct fixture f;
+        urma_jfr_t jfr = {0};
+        dfurma_wr_t *wr = NULL;
+        setup(&f);
+        destroy_failure = failure;
+        destroyed_jetty = destroyed_jfr = 0;
+        f.jetty.jfr = &jfr;
+        assert(dfurma_post_control_recv(&f.jetty, &f.local, 0, 8, 0xabcdef, &wr) == 0);
+        assert(f.jetty.control_recv_wr_count == 1);
+        assert(dfurma_control_destroy_recv_endpoint(&f.jetty) == -EBUSY);
+        f.jetty.jetty_error = f.jetty.jfr_error = 1;
+        assert(dfurma_control_destroy_recv_endpoint(&f.jetty) == -EBUSY); /* target */
+        f.jetty.target_count = 0;
+        f.jetty.outstanding_wr_count++; /* non-RECV work must block destroy */
+        assert(dfurma_control_destroy_recv_endpoint(&f.jetty) == -EBUSY);
+        f.jetty.outstanding_wr_count--;
+        assert(destroyed_jetty == 0 && destroyed_jfr == 0);
+        int result = dfurma_control_destroy_recv_endpoint(&f.jetty);
+        assert((result == 0) == (failure == 0));
+        /* Even successful native destruction must not free the backing/WR. */
+        assert(f.runtime.outstanding_wr_count == 1 && f.local.outstanding_wr_count == 1);
+        assert(f.jetty.control_recv_wr_count == 1 && f.jetty.free_wr == &f.arena[1]);
+        if (failure == 0) {
+            assert(f.jetty.jetty == NULL && f.jetty.jfr == NULL);
+            assert(destroyed_jetty == 1 && destroyed_jfr == 1);
+            dfurma_wr_complete(wr);
+            assert(f.jetty.control_recv_wr_count == 0 && f.runtime.outstanding_wr_count == 0);
+        } else {
+            assert(f.jetty.jfr == &jfr);
+            assert((f.jetty.jetty == NULL) == (failure == 2));
+            /* No retirement is permitted on failure. Fixture is process-local. */
+        }
+    }
+    destroy_failure = 0;
+}
+
 int main(void)
 {
+    test_control_unused_receives_require_successful_native_destruction();
     test_control_send_recv_retains_ambiguous_posts_and_rejects_bad_ranges();
     test_descriptor_validation();
     test_read_ownership_and_retryable_unimport();
@@ -651,6 +711,6 @@ int main(void)
     test_allocated_read_buffer_full_lifecycle();
     test_source_register_stage_timings();
     test_shared_token_lives_until_retryable_runtime_close();
-    puts("PASS: 13 groups covering SEND/RECV ownership and source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
+    puts("PASS: 14 groups covering control receive destruction, SEND/RECV ownership and source/import/READ retirement");
     return 0;
 }
