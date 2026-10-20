@@ -14,7 +14,7 @@ use crate::{
 use std::collections::{HashSet, VecDeque};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) const READ_DFUR_VERSION: u8 = 6;
+pub(crate) const READ_DFUR_VERSION: u8 = 7;
 pub(crate) const READ_DESCRIPTOR_VERSION: u32 = 1;
 const EID_LENGTH: usize = 16;
 

@@ -1,4 +1,4 @@
-//! Version 6 READ lane handshake and transfer dispatcher.
+//! Version 7 READ lane handshake and transfer dispatcher.
 //!
 //! Handshake ownership stays outside the dispatcher so native lane creation and
 //! rollback remain explicit. After handshake, one reader and writer task route
@@ -47,6 +47,7 @@ pub(crate) fn next_session_generation() -> Result<u64> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadLaneCapability {
+    pub(crate) control_transport: dragonfly_client_config::dfdaemon::UrmaControlTransport,
     pub(crate) transport_type: u32,
     pub(crate) tp_type: TpType,
     pub(crate) fabric_tag: String,
@@ -55,7 +56,8 @@ pub(crate) struct ReadLaneCapability {
 
 impl ReadLaneCapability {
     pub(crate) fn compatible(&self, remote: &Self) -> Result<u32> {
-        if self.transport_type != remote.transport_type
+        if self.control_transport != remote.control_transport
+            || self.transport_type != remote.transport_type
             || self.tp_type != remote.tp_type
             || self.fabric_tag.is_empty()
             || self.fabric_tag != remote.fabric_tag
@@ -66,6 +68,10 @@ impl ReadLaneCapability {
     }
 
     fn encode(&self, payload: &mut Vec<u8>) {
+        payload.push(match self.control_transport {
+            dragonfly_client_config::dfdaemon::UrmaControlTransport::Tcp => 0,
+            dragonfly_client_config::dfdaemon::UrmaControlTransport::Sendrecv => 1,
+        });
         payload.extend_from_slice(&self.transport_type.to_be_bytes());
         payload.push(self.tp_type.wire_value());
         put_bytes(payload, self.fabric_tag.as_bytes());
@@ -74,6 +80,11 @@ impl ReadLaneCapability {
 
     fn decode(reader: &mut PayloadReader<'_>) -> Result<Self> {
         let capability = Self {
+            control_transport: match wire(reader.u8())? {
+                0 => dragonfly_client_config::dfdaemon::UrmaControlTransport::Tcp,
+                1 => dragonfly_client_config::dfdaemon::UrmaControlTransport::Sendrecv,
+                _ => return Err(protocol("unknown READ control transport")),
+            },
             transport_type: wire(reader.u32())?,
             tp_type: TpType::from_wire(wire(reader.u8())?).map_err(protocol)?,
             fabric_tag: wire(reader.string(MAX_STRING_LENGTH))?,
@@ -560,6 +571,7 @@ mod tests {
 
     fn capability() -> ReadLaneCapability {
         ReadLaneCapability {
+            control_transport: dragonfly_client_config::dfdaemon::UrmaControlTransport::Tcp,
             transport_type: 3,
             tp_type: TpType::Rtp,
             fabric_tag: "rack-a".into(),
@@ -625,6 +637,43 @@ mod tests {
             .await
             .unwrap();
         assert!(read_handshake(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sendrecv_capability_round_trips_and_rejects_tcp_or_legacy_peer() {
+        let mut native = capability();
+        native.control_transport =
+            dragonfly_client_config::dfdaemon::UrmaControlTransport::Sendrecv;
+        assert!(native.compatible(&capability()).is_err());
+        let frame = ReadHandshake::Connect {
+            capability: native.clone(),
+            session_generation: 41,
+            descriptor: vec![7],
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        write_handshake(&mut writer, &frame).await.unwrap();
+        let decoded = read_handshake(&mut reader).await.unwrap();
+        assert_eq!(decoded, frame);
+        assert!(decoded.validate_connect(&native).is_ok());
+        assert!(decoded.validate_connect(&capability()).is_err());
+        let mut payload = Vec::new();
+        native.encode(&mut payload);
+        payload.extend_from_slice(&41u64.to_be_bytes());
+        put_bytes(&mut payload, &[7]);
+        for version in [5, 6] {
+            let (mut writer, mut reader) = tokio::io::duplex(4096);
+            write_envelope(
+                &mut writer,
+                MAGIC,
+                version,
+                CONNECT,
+                &payload,
+                MAX_PAYLOAD_LENGTH,
+            )
+            .await
+            .unwrap();
+            assert!(read_handshake(&mut reader).await.is_err());
+        }
     }
 
     #[tokio::test]

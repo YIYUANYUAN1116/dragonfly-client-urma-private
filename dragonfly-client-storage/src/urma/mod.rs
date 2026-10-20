@@ -11,6 +11,7 @@ mod error;
 pub mod fabric;
 pub(crate) mod ffi;
 mod lane;
+mod native_control;
 mod read_child_owner;
 pub(crate) mod read_control;
 pub(crate) mod read_handoff;
@@ -26,6 +27,7 @@ mod read_table;
 pub(crate) mod read_transfer;
 pub mod rendezvous;
 pub(crate) mod runtime;
+pub(crate) mod sendrecv_control;
 mod wr_admission;
 
 pub(crate) use error::native_error;

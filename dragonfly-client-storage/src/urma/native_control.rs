@@ -1,0 +1,357 @@
+//! Owner-thread SEND/RECV endpoint. Its queues and LOCAL_ONLY buffers are
+//! independent of READ credits. No native handle crosses the Fabric thread.
+use super::{
+    ffi::{
+        self, read::ReadBufferCreation, CompletionEventKind, CompletionRecord, FfiError,
+        JettyHandle, JfcHandle, NativeRuntime, SegmentHandle, TargetHandle, WrHandle,
+    },
+    lane::{JettyDescriptor, TpType},
+    native_error, Error, Result,
+};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT_CONTROL: AtomicU64 = AtomicU64::new(1);
+use tokio::sync::{mpsc, oneshot};
+
+pub(crate) const PACKET_BYTES: usize = 4096;
+const RX_SLOTS: usize = 32;
+pub(crate) const ENDPOINT_BYTES: u64 = ((RX_SLOTS + 1) * PACKET_BYTES) as u64;
+type Reply = oneshot::Sender<Result<()>>;
+
+pub(crate) struct ControlSetup {
+    pub(crate) id: u64,
+    pub(crate) descriptor: Vec<u8>,
+    pub(crate) incoming: mpsc::Receiver<Result<Vec<u8>>>,
+}
+struct Flight {
+    wr: WrHandle,
+    slot: usize,
+    reply: Option<Reply>,
+}
+
+pub(crate) struct NativeControl {
+    pub(crate) id: u64,
+    send_cq: Option<JfcHandle>,
+    recv_cq: Option<JfcHandle>,
+    jetty: Option<JettyHandle>,
+    target: Option<TargetHandle>,
+    buffer: Option<SegmentHandle>,
+    incoming: Option<mpsc::Sender<Result<Vec<u8>>>>,
+    posted: HashMap<u64, Flight>,
+    pending: VecDeque<(usize, Vec<u8>)>,
+    next_context: u64,
+    closing: bool,
+    uncertain_buffer: bool,
+}
+impl NativeControl {
+    pub(crate) fn new() -> Result<(Self, mpsc::Receiver<Result<Vec<u8>>>)> {
+        let id = NEXT_CONTROL
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| protocol("control identity exhausted"))?;
+        let (tx, rx) = mpsc::channel(RX_SLOTS);
+        Ok((
+            Self {
+                id,
+                send_cq: None,
+                recv_cq: None,
+                jetty: None,
+                target: None,
+                buffer: None,
+                incoming: Some(tx),
+                posted: HashMap::new(),
+                pending: VecDeque::new(),
+                next_context: 1,
+                closing: false,
+                uncertain_buffer: false,
+            },
+            rx,
+        ))
+    }
+    pub(crate) fn open(&mut self, runtime: &mut NativeRuntime, tp: TpType) -> Result<Vec<u8>> {
+        self.send_cq = Some(JfcHandle::create(runtime, 16).map_err(err)?);
+        self.recv_cq = Some(JfcHandle::create(runtime, 64).map_err(err)?);
+        self.jetty = Some(
+            JettyHandle::create(
+                runtime,
+                self.send_cq.as_ref().unwrap(),
+                self.recv_cq.as_ref().unwrap(),
+                &ffi::JettyConfig {
+                    send_depth: 8,
+                    recv_depth: RX_SLOTS as u32,
+                    max_send_sge: 1,
+                    max_recv_sge: 1,
+                    token: 0,
+                    tp_type: tp as u32,
+                },
+            )
+            .map_err(err)?,
+        );
+        match SegmentHandle::create_read_buffer(runtime, ENDPOINT_BYTES, 4096) {
+            ReadBufferCreation::Ready(buffer) => self.buffer = Some(buffer),
+            ReadBufferCreation::Rejected(e) => return Err(err(e)),
+            ReadBufferCreation::Uncertain { buffer, error } => {
+                self.buffer = Some(buffer);
+                self.uncertain_buffer = true;
+                return Err(err(error));
+            }
+        }
+        for slot in 0..RX_SLOTS {
+            self.post(slot, None, PACKET_BYTES as u32)?;
+        }
+        JettyDescriptor::from_ffi(
+            self.jetty
+                .as_ref()
+                .unwrap()
+                .export_descriptor()
+                .map_err(err)?,
+        )?
+        .serialize()
+    }
+    pub(crate) fn connect(&mut self, remote: &[u8], tp: TpType) -> Result<()> {
+        if self.closing || self.target.is_some() {
+            return Err(protocol("control endpoint not connectable"));
+        }
+        let descriptor = JettyDescriptor::deserialize(remote)?;
+        if descriptor.tp_type != tp {
+            return Err(protocol("control TP mismatch"));
+        }
+        self.target = Some(
+            self.jetty
+                .as_mut()
+                .ok_or_else(|| protocol("control endpoint missing"))?
+                .import_target(&descriptor.to_ffi()?, 0)
+                .map_err(err)?,
+        );
+        Ok(())
+    }
+    fn post(&mut self, slot: usize, reply: Option<Reply>, length: u32) -> Result<()> {
+        let context = self.next_context;
+        self.next_context = context
+            .checked_add(1)
+            .ok_or_else(|| protocol("control context exhausted"))?;
+        let (result, wr) = ffi::post_control(
+            self.jetty.as_ref().unwrap(),
+            if slot == RX_SLOTS {
+                self.target.as_ref()
+            } else {
+                None
+            },
+            self.buffer.as_ref().unwrap(),
+            (slot * PACKET_BYTES) as u64,
+            length,
+            context,
+        );
+        if let Some(wr) = wr {
+            self.posted.insert(context, Flight { wr, slot, reply });
+        } else if let Some(reply) = reply {
+            let _ = reply.send(Err(protocol("control post was not accepted")));
+        }
+        result.map_err(err)
+    }
+    pub(crate) fn send(&mut self, data: Vec<u8>, reply: Reply) {
+        let result = (|| {
+            if self.closing
+                || self.target.is_none()
+                || data.is_empty()
+                || data.len() > PACKET_BYTES
+                || self.posted.values().any(|f| f.slot == RX_SLOTS)
+            {
+                return Err(protocol("control SEND unavailable or oversize"));
+            }
+            let (ptr, _) = self.buffer.as_ref().unwrap().data().map_err(err)?;
+            // SAFETY: the dedicated TX slot has no outstanding WR; no other
+            // CPU thread accesses it. The owner retains it until SEND CQE.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    ptr.as_ptr().add(RX_SLOTS * PACKET_BYTES),
+                    data.len(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        if let Err(error) = self.post(RX_SLOTS, Some(reply), data.len() as u32) {
+            self.fail(error);
+        }
+    }
+    pub(crate) fn stop(&mut self) {
+        self.closing = true;
+        self.incoming.take();
+        self.pending.clear();
+        for flight in self.posted.values_mut() {
+            if let Some(reply) = flight.reply.take() {
+                let _ = reply.send(Err(Error::Shutdown {
+                    failures: vec!["control lane closed".into()],
+                }));
+            }
+        }
+        if let Some(jetty) = &mut self.jetty {
+            let _ = jetty.mark_error();
+        }
+    }
+    fn fail(&mut self, error: Error) {
+        if !self.closing {
+            tracing::debug!(control_id = self.id, %error, "URMA SEND/RECV control endpoint failed");
+            if let Some(tx) = self.incoming.take() {
+                let _ = tx.try_send(Err(error.clone()));
+            }
+            for flight in self.posted.values_mut() {
+                if let Some(reply) = flight.reply.take() {
+                    let _ = reply.send(Err(error.clone()));
+                }
+            }
+        }
+        self.stop();
+    }
+    fn deliver(&mut self, slot: usize, bytes: Vec<u8>) -> Result<()> {
+        let Some(tx) = &self.incoming else {
+            return Ok(());
+        };
+        match tx.try_send(Ok(bytes)) {
+            Ok(()) => self.post(slot, None, PACKET_BYTES as u32),
+            Err(mpsc::error::TrySendError::Full(Ok(bytes))) => {
+                self.pending.push_back((slot, bytes));
+                Ok(())
+            }
+            _ => Err(protocol("control receiver closed")),
+        }
+    }
+    fn complete(&mut self, cqe: CompletionRecord, receive: bool) -> Result<()> {
+        let (jetty_id, jfr_id) = self
+            .jetty
+            .as_ref()
+            .ok_or_else(|| protocol("control jetty missing"))?
+            .local_ids()
+            .map_err(err)?;
+        if cqe.local_id != if cqe.is_jetty { jetty_id } else { jfr_id } {
+            return Err(protocol("control CQE endpoint mismatch"));
+        }
+        if cqe.event_kind == CompletionEventKind::FlushErrorDone && self.closing {
+            let ids: Vec<_> = self
+                .posted
+                .iter()
+                .filter(|(_, f)| (f.slot != RX_SLOTS) == receive)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in ids {
+                self.posted.remove(&id).unwrap().wr.complete();
+            }
+            return Ok(());
+        }
+        if cqe.event_kind != CompletionEventKind::WorkRequest
+            || !cqe.user_ctx_valid
+            || (cqe.status == 0 && cqe.opcode != ffi::CONTROL_SEND_OPCODE)
+        {
+            return Err(protocol("unroutable control CQE"));
+        }
+        let Some(flight) = self.posted.get(&cqe.user_ctx) else {
+            return Err(protocol("unknown control CQE context"));
+        };
+        let (jetty_id, jfr_id) = self.jetty.as_ref().unwrap().local_ids().map_err(err)?;
+        if (flight.slot != RX_SLOTS) != receive
+            || cqe.is_recv != receive
+            || cqe.local_id != if cqe.is_jetty { jetty_id } else { jfr_id }
+        {
+            return Err(protocol("control CQE queue/endpoint mismatch"));
+        }
+        let flight = self.posted.remove(&cqe.user_ctx).unwrap();
+        flight.wr.complete();
+        if cqe.status != 0 {
+            if let Some(reply) = flight.reply {
+                let _ = reply.send(Err(protocol("control SEND CQE failed")));
+            }
+            return Err(protocol(format!("control CQE status {}", cqe.status)));
+        }
+        if self.closing {
+            return Ok(());
+        }
+        if receive {
+            let length = cqe.completion_len as usize;
+            if length == 0 || length > PACKET_BYTES {
+                return Err(protocol("control receive length invalid"));
+            }
+            let (ptr, _) = self.buffer.as_ref().unwrap().data().map_err(err)?;
+            // SAFETY: RECV CQE retired this slot, not reposted until copying.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(ptr.as_ptr().add(flight.slot * PACKET_BYTES), length)
+            }
+            .to_vec();
+            self.deliver(flight.slot, bytes)?;
+        } else if let Some(reply) = flight.reply {
+            let _ = reply.send(Ok(()));
+        }
+        Ok(())
+    }
+    /// Native CQ progress and cleanup stay on the same owner as READ. False
+    /// means resources remain owned (including indeterminate registration).
+    pub(crate) fn progress(&mut self) -> bool {
+        let result = (|| {
+            if self.incoming.as_ref().is_some_and(|tx| tx.is_closed()) {
+                self.stop();
+            }
+            let mut completions = [CompletionRecord::default(); 16];
+            for receive in [false, true] {
+                let cq = if receive {
+                    &self.recv_cq
+                } else {
+                    &self.send_cq
+                };
+                let count = match cq {
+                    Some(cq) => cq.poll_into(&mut completions).map_err(err)?,
+                    None => 0,
+                };
+                for cqe in completions.iter().take(count) {
+                    if let Err(error) = self.complete(*cqe, receive) {
+                        self.fail(error);
+                    }
+                }
+            }
+            if !self.closing {
+                let count = self.pending.len();
+                for _ in 0..count {
+                    if self.incoming.as_ref().is_some_and(|tx| tx.capacity() == 0) {
+                        break;
+                    }
+                    let (slot, bytes) = self.pending.pop_front().unwrap();
+                    self.deliver(slot, bytes)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.fail(error);
+        }
+        if !self.closing || !self.posted.is_empty() || self.uncertain_buffer {
+            return false;
+        }
+        let result = (|| {
+            if let Some(target) = &mut self.target {
+                target.close().map_err(err)?;
+            }
+            if let Some(jetty) = &mut self.jetty {
+                jetty.close().map_err(err)?;
+            }
+            if let Some(buffer) = &mut self.buffer {
+                buffer.close().map_err(err)?;
+            }
+            if let Some(cq) = &mut self.recv_cq {
+                cq.close().map_err(err)?;
+            }
+            if let Some(cq) = &mut self.send_cq {
+                cq.close().map_err(err)?;
+            }
+            Ok::<_, Error>(())
+        })();
+        result.is_ok()
+    }
+}
+fn protocol(message: impl Into<String>) -> Error {
+    Error::Protocol(message.into())
+}
+fn err(error: FfiError) -> Error {
+    native_error("control SEND/RECV", error)
+}

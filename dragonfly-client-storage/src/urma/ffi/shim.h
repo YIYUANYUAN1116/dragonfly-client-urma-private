@@ -69,6 +69,7 @@ typedef struct dfurma_jetty_descriptor_meta {
 } dfurma_jetty_descriptor_meta_t;
 
 #define DFURMA_EID_SIZE 16U
+#define DFURMA_CONTROL_SEND_OPCODE 0x40U
 
 #define DFURMA_IMPORT_STAGE_NONE 0U
 #define DFURMA_IMPORT_STAGE_GET_TP 1U
@@ -246,6 +247,15 @@ int dfurma_jetty_import(dfurma_jetty_t *jetty,
                         dfurma_import_diagnostics_t *diagnostics);
 int dfurma_target_unimport(dfurma_target_t *target);
 int dfurma_jetty_delete(dfurma_jetty_t *jetty);
+
+/* Control SEND/RECV. Single bounded SGE; error with non-NULL *out is
+ * indeterminate and must retain backing until CQE/verified endpoint flush. */
+int dfurma_post_control_send(dfurma_jetty_t *jetty, dfurma_target_t *target,
+                             dfurma_segment_t *local, uint64_t offset,
+                             uint32_t length, uint64_t user_ctx, dfurma_wr_t **out);
+int dfurma_post_control_recv(dfurma_jetty_t *jetty, dfurma_segment_t *local,
+                             uint64_t offset, uint32_t length,
+                             uint64_t user_ctx, dfurma_wr_t **out);
 
 void dfurma_wr_complete(dfurma_wr_t *wr);
 

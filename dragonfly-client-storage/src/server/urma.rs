@@ -469,7 +469,7 @@ fn allocate_read_token(space: &ReadTokenSpace) -> ClientResult<u32> {
     }
 }
 
-/// Builds the READ lane capability advertised during the version-6 handshake.
+/// Builds the READ lane capability advertised during the version-7 handshake.
 fn read_parent_config(
     read: &UrmaReadServer,
     fabric: &UrmaFabricHandle,
@@ -477,6 +477,7 @@ fn read_parent_config(
 ) -> ReadParentConfig {
     ReadParentConfig {
         capability: ReadLaneCapability {
+            control_transport: read.control_transport,
             transport_type: fabric.transport_type(),
             tp_type: fabric.tp_type(),
             fabric_tag: fabric_tag.to_string(),
@@ -636,9 +637,9 @@ impl UrmaServerHandler {
         Ok(PieceSource::Reader(reader))
     }
 
-    /// Serves one RM-READ lane: version-6 handshake, Child-side Jetty import, and
-    /// Child-initiated transfer admission. Only control frames use this TCP
-    /// stream; Piece bytes move inside the registered READ budget.
+    /// Serves one RM-READ lane: version-7 handshake, Child-side Jetty import, and
+    /// Child-initiated transfer admission. TCP bootstraps descriptors, then
+    /// control frames use the negotiated transport; Piece bytes use READ.
     async fn handle_read_lane(
         self: Arc<Self>,
         mut stream: TcpStream,
@@ -654,14 +655,39 @@ impl UrmaServerHandler {
                 ));
             }
         };
-        let (session_generation, effective_max_read_size, _) = connect
+        let (session_generation, effective_max_read_size, remote_descriptor) = connect
             .validate_connect(&read.capability)
             .map_err(client_error)?;
 
         // READ has a fixed one-sided direction. The Child imports this local
         // endpoint and posts READs; the Parent only registers source memory,
-        // so importing the Child Jetty would create an unused reverse target.
+        // so importing the Child data Jetty would create an unused reverse
+        // READ target. SEND/RECV uses a separate bidirectional control endpoint.
         let (lane_id, parent_descriptor) = self.fabric.create_lane().await.map_err(client_error)?;
+        let guard = self.fabric.lane_guard(lane_id);
+        let native_control = read.capability.control_transport
+            == dragonfly_client_config::dfdaemon::UrmaControlTransport::Sendrecv;
+        let (_, remote_control) =
+            crate::urma::sendrecv_control::unpack_descriptors(remote_descriptor, native_control)
+                .map_err(client_error)?;
+        let setup = if native_control {
+            let setup = self
+                .fabric
+                .create_control(lane_id)
+                .await
+                .map_err(client_error)?;
+            self.fabric
+                .connect_control(lane_id, setup.id, remote_control)
+                .await
+                .map_err(client_error)?;
+            Some(setup)
+        } else {
+            None
+        };
+        let parent_descriptor =
+            crate::urma::sendrecv_control::pack_descriptors(parent_descriptor, setup.as_ref())
+                .map_err(client_error)?;
+
         if let Err(error) = write_handshake(
             &mut stream,
             &ReadHandshake::Connected {
@@ -672,7 +698,6 @@ impl UrmaServerHandler {
         )
         .await
         {
-            let _ = self.fabric.close_lane(lane_id).await;
             return Err(client_error(error));
         }
         info!(
@@ -680,21 +705,35 @@ impl UrmaServerHandler {
             lane_id,
             session_generation,
             max_read_size = effective_max_read_size,
+            control_transport = ?read.capability.control_transport,
             "urma READ lane established"
         );
 
-        let lane = match ReadLaneControl::spawn(
-            stream,
-            session_generation,
-            self.max_concurrent_transfers,
-            self.max_concurrent_transfers.saturating_mul(2).max(16),
-        ) {
-            Ok(lane) => Arc::new(lane),
-            Err(error) => {
-                let _ = self.fabric.close_lane(lane_id).await;
-                return Err(client_error(error));
-            }
-        };
+        let lane = if let Some(setup) = setup {
+            let native = crate::urma::sendrecv_control::spawn(
+                self.fabric.clone(),
+                lane_id,
+                session_generation,
+                setup,
+                stream,
+            );
+            ReadLaneControl::spawn(
+                native,
+                session_generation,
+                self.max_concurrent_transfers,
+                self.max_concurrent_transfers.saturating_mul(2).max(16),
+            )
+        } else {
+            ReadLaneControl::spawn(
+                stream,
+                session_generation,
+                self.max_concurrent_transfers,
+                self.max_concurrent_transfers.saturating_mul(2).max(16),
+            )
+        }
+        .map(Arc::new)
+        .map_err(client_error)?;
+        guard.disarm();
         let mut transfers = JoinSet::new();
         loop {
             let Some(accepted) = lane.accept_transfer(self.session_idle_timeout).await else {

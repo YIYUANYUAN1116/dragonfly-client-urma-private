@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! RM-READ piece download client (DFUR version 6).
+//! RM-READ piece download client (DFUR version 7).
 //!
 //! One persistent lane per parent carries READ transfers: the Child owns a
 //! fabric-registered destination, sends BufferReady with the Piece locator,
@@ -188,6 +188,7 @@ impl UrmaReadClient {
             .as_ref()
             .expect("READ client requires the storage.server.urma.read config");
         let capability = ReadLaneCapability {
+            control_transport: read_config.control_transport,
             transport_type: fabric.transport_type(),
             tp_type: fabric.tp_type(),
             fabric_tag: urma_config
@@ -277,7 +278,7 @@ impl UrmaReadClient {
             piece_number = number,
             "urma READ child starting transfer"
         );
-        // SAFETY: The lane identity was bound to an authenticated version-6
+        // SAFETY: The lane identity was bound to an authenticated version-7
         // handshake and the destination allocation below is exclusively owned
         // by this transfer for its whole lifetime.
         let transfer = ChildTransfer::new(
@@ -455,6 +456,18 @@ impl UrmaReadClient {
             let session_generation = next_session_generation().map_err(|error| {
                 ClientError::Unknown(format!("urma READ session generation failed: {error}"))
             })?;
+            let native_control = self.capability.control_transport
+                == dragonfly_client_config::dfdaemon::UrmaControlTransport::Sendrecv;
+            let setup = if native_control {
+                Some(self.fabric.create_control(lane_id).await.map_err(|error| {
+                    ClientError::Unknown(format!("urma control endpoint create failed: {error}"))
+                })?)
+            } else {
+                None
+            };
+            let descriptor =
+                crate::urma::sendrecv_control::pack_descriptors(descriptor, setup.as_ref())
+                    .map_err(|e| ClientError::Unknown(e.to_string()))?;
             write_handshake(
                 &mut stream,
                 &ReadHandshake::Connect {
@@ -475,20 +488,48 @@ impl UrmaReadClient {
                 .map_err(|error| {
                     ClientError::Unknown(format!("urma READ Connected rejected: {error}"))
                 })?;
+            let (parent_descriptor, control_descriptor) =
+                crate::urma::sendrecv_control::unpack_descriptors(
+                    parent_descriptor,
+                    native_control,
+                )
+                .map_err(|e| ClientError::Unknown(e.to_string()))?;
             self.fabric
-                .connect_lane(lane_id, parent_descriptor.to_vec())
+                .connect_lane(lane_id, parent_descriptor)
                 .await
                 .map_err(|error| {
                     ClientError::Unknown(format!("urma READ lane connect failed: {error}"))
                 })?;
             let max_concurrent = urma_config.max_concurrent_transfers as usize;
-            let control = ReadLaneControl::spawn(stream, session_generation, max_concurrent, 16)
-                .map_err(|error| {
-                    ClientError::Unknown(format!("urma READ lane spawn failed: {error}"))
-                })?;
+            let control = if let Some(setup) = setup {
+                self.fabric
+                    .connect_control(lane_id, setup.id, control_descriptor)
+                    .await
+                    .map_err(|error| {
+                        ClientError::Unknown(format!(
+                            "urma control endpoint connect failed: {error}"
+                        ))
+                    })?;
+                let native = crate::urma::sendrecv_control::spawn(
+                    self.fabric.clone(),
+                    lane_id,
+                    session_generation,
+                    setup,
+                    stream,
+                );
+                ReadLaneControl::spawn(native, session_generation, max_concurrent, 16)
+            } else {
+                ReadLaneControl::spawn(stream, session_generation, max_concurrent, 16)
+            }
+            .map_err(|error| {
+                ClientError::Unknown(format!("urma READ lane spawn failed: {error}"))
+            })?;
             debug!(
                 parent_addr = self.addr,
-                lane_id, effective_max_read_size, "urma READ lane established"
+                lane_id,
+                effective_max_read_size,
+                control_transport = ?self.capability.control_transport,
+                "urma READ lane established"
             );
             Ok::<_, ClientError>(Arc::new(ReadLaneSession {
                 lane_id,

@@ -31,6 +31,7 @@
 
 _Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
                "URMA EID size changed");
+_Static_assert(URMA_OPC_SEND == DFURMA_CONTROL_SEND_OPCODE, "URMA SEND opcode changed");
 _Static_assert(URMA_RTP == DFURMA_TP_RTP, "URMA RTP value changed");
 _Static_assert(URMA_CTP == DFURMA_TP_CTP, "URMA CTP value changed");
 _Static_assert(URMA_ACCESS_READ == DFURMA_READ_ACCESS, "URMA READ access changed");
@@ -134,6 +135,7 @@ struct dfurma_wr {
     urma_sge_t remote_sge;
     urma_sge_t sge;
     urma_jfs_wr_t send_wr;
+    urma_jfr_wr_t recv_wr;
     dfurma_wr_t *next_free;
 };
 
@@ -1311,6 +1313,61 @@ int dfurma_post_read(dfurma_jetty_t *jetty, dfurma_target_t *target,
     }
     /* Success, or an ambiguous error without a known rejected WR: retain all
      * references. The caller must quarantine an ambiguous post, not recycle it. */
+    dfurma_wr_posted(wr);
+    *out = wr;
+    return (int)status;
+}
+
+int dfurma_post_control_send(dfurma_jetty_t *jetty, dfurma_target_t *target,
+                             dfurma_segment_t *local, uint64_t offset,
+                             uint32_t length, uint64_t user_ctx, dfurma_wr_t **out)
+{
+    dfurma_wr_t *wr;
+    urma_jfs_wr_t *bad_wr = NULL;
+    if (out == NULL) return -EINVAL;
+    *out = NULL;
+    if (jetty == NULL || target == NULL || target->jetty != jetty ||
+        target->target == NULL || length == 0 || length > 4096) return -EINVAL;
+    if (jetty->jetty_error || jetty->jfr_error) return -ESHUTDOWN;
+    int result = dfurma_wr_acquire(jetty, local, offset, length, &wr);
+    if (result != 0) return result;
+    wr->target = target;
+    wr->send_wr.opcode = URMA_OPC_SEND;
+    wr->send_wr.flag.bs.complete_enable = 1;
+    wr->send_wr.tjetty = target->target;
+    wr->send_wr.user_ctx = user_ctx;
+    wr->send_wr.send.src.sge = &wr->sge;
+    wr->send_wr.send.src.num_sge = 1;
+    urma_status_t status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
+    if (status != URMA_SUCCESS && bad_wr == &wr->send_wr) {
+        dfurma_wr_return(wr);
+        return (int)status;
+    }
+    dfurma_wr_posted(wr);
+    *out = wr;
+    return (int)status;
+}
+
+int dfurma_post_control_recv(dfurma_jetty_t *jetty, dfurma_segment_t *local,
+                             uint64_t offset, uint32_t length,
+                             uint64_t user_ctx, dfurma_wr_t **out)
+{
+    dfurma_wr_t *wr;
+    urma_jfr_wr_t *bad_wr = NULL;
+    if (out == NULL) return -EINVAL;
+    *out = NULL;
+    if (jetty == NULL || length == 0 || length > 4096) return -EINVAL;
+    if (jetty->jetty_error || jetty->jfr_error) return -ESHUTDOWN;
+    int result = dfurma_wr_acquire(jetty, local, offset, length, &wr);
+    if (result != 0) return result;
+    wr->recv_wr.src.sge = &wr->sge;
+    wr->recv_wr.src.num_sge = 1;
+    wr->recv_wr.user_ctx = user_ctx;
+    urma_status_t status = urma_post_jetty_recv_wr(jetty->jetty, &wr->recv_wr, &bad_wr);
+    if (status != URMA_SUCCESS && bad_wr == &wr->recv_wr) {
+        dfurma_wr_return(wr);
+        return (int)status;
+    }
     dfurma_wr_posted(wr);
     *out = wr;
     return (int)status;

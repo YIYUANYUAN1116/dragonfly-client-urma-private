@@ -174,12 +174,14 @@ impl ReadRuntimeConfig {
             buffer_alignment: 4096,
             source_workers: read.source_workers as usize,
             provider_revocation_validated: read.provider_revocation_validated,
+            control_bytes: read.control_bytes.as_u64(),
         })
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadRuntimeConfig {
+    pub(crate) control_bytes: u64,
     pub(crate) provider_revocation_validated: bool,
     pub(crate) source_workers: usize,
     pub(crate) budget: ReadBudget,
@@ -490,6 +492,8 @@ mod native {
         next_cache_idle_check: Instant,
         next_cache_maintenance: Instant,
         cached_revocation_validated: bool,
+        controls: HashMap<u16, crate::urma::native_control::NativeControl>,
+        control_bytes: u64,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -556,6 +560,7 @@ mod native {
             debug_assert_eq!(send_jfc.kind(), JfcKind::Send);
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
             let cached_revocation_validated = config.read.provider_revocation_validated;
+            let control_bytes = config.read.control_bytes;
             let read = {
                 let read = config.read;
                 let credits = match ReadWrCredits::new(
@@ -614,8 +619,89 @@ mod native {
                 next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated,
+                controls: HashMap::new(),
+                control_bytes,
                 _not_send_sync: PhantomData,
             })
+        }
+
+        pub(crate) fn controls_present(&self) -> bool {
+            !self.controls.is_empty()
+        }
+
+        pub(crate) fn create_control(
+            &mut self,
+            lane_id: u16,
+        ) -> Result<crate::urma::native_control::ControlSetup> {
+            if !self.accepting
+                || self.controls.contains_key(&lane_id)
+                || !self.peers.get(&lane_id).is_some_and(|p| !p.is_draining())
+            {
+                return Err(Error::Protocol("control lane unavailable".into()));
+            }
+            let bytes = crate::urma::native_control::ENDPOINT_BYTES;
+            if (self.controls.len() as u64 + 1) * bytes > self.control_bytes {
+                return Err(Error::Protocol("controlBytes capacity exhausted".into()));
+            }
+            let (control, incoming) = crate::urma::native_control::NativeControl::new()?;
+            self.controls.insert(lane_id, control);
+            let control = self.controls.get_mut(&lane_id).unwrap();
+            match control.open(
+                self.native
+                    .as_mut()
+                    .ok_or_else(|| Error::Protocol("runtime closed".into()))?,
+                self.endpoint_config.tp_type,
+            ) {
+                Ok(descriptor) => Ok(crate::urma::native_control::ControlSetup {
+                    id: control.id,
+                    descriptor,
+                    incoming,
+                }),
+                Err(error) => {
+                    control.stop();
+                    Err(error)
+                }
+            }
+        }
+        pub(crate) fn connect_control(
+            &mut self,
+            lane_id: u16,
+            control_id: u64,
+            descriptor: Vec<u8>,
+        ) -> Result<()> {
+            self.controls
+                .get_mut(&lane_id)
+                .filter(|control| control.id == control_id)
+                .ok_or_else(|| Error::Protocol("unknown control endpoint".into()))?
+                .connect(&descriptor, self.endpoint_config.tp_type)
+        }
+        pub(crate) fn stop_control(&mut self, lane_id: u16, control_id: u64) {
+            if let Some(control) = self
+                .controls
+                .get_mut(&lane_id)
+                .filter(|control| control.id == control_id)
+            {
+                control.stop();
+            }
+        }
+        pub(crate) fn send_control(
+            &mut self,
+            lane_id: u16,
+            control_id: u64,
+            bytes: Vec<u8>,
+            reply: tokio::sync::oneshot::Sender<Result<()>>,
+        ) {
+            match self.controls.get_mut(&lane_id) {
+                Some(control) if self.accepting && control.id == control_id => {
+                    control.send(bytes, reply)
+                }
+                _ => {
+                    let _ = reply.send(Err(Error::Protocol("control lane stopped".into())));
+                }
+            }
+        }
+        fn progress_controls(&mut self) {
+            self.controls.retain(|_, control| !control.progress());
         }
 
         pub(crate) fn create_peer_target(&mut self) -> Result<(u16, JettyDescriptor)> {
@@ -1650,6 +1736,7 @@ mod native {
             })
         }
         pub(crate) fn poll_once(&mut self) -> Result<usize> {
+            self.progress_controls();
             let send_jfc = self
                 .send_jfc
                 .as_ref()
@@ -1691,6 +1778,9 @@ mod native {
         }
 
         pub(crate) fn abort_peer_target(&mut self, peer_id: u16) -> Result<()> {
+            if let Some(control) = self.controls.get_mut(&peer_id) {
+                control.stop();
+            }
             let generation = self
                 .peers
                 .get(&peer_id)
@@ -1712,7 +1802,8 @@ mod native {
                 .peers
                 .iter()
                 .filter_map(|(&peer_id, peer)| {
-                    (peer.is_draining()
+                    (!self.controls.contains_key(&peer_id)
+                        && peer.is_draining()
                         && peer.is_retirement_armed()
                         && self.read.peer_drained(ReadPeer {
                             id: peer_id,
@@ -1761,6 +1852,9 @@ mod native {
                 });
             }
             self.accepting = false;
+            for control in self.controls.values_mut() {
+                control.stop();
+            }
             self.read.begin_shutdown();
             progress(self);
             self.next_cache_maintenance = Instant::now();
@@ -2039,6 +2133,8 @@ mod native {
                 next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated: true,
+                controls: HashMap::new(),
+                control_bytes: read.control_bytes,
                 _not_send_sync: PhantomData,
             }
         }
@@ -2084,6 +2180,24 @@ mod native {
                 runtime.poll_source_workers();
                 thread::sleep(Duration::from_millis(1));
             }
+        }
+
+        #[test]
+        fn stale_control_guard_cannot_close_a_replacement_endpoint() {
+            let mut runtime = runtime(Arc::new(Mutex::new(Vec::new())));
+            let (old, _) = crate::urma::native_control::NativeControl::new().unwrap();
+            let old_id = old.id;
+            let (new, receiver) = crate::urma::native_control::NativeControl::new().unwrap();
+            let new_id = new.id;
+            assert_ne!(old_id, new_id);
+            runtime.controls.insert(7, new);
+            runtime.stop_control(7, old_id);
+            assert!(!receiver.is_closed());
+            runtime.stop_control(7, new_id);
+            assert!(receiver.is_closed());
+            runtime.progress_controls();
+            assert!(!runtime.controls_present());
+            runtime.shutdown().unwrap();
         }
 
         #[test]

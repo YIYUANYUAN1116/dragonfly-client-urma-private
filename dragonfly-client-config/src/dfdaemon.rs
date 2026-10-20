@@ -1058,6 +1058,19 @@ pub struct UrmaServer {
     pub read: Option<UrmaReadServer>,
 }
 
+/// READ transfer control transport; TCP remains the descriptor bootstrap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UrmaControlTransport {
+    #[default]
+    Tcp,
+    Sendrecv,
+}
+
+fn default_urma_control_bytes() -> ByteSize {
+    ByteSize::mib(16)
+}
+
 /// Parent source registration policy. Incomplete files always use Piece registration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1092,6 +1105,12 @@ impl Default for UrmaRegistration {
 #[validate(schema(function = "validate_urma_read_server", skip_on_field_errors = true))]
 #[serde(default, rename_all = "camelCase")]
 pub struct UrmaReadServer {
+    pub control_transport: UrmaControlTransport,
+
+    /// Separate process budget for locally registered control buffers.
+    #[serde(with = "bytesize_serde", default = "default_urma_control_bytes")]
+    pub control_bytes: ByteSize,
+
     #[validate]
     pub registration: UrmaRegistration,
 
@@ -1174,6 +1193,8 @@ impl Default for UrmaReadServer {
     fn default() -> Self {
         Self {
             registration: UrmaRegistration::default(),
+            control_transport: UrmaControlTransport::Tcp,
+            control_bytes: default_urma_control_bytes(),
             provider_revocation_validated: false,
             source_workers: 0,
             total_bytes: default_urma_read_total_bytes(),
@@ -1241,6 +1262,13 @@ fn validate_urma_read_server(read: &UrmaReadServer) -> std::result::Result<(), V
     if read.registration.max_region_bytes.as_u64() == 0 {
         return Err(ValidationError::new(
             "urma read registration.maxRegionBytes must be non-zero",
+        ));
+    }
+    if read.control_transport == UrmaControlTransport::Sendrecv
+        && read.control_bytes.as_u64() < 33 * 4096
+    {
+        return Err(ValidationError::new(
+            "urma read controlBytes must cover one 132KiB control endpoint",
         ));
     }
     let total = read.total_bytes.as_u64();
@@ -2219,6 +2247,22 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tokio::fs;
+
+    #[test]
+    fn urma_sendrecv_control_is_explicit_and_budgeted() {
+        assert_eq!(
+            UrmaReadServer::default().control_transport,
+            UrmaControlTransport::Tcp
+        );
+        let config: UrmaReadServer =
+            serde_yaml::from_str("controlTransport: sendrecv\ncontrolBytes: 16MiB\n").unwrap();
+        assert_eq!(config.control_transport, UrmaControlTransport::Sendrecv);
+        assert!(config.validate().is_ok());
+        let small: UrmaReadServer =
+            serde_yaml::from_str("controlTransport: sendrecv\ncontrolBytes: 64KiB\n").unwrap();
+        assert!(small.validate().is_err());
+        assert!(serde_yaml::from_str::<UrmaReadServer>("controlTransport: auto").is_err());
+    }
 
     #[test]
     fn urma_completed_file_registration_configuration() {

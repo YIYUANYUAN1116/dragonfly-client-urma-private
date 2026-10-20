@@ -211,6 +211,45 @@ pub(crate) struct ReadCachedSourceLease {
 }
 
 impl UrmaFabricHandle {
+    pub(crate) fn control_guard(&self, lane_id: u16, control_id: u64) -> ResourceGuard {
+        self.resource_guard(Abandoned::Control(lane_id, control_id))
+    }
+    pub(crate) async fn create_control(
+        &self,
+        lane_id: u16,
+    ) -> Result<super::native_control::ControlSetup> {
+        self.submit(|reply| FabricCommand::CreateControl { lane_id, reply })
+            .await
+    }
+    pub(crate) async fn connect_control(
+        &self,
+        lane_id: u16,
+        control_id: u64,
+        descriptor: Vec<u8>,
+    ) -> Result<()> {
+        self.submit(|reply| FabricCommand::ConnectControl {
+            lane_id,
+            control_id,
+            descriptor,
+            reply,
+        })
+        .await
+    }
+    pub(crate) async fn send_control(
+        &self,
+        lane_id: u16,
+        control_id: u64,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        self.submit_urgent(|reply| FabricCommand::SendControl {
+            lane_id,
+            control_id,
+            bytes,
+            reply,
+        })
+        .await
+    }
+
     /// # Safety
     /// Storage completion evidence matches this exact immutable opened file.
     /// Native producer ownership belongs to the cache, including on timeout.
@@ -678,6 +717,7 @@ impl Drop for FabricInner {
 }
 
 pub(crate) enum Abandoned {
+    Control(u16, u64),
     Lane(u16),
     Child(ReadChildId),
     Source(ReadSourceId, bool),
@@ -685,6 +725,22 @@ pub(crate) enum Abandoned {
 }
 
 enum FabricCommand {
+    CreateControl {
+        lane_id: u16,
+        reply: oneshot::Sender<Result<super::native_control::ControlSetup>>,
+    },
+    ConnectControl {
+        lane_id: u16,
+        control_id: u64,
+        descriptor: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SendControl {
+        lane_id: u16,
+        control_id: u64,
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Abandon {
         action: Abandoned,
     },
@@ -848,7 +904,10 @@ fn run_owner(
     loop {
         runtime.poll_source_workers();
         runtime.maintain_cached_sources();
-        if runtime.outstanding() == 0 && !runtime.source_work_pending() {
+        if runtime.outstanding() == 0
+            && !runtime.source_work_pending()
+            && !runtime.controls_present()
+        {
             // Cached sources need maintenance even without commands or CQEs.
             // Keep the original blocking path when the cache is empty; an
             // idle cache wakes at low frequency without polling the device CQ.
@@ -930,8 +989,43 @@ fn handle_command(
     poisoned: Option<&str>,
 ) -> OwnerControl {
     match command {
+        FabricCommand::CreateControl { lane_id, reply } => {
+            let result =
+                reject_if_poisoned(poisoned).and_then(|()| runtime.create_control(lane_id));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::ConnectControl {
+            lane_id,
+            control_id,
+            descriptor,
+            reply,
+        } => {
+            let result = reject_if_poisoned(poisoned)
+                .and_then(|()| runtime.connect_control(lane_id, control_id, descriptor));
+            let _ = reply.send(result);
+            OwnerControl::Continue
+        }
+        FabricCommand::SendControl {
+            lane_id,
+            control_id,
+            bytes,
+            reply,
+        } => {
+            match reject_if_poisoned(poisoned) {
+                Ok(()) => runtime.send_control(lane_id, control_id, bytes, reply),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            OwnerControl::Continue
+        }
+
         FabricCommand::Abandon { action } => {
             match action {
+                Abandoned::Control(lane, id) => {
+                    runtime.stop_control(lane, id);
+                }
                 Abandoned::Lane(id) => {
                     let _ = runtime.close_peer_target(id);
                 }
@@ -1903,6 +1997,55 @@ mod tests {
             }
             assert_eq!(registry.usage().source_bytes, 64);
         }
+    }
+
+    #[tokio::test]
+    async fn control_bridge_segments_bytes_and_guards_exact_endpoint_on_drop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (fabric, mut commands) = lease_test_handle();
+        let (incoming, receiver) = mpsc::channel(32);
+        let (watchdog, _remote_watchdog) = tokio::io::duplex(32);
+        let setup = super::super::native_control::ControlSetup {
+            id: 91,
+            descriptor: vec![1],
+            incoming: receiver,
+        };
+        let mut stream = super::super::sendrecv_control::spawn(fabric, 7, 41, setup, watchdog);
+        let bytes: Vec<_> = (0..20_000).map(|n| (n % 251) as u8).collect();
+        stream.write_all(&bytes).await.unwrap();
+        let mut received = vec![0; bytes.len()];
+        let mut reading = Box::pin(stream.read_exact(&mut received));
+        let mut packets = 0;
+        loop {
+            tokio::select! {
+                result = &mut reading => { result.unwrap(); break; }
+                command = commands.recv() => {
+                    let FabricCommand::SendControl { lane_id, control_id, bytes, reply } = command.unwrap().command else {
+                        panic!("expected native SEND, never TCP frame fallback");
+                    };
+                    assert_eq!((lane_id, control_id), (7, 91));
+                    assert!(bytes.len() <= 4096);
+                    assert_eq!(u64::from_be_bytes(bytes[..8].try_into().unwrap()), 41);
+                    reply.send(Ok(())).unwrap();
+                    incoming.send(Ok(bytes)).await.unwrap();
+                    packets += 1;
+                }
+            }
+        }
+        drop(reading);
+        assert!(packets >= 5);
+        assert_eq!(received, bytes);
+        drop(stream);
+        let closing = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            closing.command,
+            FabricCommand::Abandon {
+                action: Abandoned::Control(7, 91)
+            }
+        ));
     }
 
     #[test]

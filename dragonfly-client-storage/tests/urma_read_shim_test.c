@@ -6,6 +6,7 @@
 #define urma_import_seg test_import_seg
 #define urma_unimport_seg test_unimport_seg
 #define urma_post_jetty_send_wr test_post_read
+#define urma_post_jetty_recv_wr test_post_recv
 #define urma_alloc_token_id test_alloc_token
 #define urma_free_token_id test_free_token
 #define urma_register_seg test_register_source
@@ -191,6 +192,14 @@ urma_status_t test_post_read(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
 {
     (void)jetty;
     posts++;
+    if (wr->opcode == URMA_OPC_SEND) {
+        assert(wr->flag.bs.complete_enable == 1 && wr->tjetty != NULL);
+        assert(wr->user_ctx == 0xabcdef && wr->next == NULL);
+        assert(wr->send.src.num_sge == 1 && wr->send.src.sge->len == 8);
+        assert(wr->send.src.sge->tseg != NULL);
+        *bad_wr = post_mode == 1 ? wr : NULL;
+        return post_mode ? URMA_FAIL : URMA_SUCCESS;
+    }
     assert(wr->opcode == URMA_OPC_READ && wr->flag.bs.complete_enable == 1);
     assert(wr->next == NULL && wr->tjetty != NULL);
     assert(wr->user_ctx == 0xabcdef);
@@ -206,6 +215,16 @@ urma_status_t test_post_read(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
            (void *)(uintptr_t)wr->rw.src.sge->addr, wr->rw.src.sge->len);
     *bad_wr = NULL;
     return post_mode == 2 ? URMA_FAIL : URMA_SUCCESS;
+}
+
+urma_status_t test_post_recv(urma_jetty_t *jetty, urma_jfr_wr_t *wr,
+                            urma_jfr_wr_t **bad_wr)
+{
+    (void)jetty;
+    assert(wr->next == NULL && wr->user_ctx == 0xabcdef);
+    assert(wr->src.num_sge == 1 && wr->src.sge->len == 8 && wr->src.sge->tseg != NULL);
+    *bad_wr = post_mode == 1 ? wr : NULL;
+    return post_mode ? URMA_FAIL : URMA_SUCCESS;
 }
 
 struct fixture {
@@ -585,8 +604,41 @@ static void test_shared_token_lives_until_retryable_runtime_close(void)
     assert(token_frees == 1);
 }
 
+static void test_control_send_recv_retains_ambiguous_posts_and_rejects_bad_ranges(void)
+{
+    for (int receive = 0; receive <= 1; receive++) {
+        for (int mode = 0; mode <= 2; mode++) {
+            struct fixture f;
+            setup(&f);
+            post_mode = mode;
+            dfurma_wr_t *wr = NULL;
+            int result = receive ?
+                dfurma_post_control_recv(&f.jetty, &f.local, 0, 8, 0xabcdef, &wr) :
+                dfurma_post_control_send(&f.jetty, &f.target, &f.local, 0, 8, 0xabcdef, &wr);
+            assert((result == 0) == (mode == 0));
+            if (mode == 1) {
+                assert(wr == NULL && f.runtime.outstanding_wr_count == 0);
+            } else {
+                assert(wr != NULL && f.runtime.outstanding_wr_count == 1);
+                assert(f.local.outstanding_wr_count == 1 && f.jetty.outstanding_wr_count == 1);
+                assert(f.target.outstanding_wr_count == (receive ? 0U : 1U));
+                assert(dfurma_segment_delete(&f.local) == -EBUSY);
+                dfurma_wr_complete(wr);
+                assert(f.runtime.outstanding_wr_count == 0 && f.local.outstanding_wr_count == 0);
+            }
+            assert(dfurma_post_control_send(&f.jetty, &f.target, &f.local, 0, 4097, 0, &wr) == -EINVAL);
+            assert(wr == NULL);
+            assert(dfurma_post_control_recv(&f.jetty, &f.local, 30, 8, 0, &wr) == -EINVAL);
+            assert(wr == NULL);
+            f.jetty.jetty_error = 1;
+            assert(dfurma_post_control_recv(&f.jetty, &f.local, 0, 8, 0, &wr) == -ESHUTDOWN);
+        }
+    }
+}
+
 int main(void)
 {
+    test_control_send_recv_retains_ambiguous_posts_and_rejects_bad_ranges();
     test_descriptor_validation();
     test_read_ownership_and_retryable_unimport();
     test_read_preflight();
@@ -599,6 +651,6 @@ int main(void)
     test_allocated_read_buffer_full_lifecycle();
     test_source_register_stage_timings();
     test_shared_token_lives_until_retryable_runtime_close();
-    puts("PASS: 12 groups covering source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
+    puts("PASS: 13 groups covering SEND/RECV ownership and source/import/READ, context validation, retirement, uncertain grants and register sub-phase timings");
     return 0;
 }

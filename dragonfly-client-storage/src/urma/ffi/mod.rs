@@ -23,6 +23,8 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
 }
 
+pub(crate) const CONTROL_SEND_OPCODE: u32 = sys::DFURMA_CONTROL_SEND_OPCODE;
+
 pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
 pub(crate) const TP_RTP: u32 = sys::DFURMA_TP_RTP;
 pub(crate) const TP_CTP: u32 = sys::DFURMA_TP_CTP;
@@ -593,4 +595,62 @@ fn status_result(status: c_int) -> Result<(), FfiError> {
     } else {
         Err(FfiError::Status(status))
     }
+}
+
+/// Post control work on an independently owned endpoint. A returned WR on an
+/// error remains owned by the caller; cancellation cannot release its buffer.
+pub(crate) fn post_control(
+    jetty: &JettyHandle,
+    target: Option<&TargetHandle>,
+    segment: &SegmentHandle,
+    offset: u64,
+    length: u32,
+    context: u64,
+) -> (Result<(), FfiError>, Option<WrHandle>) {
+    let Some(jetty) = jetty.raw else {
+        return (Err(FfiError::NullHandle), None);
+    };
+    let Some(segment) = segment.raw else {
+        return (Err(FfiError::NullHandle), None);
+    };
+    let mut out = std::ptr::null_mut();
+    // SAFETY: all handles stay on the Fabric owner; the caller owns this
+    // non-overlapping slot until the returned WR retires.
+    let status = unsafe {
+        if let Some(target) = target {
+            let Some(target) = target.raw else {
+                return (Err(FfiError::NullHandle), None);
+            };
+            sys::dfurma_post_control_send(
+                jetty.as_ptr(),
+                target.as_ptr(),
+                segment.as_ptr(),
+                offset,
+                length,
+                context,
+                &mut out,
+            )
+        } else {
+            sys::dfurma_post_control_recv(
+                jetty.as_ptr(),
+                segment.as_ptr(),
+                offset,
+                length,
+                context,
+                &mut out,
+            )
+        }
+    };
+    let wr = NonNull::new(out).map(|raw| WrHandle {
+        raw: Some(raw),
+        _not_send_sync: PhantomData,
+    });
+    (
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FfiError::Status(status))
+        },
+        wr,
+    )
 }

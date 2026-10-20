@@ -121,7 +121,7 @@ impl JettyDescriptor {
         Ok(descriptor)
     }
 
-    fn from_ffi(raw: ffi::JettyDescriptorData) -> Result<Self> {
+    pub(crate) fn from_ffi(raw: ffi::JettyDescriptorData) -> Result<Self> {
         let opaque_len = u32::try_from(raw.opaque_data.len())
             .map_err(|_| Error::Protocol("native descriptor exceeds u32".into()))?;
         let descriptor = Self {
@@ -141,7 +141,7 @@ impl JettyDescriptor {
         Ok(descriptor)
     }
 
-    fn to_ffi(&self) -> Result<ffi::JettyDescriptorData> {
+    pub(crate) fn to_ffi(&self) -> Result<ffi::JettyDescriptorData> {
         self.validate()?;
         Ok(ffi::JettyDescriptorData {
             transport_type: self.transport_type,
