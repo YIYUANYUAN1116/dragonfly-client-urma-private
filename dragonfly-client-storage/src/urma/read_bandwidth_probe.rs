@@ -63,6 +63,29 @@ fn require(ok: bool, message: &str) -> Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePattern {
+    Sequential,
+    Fixed,
+}
+impl SourcePattern {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "sequential" => Ok(Self::Sequential),
+            "fixed" => Ok(Self::Fixed),
+            _ => Err(Error::Protocol(
+                "source pattern must be sequential|fixed".into(),
+            )),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Fixed => "fixed",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     parent: bool,
@@ -77,6 +100,7 @@ struct Options {
     warmup: Duration,
     duration: Duration,
     threads: usize,
+    source_pattern: SourcePattern,
 }
 impl Options {
     fn env() -> Result<Self> {
@@ -104,6 +128,9 @@ impl Options {
             warmup: Duration::from_secs(number("URMA_BW_WARMUP_SECONDS", 1)?),
             duration: Duration::from_secs(number("URMA_BW_SECONDS", 10)?),
             threads: checked(usize::try_from(number("URMA_BW_TOKIO_THREADS", 32)?))?,
+            source_pattern: SourcePattern::parse(
+                &std::env::var("URMA_BW_SOURCE_PATTERN").unwrap_or_else(|_| "sequential".into()),
+            )?,
         };
         o.validate()?;
         Ok(o)
@@ -151,10 +178,25 @@ impl Options {
     fn pieces(&self) -> u64 {
         self.file_bytes / self.piece
     }
+    fn validate_mode(&self, cached: bool) -> Result<()> {
+        require(
+            !cached || self.source_pattern == SourcePattern::Sequential,
+            "fixed source pattern is supported only by probe B",
+        )
+    }
+    fn native_piece(&self, submitted: u64, verify: bool) -> u64 {
+        // Integrity passes still cover the entire file. Only warmup and the
+        // measurement change their source working set; destinations stay private.
+        if !verify && self.source_pattern == SourcePattern::Fixed {
+            0
+        } else {
+            submitted % self.pieces()
+        }
+    }
     fn signature(&self, cached: bool) -> [u64; 8] {
         [
             MAGIC,
-            u64::from(cached),
+            u64::from(cached) | (u64::from(self.source_pattern == SourcePattern::Fixed) << 1),
             self.file_bytes,
             self.piece,
             self.region,
@@ -427,7 +469,7 @@ fn native_phase(
     loop {
         while !free.is_empty() && limit.allows(start, Instant::now(), submitted) {
             let slot = free.pop_front().unwrap();
-            let piece = submitted % o.pieces();
+            let piece = o.native_piece(submitted, verify);
             let offset = piece * o.piece;
             let context = *next;
             *next = next
@@ -1057,10 +1099,12 @@ async fn cached_probe(o: &Options) -> Result<()> {
 }
 fn run(cached: bool) {
     let o = Options::env().expect("invalid bandwidth probe options");
-    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={}",
+    o.validate_mode(cached)
+        .expect("invalid bandwidth probe mode");
+    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={} source_pattern={}",
         if cached { "C" } else { "B" }, if o.parent { "parent" } else { "child" }, o.device, o.eid,
         o.file_bytes, o.piece, o.region, o.depth, o.warmup.as_secs(), o.duration.as_secs(),
-        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 });
+        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 }, o.source_pattern.name());
     let mut builder = if cached {
         let mut b = tokio::runtime::Builder::new_multi_thread();
         b.worker_threads(o.threads);
@@ -1120,6 +1164,7 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
         warmup: Duration::from_secs(1),
         duration: Duration::from_secs(10),
         threads: 32,
+        source_pattern: SourcePattern::Sequential,
     };
     o.validate().unwrap();
     let budget = cached_budget(&o);
@@ -1157,6 +1202,20 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     assert_eq!(o.signature(true), peer.signature(true));
     peer.depth = 8;
     assert_ne!(o.signature(true), peer.signature(true));
+    let mut fixed = o.clone();
+    fixed.source_pattern = SourcePattern::parse("fixed").unwrap();
+    assert!(SourcePattern::parse("typo").is_err());
+    assert_ne!(o.signature(false), fixed.signature(false));
+    fixed.validate_mode(false).unwrap();
+    assert!(fixed.validate_mode(true).is_err());
+    for index in 0..96 {
+        assert_eq!(o.native_piece(index, false), index % o.pieces());
+        assert_eq!(fixed.native_piece(index, false), 0);
+        assert_eq!(fixed.native_piece(index, true), index % o.pieces());
+    }
+    assert_eq!(fixed.file_bytes, o.file_bytes);
+    assert_eq!(fixed.region, o.region);
+    assert_eq!(fixed.depth, o.depth);
     let measured = Measurement {
         pieces: 32,
         elapsed: Duration::from_millis(500),
