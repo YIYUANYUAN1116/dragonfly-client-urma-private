@@ -23,6 +23,13 @@ pub(crate) struct ControlSetup {
     pub(crate) descriptor: Vec<u8>,
     pub(crate) incoming: mpsc::Receiver<Result<Vec<u8>>>,
 }
+
+pub(crate) struct ControlProgress {
+    pub(crate) closed: bool,
+    /// Consumed CQ records, including flush/error events. The owner must not
+    /// sleep as though the control queues were idle after making progress.
+    pub(crate) events: usize,
+}
 struct Flight {
     wr: WrHandle,
     slot: usize,
@@ -281,9 +288,10 @@ impl NativeControl {
         }
         Ok(())
     }
-    /// Native CQ progress and cleanup stay on the same owner as READ. False
-    /// means resources remain owned (including indeterminate registration).
-    pub(crate) fn progress(&mut self) -> bool {
+    /// Native CQ progress and cleanup stay on the same owner as READ. A
+    /// non-closed endpoint retains ownership, including uncertain registration.
+    pub(crate) fn progress(&mut self) -> ControlProgress {
+        let mut events = 0;
         let result = (|| {
             if self.incoming.as_ref().is_some_and(|tx| tx.is_closed()) {
                 self.stop();
@@ -299,6 +307,7 @@ impl NativeControl {
                     Some(cq) => cq.poll_into(&mut completions).map_err(err)?,
                     None => 0,
                 };
+                events += count;
                 for cqe in completions.iter().take(count) {
                     if let Err(error) = self.complete(*cqe, receive) {
                         self.fail(error);
@@ -321,7 +330,10 @@ impl NativeControl {
             self.fail(error);
         }
         if !self.closing || !self.posted.is_empty() || self.uncertain_buffer {
-            return false;
+            return ControlProgress {
+                closed: false,
+                events,
+            };
         }
         let result = (|| {
             if let Some(target) = &mut self.target {
@@ -341,7 +353,10 @@ impl NativeControl {
             }
             Ok::<_, Error>(())
         })();
-        result.is_ok()
+        ControlProgress {
+            closed: result.is_ok(),
+            events,
+        }
     }
 }
 fn protocol(message: impl Into<String>) -> Error {

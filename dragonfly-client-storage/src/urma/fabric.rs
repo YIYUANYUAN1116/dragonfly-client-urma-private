@@ -36,6 +36,8 @@ const MAX_COMMANDS_PER_TICK: usize = 16;
 
 /// Pure polling is used because this runtime has no JFCE. Keep the
 /// idle interval short without allowing an outstanding WR to consume one CPU.
+/// Commands unpark the owner before this timeout; CQ-only work is polled on
+/// expiry because the device does not currently provide a wakeup event here.
 const PROGRESS_IDLE_INTERVAL: Duration = Duration::from_micros(100);
 
 /// Native device discovery should normally finish immediately. Bound the
@@ -940,9 +942,11 @@ fn run_owner(
             continue;
         }
 
+        let mut commands_processed = 0;
         for _ in 0..MAX_COMMANDS_PER_TICK {
             match command_rx.try_recv() {
                 Ok(envelope) => {
+                    commands_processed += 1;
                     if let OwnerControl::Shutdown(reply) =
                         handle_command(envelope.command, &mut runtime, poisoned.as_deref())
                     {
@@ -960,9 +964,9 @@ fn run_owner(
 
         match runtime.poll_once() {
             Ok(completed) => {
-                let idle = completed == 0;
+                let idle = completed == 0 && commands_processed == 0;
                 if idle {
-                    thread::sleep(PROGRESS_IDLE_INTERVAL);
+                    thread::park_timeout(PROGRESS_IDLE_INTERVAL);
                 } else {
                     thread::yield_now();
                 }
@@ -972,7 +976,7 @@ fn run_owner(
                     runtime.interrupt_read_waiters();
                 }
                 poison_once(&mut poisoned, error.to_string(), &readiness_tx);
-                thread::sleep(PROGRESS_IDLE_INTERVAL);
+                thread::park_timeout(PROGRESS_IDLE_INTERVAL);
             }
         }
     }
@@ -1278,7 +1282,7 @@ mod tests {
         let join = thread::spawn(move || {
             // The command is enqueued before this rendezvous permits parking.
             park_rx.recv().unwrap();
-            thread::park();
+            thread::park_timeout(Duration::from_secs(30));
             done_tx.send(()).unwrap();
         });
         let sender = CommandSender {

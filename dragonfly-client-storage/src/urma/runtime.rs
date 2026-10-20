@@ -700,8 +700,14 @@ mod native {
                 }
             }
         }
-        fn progress_controls(&mut self) {
-            self.controls.retain(|_, control| !control.progress());
+        fn progress_controls(&mut self) -> usize {
+            let mut events = 0;
+            self.controls.retain(|_, control| {
+                let progress = control.progress();
+                events += progress.events;
+                !progress.closed
+            });
+            events
         }
 
         pub(crate) fn create_peer_target(&mut self) -> Result<(u16, JettyDescriptor)> {
@@ -1736,7 +1742,7 @@ mod native {
             })
         }
         pub(crate) fn poll_once(&mut self) -> Result<usize> {
-            self.progress_controls();
+            let control_events = self.progress_controls();
             let send_jfc = self
                 .send_jfc
                 .as_ref()
@@ -1747,7 +1753,7 @@ mod native {
             let reap = self.reap_drained_peers();
             match (progress, reap) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                (Ok(count), Ok(())) => Ok(count),
+                (Ok(count), Ok(())) => Ok(count + control_events),
             }
         }
 
