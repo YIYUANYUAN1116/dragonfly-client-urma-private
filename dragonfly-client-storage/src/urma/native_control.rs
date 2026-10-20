@@ -242,12 +242,7 @@ impl NativeControl {
             }
             return Ok(());
         }
-        if cqe.event_kind != CompletionEventKind::WorkRequest
-            || !cqe.user_ctx_valid
-            || (cqe.status == 0 && cqe.opcode != ffi::CONTROL_SEND_OPCODE)
-        {
-            return Err(protocol("unroutable control CQE"));
-        }
+        validate_work_completion(&cqe, receive)?;
         let Some(flight) = self.posted.get(&cqe.user_ctx) else {
             return Err(protocol("unknown control CQE context"));
         };
@@ -354,4 +349,69 @@ fn protocol(message: impl Into<String>) -> Error {
 }
 fn err(error: FfiError) -> Error {
     native_error("control SEND/RECV", error)
+}
+
+fn validate_work_completion(cqe: &CompletionRecord, receive: bool) -> Result<()> {
+    // URMA_OPC_SEND describes a submitted WR, not its completion. Receive
+    // completions use urma_cr_opcode_t (URMA_CR_OPC_SEND); udma's send-CQ
+    // parser does not populate opcode. SEND identity comes from the posted
+    // context and queue/endpoint checks in complete(), as for READ CQEs.
+    if cqe.event_kind != CompletionEventKind::WorkRequest
+        || !cqe.user_ctx_valid
+        || cqe.is_recv != receive
+        || (receive && cqe.status == 0 && cqe.opcode != ffi::CONTROL_RECV_OPCODE)
+    {
+        return Err(protocol(format!(
+            "unroutable control CQE: status={} opcode={} receive={} expected_receive={} context_valid={} event={:?}",
+            cqe.status, cqe.opcode, cqe.is_recv, receive, cqe.user_ctx_valid, cqe.event_kind,
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udma_send_and_recv_completions_do_not_use_the_wr_send_opcode() {
+        // udma fills receive opcode with URMA_CR_OPC_SEND (0), and leaves
+        // send opcode unset (the shim zero-initializes its polling buffer).
+        let mut cqe = CompletionRecord {
+            user_ctx: 17,
+            user_ctx_valid: true,
+            opcode: 0,
+            ..Default::default()
+        };
+        validate_work_completion(&cqe, false).unwrap();
+        cqe.is_recv = true;
+        cqe.completion_len = 128;
+        validate_work_completion(&cqe, true).unwrap();
+        cqe.opcode = 0x40; // URMA_OPC_SEND belongs to WRs, not receive CQEs.
+        assert!(validate_work_completion(&cqe, true).is_err());
+        cqe.is_recv = false;
+        cqe.opcode = u32::MAX; // Send opcode is not a provider guarantee.
+        validate_work_completion(&cqe, false).unwrap();
+    }
+
+    #[test]
+    fn control_completion_still_requires_valid_context_and_correct_queue() {
+        let mut cqe = CompletionRecord {
+            user_ctx_valid: true,
+            ..Default::default()
+        };
+        assert!(validate_work_completion(&cqe, true).is_err());
+        cqe.user_ctx_valid = false;
+        assert!(validate_work_completion(&cqe, false).is_err());
+        cqe.user_ctx_valid = true;
+        cqe.event_kind = CompletionEventKind::FlushErrorDone;
+        assert!(validate_work_completion(&cqe, false).is_err());
+        cqe.event_kind = CompletionEventKind::SuspendDone;
+        assert!(validate_work_completion(&cqe, false).is_err());
+        cqe.event_kind = CompletionEventKind::WorkRequest;
+        cqe.is_recv = true;
+        cqe.status = 1; // Failed WRs need not carry a successful opcode.
+        cqe.opcode = u32::MAX;
+        validate_work_completion(&cqe, true).unwrap();
+    }
 }

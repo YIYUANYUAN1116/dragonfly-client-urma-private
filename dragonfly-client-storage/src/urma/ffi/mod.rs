@@ -23,7 +23,7 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
 }
 
-pub(crate) const CONTROL_SEND_OPCODE: u32 = sys::DFURMA_CONTROL_SEND_OPCODE;
+pub(crate) const CONTROL_RECV_OPCODE: u32 = sys::DFURMA_CONTROL_RECV_OPCODE;
 
 pub(crate) const EID_SIZE: usize = sys::DFURMA_EID_SIZE as usize;
 pub(crate) const TP_RTP: u32 = sys::DFURMA_TP_RTP;

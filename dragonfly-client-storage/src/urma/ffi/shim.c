@@ -31,7 +31,8 @@
 
 _Static_assert(sizeof(((urma_eid_t *)0)->raw) == DFURMA_EID_SIZE,
                "URMA EID size changed");
-_Static_assert(URMA_OPC_SEND == DFURMA_CONTROL_SEND_OPCODE, "URMA SEND opcode changed");
+_Static_assert(URMA_CR_OPC_SEND == DFURMA_CONTROL_RECV_OPCODE,
+               "URMA SEND receive-completion opcode changed");
 _Static_assert(URMA_RTP == DFURMA_TP_RTP, "URMA RTP value changed");
 _Static_assert(URMA_CTP == DFURMA_TP_CTP, "URMA CTP value changed");
 _Static_assert(URMA_ACCESS_READ == DFURMA_READ_ACCESS, "URMA READ access changed");

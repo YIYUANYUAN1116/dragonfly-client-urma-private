@@ -69,7 +69,7 @@ typedef struct dfurma_jetty_descriptor_meta {
 } dfurma_jetty_descriptor_meta_t;
 
 #define DFURMA_EID_SIZE 16U
-#define DFURMA_CONTROL_SEND_OPCODE 0x40U
+#define DFURMA_CONTROL_RECV_OPCODE 0x00U
 
 #define DFURMA_IMPORT_STAGE_NONE 0U
 #define DFURMA_IMPORT_STAGE_GET_TP 1U
