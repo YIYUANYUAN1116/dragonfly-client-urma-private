@@ -86,6 +86,29 @@ impl SourcePattern {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationLayout {
+    Segments,
+    Contiguous,
+}
+impl DestinationLayout {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "segments" => Ok(Self::Segments),
+            "contiguous" => Ok(Self::Contiguous),
+            _ => Err(Error::Protocol(
+                "destination layout must be segments|contiguous".into(),
+            )),
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Segments => "segments",
+            Self::Contiguous => "contiguous",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     parent: bool,
@@ -101,6 +124,7 @@ struct Options {
     duration: Duration,
     threads: usize,
     source_pattern: SourcePattern,
+    destination_layout: DestinationLayout,
 }
 impl Options {
     fn env() -> Result<Self> {
@@ -130,6 +154,9 @@ impl Options {
             threads: checked(usize::try_from(number("URMA_BW_TOKIO_THREADS", 32)?))?,
             source_pattern: SourcePattern::parse(
                 &std::env::var("URMA_BW_SOURCE_PATTERN").unwrap_or_else(|_| "sequential".into()),
+            )?,
+            destination_layout: DestinationLayout::parse(
+                &std::env::var("URMA_BW_DESTINATION_LAYOUT").unwrap_or_else(|_| "segments".into()),
             )?,
         };
         o.validate()?;
@@ -180,6 +207,10 @@ impl Options {
     }
     fn validate_mode(&self, cached: bool) -> Result<()> {
         require(
+            !cached || matches!(self.destination_layout, DestinationLayout::Segments),
+            "contiguous destination layout is supported only by probe B",
+        )?;
+        require(
             !cached || self.source_pattern == SourcePattern::Sequential,
             "fixed source pattern is supported only by probe B",
         )
@@ -196,7 +227,12 @@ impl Options {
     fn signature(&self, cached: bool) -> [u64; 8] {
         [
             MAGIC,
-            u64::from(cached) | (u64::from(self.source_pattern == SourcePattern::Fixed) << 1),
+            u64::from(cached)
+                | (u64::from(self.source_pattern == SourcePattern::Fixed) << 1)
+                | (u64::from(matches!(
+                    self.destination_layout,
+                    DestinationLayout::Contiguous
+                )) << 2),
             self.file_bytes,
             self.piece,
             self.region,
@@ -449,8 +485,8 @@ impl NativeObservation {
     fn report(&self, o: &Options, elapsed: Duration) {
         let ns = elapsed.as_nanos().max(1) as f64;
         let mean_us = |total: u128, count: u64| total as f64 / count.max(1) as f64 / 1000.0;
-        println!("URMA_BW_NATIVE mode=B source_pattern={} wrs={} polls={} empty_polls={} empty_poll_pct={:.3} avg_unretired={:.3} peak_unretired={} full_window_pct={:.3} zero_unretired_pct={:.3} post_call_ms={:.3} post_call_mean_us={:.3} post_call_max_us={:.3} post_to_cqe_mean_us={:.3} post_to_cqe_min_us={:.3} post_to_cqe_max_us={:.3} refill_count={} refill_mean_us={:.3} refill_max_us={:.3} outstanding_scope=host-post-to-polled-cqe drain_included=true",
-            o.source_pattern.name(), self.completions, self.polls, self.empty_polls,
+        println!("URMA_BW_NATIVE mode=B source_pattern={} destination_layout={} wrs={} polls={} empty_polls={} empty_poll_pct={:.3} avg_unretired={:.3} peak_unretired={} full_window_pct={:.3} zero_unretired_pct={:.3} post_call_ms={:.3} post_call_mean_us={:.3} post_call_max_us={:.3} post_to_cqe_mean_us={:.3} post_to_cqe_min_us={:.3} post_to_cqe_max_us={:.3} refill_count={} refill_mean_us={:.3} refill_max_us={:.3} outstanding_scope=host-post-to-polled-cqe drain_included=true",
+            o.source_pattern.name(), o.destination_layout.name(), self.completions, self.polls, self.empty_polls,
             100.0 * self.empty_polls as f64 / self.polls.max(1) as f64,
             self.area_ns as f64 / ns, self.peak, 100.0 * self.full_ns as f64 / ns,
             100.0 * self.zero_ns as f64 / ns, self.post_ns as f64 / 1e6,
@@ -538,6 +574,96 @@ fn descriptor(offer: &ReadSegmentOffer) -> ReadDescriptor {
         token_policy: offer.token_policy,
     }
 }
+// The same Slot plan is used for post offsets and CRC ranges. All Slots stay
+// disjoint in either layout, and each native Segment has exactly one owner.
+struct DestinationPlan {
+    segment_count: usize,
+    segment_bytes: u64,
+    slot_bytes: u64,
+    slots: Vec<(usize, u64)>,
+}
+impl DestinationPlan {
+    fn new(o: &Options) -> Self {
+        // Options::validate bounds depth*piece to 8 GiB without overflow.
+        let contiguous = o.destination_layout == DestinationLayout::Contiguous;
+        Self {
+            segment_count: if contiguous { 1 } else { o.depth },
+            segment_bytes: if contiguous {
+                o.piece * o.depth as u64
+            } else {
+                o.piece
+            },
+            slot_bytes: o.piece,
+            slots: (0..o.depth)
+                .map(|slot| {
+                    if contiguous {
+                        (0, slot as u64 * o.piece)
+                    } else {
+                        (slot, 0)
+                    }
+                })
+                .collect(),
+        }
+    }
+    fn range(&self, slot: usize, buffer_length: usize) -> Result<std::ops::Range<usize>> {
+        let (_, offset) = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| Error::Protocol("invalid destination Slot".into()))?;
+        let start = checked(usize::try_from(*offset))?;
+        let length = checked(usize::try_from(self.slot_bytes))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| Error::Protocol("destination range overflow".into()))?;
+        require(
+            buffer_length as u64 == self.segment_bytes && end <= buffer_length,
+            "destination length/range mismatch",
+        )?;
+        Ok(start..end)
+    }
+}
+struct NativeDestinations {
+    buffers: Vec<SegmentHandle>,
+    plan: DestinationPlan,
+}
+impl NativeDestinations {
+    fn create(native: &mut NativeRuntime, o: &Options) -> Result<Self> {
+        let plan = DestinationPlan::new(o);
+        let mut buffers = Vec::with_capacity(plan.segment_count);
+        for _ in 0..plan.segment_count {
+            match SegmentHandle::create_read_buffer(native, plan.segment_bytes, 4096) {
+                ReadBufferCreation::Ready(buffer) => buffers.push(buffer),
+                ReadBufferCreation::Rejected(error)
+                | ReadBufferCreation::Uncertain { error, .. } => return checked(Err(error)),
+            }
+        }
+        println!("URMA_BW_DESTINATION layout={} segments={} segment_bytes={} registered_bytes={} slots={} slot_bytes={}",
+            o.destination_layout.name(), plan.segment_count, plan.segment_bytes,
+            plan.segment_count as u64 * plan.segment_bytes, plan.slots.len(), plan.slot_bytes);
+        Ok(Self { buffers, plan })
+    }
+    fn slot(&self, slot: usize) -> (&SegmentHandle, u64) {
+        let (buffer, offset) = self.plan.slots[slot];
+        (&self.buffers[buffer], offset)
+    }
+    fn verify(&self, slot: usize, digest: u32) -> Result<()> {
+        let (buffer, _) = self.slot(slot);
+        let (ptr, length) = checked(buffer.data())?;
+        let range = self.plan.range(slot, length)?;
+        // SAFETY: validated in-bounds private Slot, its matching CQE consumed,
+        // no repost/CPU write until this function returns. Entire Segment lives.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(range.start), range.len()) };
+        require(crc32fast::hash(bytes) == digest, "native READ CRC mismatch")
+    }
+    fn close(&mut self) -> Result<()> {
+        for buffer in &mut self.buffers {
+            checked(buffer.close())?;
+        }
+        Ok(())
+    }
+}
+
 struct Pending {
     slot: usize,
     piece: usize,
@@ -559,12 +685,18 @@ fn native_phase(
     lane: &mut NativeLane,
     target: &ffi::TargetHandle,
     remote: &[ImportedReadSegment],
-    local: &[SegmentHandle],
+    local: &NativeDestinations,
     digests: &[u32],
     limit: Limit,
     verify: bool,
     next: &mut u64,
 ) -> Result<Measurement> {
+    // Even a one-Piece fixture must initialize/check every private destination
+    // Slot before measurement. Cycling the source still covers the whole file.
+    let limit = match (verify, limit) {
+        (true, Limit::Pieces(pieces)) => Limit::Pieces(pieces.max(o.depth as u64)),
+        _ => limit,
+    };
     let start = Instant::now();
     let mut pending = HashMap::<u64, Pending>::new();
     let mut free: VecDeque<_> = (0..o.depth).map(|slot| (slot, None)).collect();
@@ -583,13 +715,14 @@ fn native_phase(
                 .ok_or_else(|| Error::Protocol("probe context exhausted".into()))?;
             // SAFETY: each destination Slot is exclusively owned until its
             // validated CQE, and the immutable Source was checked at setup.
+            let (destination, local_offset) = local.slot(slot);
             let post = checked(unsafe {
                 lane.jetty.post_read(
                     target,
-                    &local[slot],
+                    destination,
                     &remote[(offset / o.region) as usize],
                     &ReadRequest {
-                        local_offset: 0,
+                        local_offset,
                         remote_offset: offset % o.region,
                         length: o.piece as u32,
                         user_ctx: context,
@@ -641,13 +774,7 @@ fn native_phase(
             unsafe { item.wr.complete() };
             require(cqe.status == 0, "native READ completion failed")?;
             if verify {
-                let (ptr, length) = checked(local[item.slot].data())?;
-                require(length as u64 == o.piece, "destination length mismatch")?;
-                let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), length) };
-                require(
-                    crc32fast::hash(bytes) == digests[item.piece],
-                    "native READ CRC mismatch",
-                )?;
+                local.verify(item.slot, digests[item.piece])?;
             }
             completed += 1;
             free.push_back((item.slot, Some(observed)));
@@ -769,14 +896,7 @@ async fn native_probe(o: &Options) -> Result<()> {
                 max_read,
             ))?);
         }
-        let mut local = Vec::new();
-        for _ in 0..o.depth {
-            match SegmentHandle::create_read_buffer(&mut lane.native, o.piece, 4096) {
-                ReadBufferCreation::Ready(buffer) => local.push(buffer),
-                ReadBufferCreation::Rejected(error)
-                | ReadBufferCreation::Uncertain { error, .. } => return checked(Err(error)),
-            }
-        }
+        let mut local = NativeDestinations::create(&mut lane.native, o)?;
         let mut supervisor = supervisor(o, None, session).await?;
         let digests = checksums(o, &mut supervisor, Vec::new()).await?;
         let mut next = 1;
@@ -827,9 +947,7 @@ async fn native_probe(o: &Options) -> Result<()> {
         for remote in &mut remote {
             checked(remote.close())?;
         }
-        for buffer in &mut local {
-            checked(buffer.close())?;
-        }
+        local.close()?;
         checked(target.close())?;
         lane.close()?;
         checked(supervisor.write_u64(FINISHED).await)?;
@@ -1221,10 +1339,10 @@ fn run(cached: bool) {
     let o = Options::env().expect("invalid bandwidth probe options");
     o.validate_mode(cached)
         .expect("invalid bandwidth probe mode");
-    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={} source_pattern={}",
+    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={} source_pattern={} destination_layout={}",
         if cached { "C" } else { "B" }, if o.parent { "parent" } else { "child" }, o.device, o.eid,
         o.file_bytes, o.piece, o.region, o.depth, o.warmup.as_secs(), o.duration.as_secs(),
-        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 }, o.source_pattern.name());
+        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 }, o.source_pattern.name(), o.destination_layout.name());
     let mut builder = if cached {
         let mut b = tokio::runtime::Builder::new_multi_thread();
         b.worker_threads(o.threads);
@@ -1285,6 +1403,7 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
         duration: Duration::from_secs(10),
         threads: 32,
         source_pattern: SourcePattern::Sequential,
+        destination_layout: DestinationLayout::Segments,
     };
     o.validate().unwrap();
     let budget = cached_budget(&o);
@@ -1336,6 +1455,48 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     assert_eq!(fixed.file_bytes, o.file_bytes);
     assert_eq!(fixed.region, o.region);
     assert_eq!(fixed.depth, o.depth);
+    assert!(DestinationLayout::parse("typo").is_err());
+    for depth in [1, 16, 64] {
+        for layout in [DestinationLayout::Segments, DestinationLayout::Contiguous] {
+            let mut cfg = o.clone();
+            cfg.depth = depth;
+            cfg.destination_layout = layout;
+            cfg.validate().unwrap();
+            cfg.validate_mode(false).unwrap();
+            let plan = DestinationPlan::new(&cfg);
+            assert_eq!(
+                plan.segment_count as u64 * plan.segment_bytes,
+                depth as u64 * o.piece
+            );
+            for slot in 0..depth {
+                let (segment, offset) = plan.slots[slot];
+                assert!(segment < plan.segment_count);
+                let range = plan.range(slot, plan.segment_bytes as usize).unwrap();
+                assert_eq!(range.start as u64, offset);
+                assert_eq!(range.len() as u64, o.piece);
+                for previous in 0..slot {
+                    let (other_segment, _) = plan.slots[previous];
+                    let other = plan.range(previous, plan.segment_bytes as usize).unwrap();
+                    assert!(
+                        segment != other_segment
+                            || range.end <= other.start
+                            || other.end <= range.start
+                    );
+                }
+            }
+            assert!(plan.range(depth, plan.segment_bytes as usize).is_err());
+            assert!(plan.range(0, plan.segment_bytes as usize - 1).is_err());
+            if layout == DestinationLayout::Contiguous {
+                assert_eq!(plan.segment_count, 1);
+                assert_ne!(cfg.signature(false), {
+                    let mut separate = cfg.clone();
+                    separate.destination_layout = DestinationLayout::Segments;
+                    separate.signature(false)
+                });
+                assert!(cfg.validate_mode(true).is_err());
+            }
+        }
+    }
     let measured = Measurement {
         pieces: 32,
         elapsed: Duration::from_millis(500),
