@@ -14,6 +14,10 @@ pub(crate) enum ReadSourceMemory {
     /// Piece-exact Storage mmap. Page-aligned mappings are registered directly
     /// and retained through verified revocation.
     Mapped(crate::content::MappedPiece),
+    /// Diagnostic-only anonymous mapping. Uses the same borrowed-pointer native
+    /// registration and verified-retirement ownership as a file mapping.
+    #[cfg(test)]
+    ProbeAnonymous(memmap2::Mmap),
 }
 
 impl ReadSourceMemory {
@@ -21,11 +25,13 @@ impl ReadSourceMemory {
         match self {
             Self::Bytes(bytes) => bytes,
             Self::Mapped(mapped) => mapped.as_slice(),
+            #[cfg(test)]
+            Self::ProbeAnonymous(mapped) => mapped,
         }
     }
 
     fn can_register_directly(&self) -> bool {
-        matches!(self, Self::Mapped(_))
+        !matches!(self, Self::Bytes(_))
             && (self.bytes().as_ptr() as usize) % PROVIDER_PAGE_ALIGNMENT == 0
     }
 }

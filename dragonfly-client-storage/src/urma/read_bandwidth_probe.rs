@@ -87,6 +87,52 @@ impl SourcePattern {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceBacking {
+    File,
+    Anonymous,
+}
+impl SourceBacking {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "file" => Ok(Self::File),
+            "anonymous" => Ok(Self::Anonymous),
+            _ => Err(Error::Protocol(
+                "source backing must be file|anonymous".into(),
+            )),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Anonymous => "anonymous",
+        }
+    }
+}
+
+// Setup only: both variants register directly through the same Source API.
+// Copying the entire Region materializes every anonymous page before timing.
+fn source_memory(
+    file: &Arc<ReadSourceFile>,
+    offset: u64,
+    length: u64,
+    backing: SourceBacking,
+) -> Result<ReadSourceMemory> {
+    let mapped = checked(unsafe { file.map_range(offset, length) })?;
+    match backing {
+        SourceBacking::File => Ok(ReadSourceMemory::Mapped(mapped)),
+        SourceBacking::Anonymous => {
+            let mut anonymous = checked(memmap2::MmapMut::map_anon(checked(usize::try_from(
+                length,
+            ))?))?;
+            anonymous.copy_from_slice(mapped.as_slice());
+            Ok(ReadSourceMemory::ProbeAnonymous(checked(
+                anonymous.make_read_only(),
+            )?))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DestinationLayout {
     Segments,
     Contiguous,
@@ -124,6 +170,7 @@ struct Options {
     duration: Duration,
     threads: usize,
     source_pattern: SourcePattern,
+    source_backing: SourceBacking,
     destination_layout: DestinationLayout,
 }
 impl Options {
@@ -154,6 +201,9 @@ impl Options {
             threads: checked(usize::try_from(number("URMA_BW_TOKIO_THREADS", 32)?))?,
             source_pattern: SourcePattern::parse(
                 &std::env::var("URMA_BW_SOURCE_PATTERN").unwrap_or_else(|_| "sequential".into()),
+            )?,
+            source_backing: SourceBacking::parse(
+                &std::env::var("URMA_BW_SOURCE_BACKING").unwrap_or_else(|_| "file".into()),
             )?,
             destination_layout: DestinationLayout::parse(
                 &std::env::var("URMA_BW_DESTINATION_LAYOUT").unwrap_or_else(|_| "segments".into()),
@@ -207,6 +257,10 @@ impl Options {
     }
     fn validate_mode(&self, cached: bool) -> Result<()> {
         require(
+            !cached || self.source_backing == SourceBacking::File,
+            "anonymous source backing is supported only by probe B",
+        )?;
+        require(
             !cached || matches!(self.destination_layout, DestinationLayout::Segments),
             "contiguous destination layout is supported only by probe B",
         )?;
@@ -228,6 +282,7 @@ impl Options {
         [
             MAGIC,
             u64::from(cached)
+                | (u64::from(self.source_backing == SourceBacking::Anonymous) << 3)
                 | (u64::from(self.source_pattern == SourcePattern::Fixed) << 1)
                 | (u64::from(matches!(
                     self.destination_layout,
@@ -485,8 +540,8 @@ impl NativeObservation {
     fn report(&self, o: &Options, elapsed: Duration) {
         let ns = elapsed.as_nanos().max(1) as f64;
         let mean_us = |total: u128, count: u64| total as f64 / count.max(1) as f64 / 1000.0;
-        println!("URMA_BW_NATIVE mode=B source_pattern={} destination_layout={} wrs={} polls={} empty_polls={} empty_poll_pct={:.3} avg_unretired={:.3} peak_unretired={} full_window_pct={:.3} zero_unretired_pct={:.3} post_call_ms={:.3} post_call_mean_us={:.3} post_call_max_us={:.3} post_to_cqe_mean_us={:.3} post_to_cqe_min_us={:.3} post_to_cqe_max_us={:.3} refill_count={} refill_mean_us={:.3} refill_max_us={:.3} outstanding_scope=host-post-to-polled-cqe drain_included=true",
-            o.source_pattern.name(), o.destination_layout.name(), self.completions, self.polls, self.empty_polls,
+        println!("URMA_BW_NATIVE mode=B source_pattern={} source_backing={} destination_layout={} wrs={} polls={} empty_polls={} empty_poll_pct={:.3} avg_unretired={:.3} peak_unretired={} full_window_pct={:.3} zero_unretired_pct={:.3} post_call_ms={:.3} post_call_mean_us={:.3} post_call_max_us={:.3} post_to_cqe_mean_us={:.3} post_to_cqe_min_us={:.3} post_to_cqe_max_us={:.3} refill_count={} refill_mean_us={:.3} refill_max_us={:.3} outstanding_scope=host-post-to-polled-cqe drain_included=true",
+            o.source_pattern.name(), o.source_backing.name(), o.destination_layout.name(), self.completions, self.polls, self.empty_polls,
             100.0 * self.empty_polls as f64 / self.polls.max(1) as f64,
             self.area_ns as f64 / ns, self.peak, 100.0 * self.full_ns as f64 / ns,
             100.0 * self.zero_ns as f64 / ns, self.post_ns as f64 / 1e6,
@@ -818,12 +873,16 @@ async fn native_probe(o: &Options) -> Result<()> {
         let mut sources = Vec::new();
         for offset in (0..o.file_bytes).step_by(o.region as usize) {
             let token = 0xb7000000 + sources.len() as u32 + 1;
-            let mapped =
-                checked(unsafe { file.map_range(offset, o.region.min(o.file_bytes - offset)) })?;
+            let memory = source_memory(
+                &file,
+                offset,
+                o.region.min(o.file_bytes - offset),
+                o.source_backing,
+            )?;
             let source = match unsafe {
                 ReadSource::register(
                     &mut lane.native,
-                    ReadBacking::new(ReadSourceMemory::Mapped(mapped), ()),
+                    ReadBacking::new(memory, ()),
                     &ReadToken::new(token),
                 )
             } {
@@ -831,6 +890,10 @@ async fn native_probe(o: &Options) -> Result<()> {
                 SourceRegistration::Rejected { error, .. }
                 | SourceRegistration::Uncertain { error, .. } => return checked(Err(error)),
             };
+            require(
+                checked(source.register_stages())?.direct,
+                "bandwidth Source must use direct registration",
+            )?;
             let offer = wire_offer(checked(source.descriptor())?, token, offset, o.piece);
             write_read_frame(
                 &mut stream,
@@ -842,6 +905,13 @@ async fn native_probe(o: &Options) -> Result<()> {
             .await?;
             sources.push(source);
         }
+        println!(
+            "URMA_BW_SOURCE backing={} segments={} registered_bytes={} region_bytes={} direct=true",
+            o.source_backing.name(),
+            sources.len(),
+            o.file_bytes,
+            o.region
+        );
         let mut supervisor = supervisor(o, listener.as_ref(), session).await?;
         checksums(o, &mut supervisor, digests).await?;
         // Child sends this only after draining every WR, checking content,
@@ -1339,10 +1409,10 @@ fn run(cached: bool) {
     let o = Options::env().expect("invalid bandwidth probe options");
     o.validate_mode(cached)
         .expect("invalid bandwidth probe mode");
-    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={} source_pattern={} destination_layout={}",
+    println!("URMA_BW_CONFIG mode={} role={} device={} eid={} file_bytes={} piece_bytes={} region_bytes={} depth={} warmup_s={} measure_s={} poll={} tokio_threads={} source_pattern={} source_backing={} destination_layout={}",
         if cached { "C" } else { "B" }, if o.parent { "parent" } else { "child" }, o.device, o.eid,
         o.file_bytes, o.piece, o.region, o.depth, o.warmup.as_secs(), o.duration.as_secs(),
-        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 }, o.source_pattern.name(), o.destination_layout.name());
+        if cached { "fabric-owner" } else { "busy" }, if cached { o.threads } else { 1 }, o.source_pattern.name(), o.source_backing.name(), o.destination_layout.name());
     let mut builder = if cached {
         let mut b = tokio::runtime::Builder::new_multi_thread();
         b.worker_threads(o.threads);
@@ -1388,6 +1458,30 @@ fn bandwidth_probe_limits_do_not_submit_after_deadline_but_finite_validation_cov
 }
 
 #[test]
+fn bandwidth_probe_anonymous_source_preserves_region_contents_without_file_alias() {
+    use std::io::Write;
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    let bytes: Vec<u8> = (0..16384)
+        .map(|index| (index / 4096 + index % 251) as u8)
+        .collect();
+    fixture.write_all(&bytes).unwrap();
+    let file = ReadSourceFile::open(fixture.path()).unwrap();
+    let region = source_memory(&file, 4096, 8192, SourceBacking::File).unwrap();
+    let anonymous = source_memory(&file, 4096, 8192, SourceBacking::Anonymous).unwrap();
+    let ReadSourceMemory::Mapped(mapped) = region else {
+        panic!("not file-backed")
+    };
+    let ReadSourceMemory::ProbeAnonymous(copy) = anonymous else {
+        panic!("not anonymous")
+    };
+    assert_eq!(copy.as_ref(), &bytes[4096..12288]);
+    assert_eq!(copy.as_ref(), mapped.as_slice());
+    assert_ne!(copy.as_ptr(), mapped.as_slice().as_ptr());
+    assert_eq!(copy.as_ptr() as usize % 4096, 0);
+    assert!(source_memory(&file, 12288, 8192, SourceBacking::Anonymous).is_err());
+}
+
+#[test]
 fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     let o = Options {
         parent: true,
@@ -1403,6 +1497,7 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
         duration: Duration::from_secs(10),
         threads: 32,
         source_pattern: SourcePattern::Sequential,
+        source_backing: SourceBacking::File,
         destination_layout: DestinationLayout::Segments,
     };
     o.validate().unwrap();
@@ -1452,6 +1547,15 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
         assert_eq!(fixed.native_piece(index, false), 0);
         assert_eq!(fixed.native_piece(index, true), index % o.pieces());
     }
+    let mut anonymous = o.clone();
+    anonymous.source_backing = SourceBacking::parse("anonymous").unwrap();
+    assert!(SourceBacking::parse("typo").is_err());
+    anonymous.validate_mode(false).unwrap();
+    assert!(anonymous.validate_mode(true).is_err());
+    assert_ne!(anonymous.signature(false), o.signature(false));
+    let mut anonymous_peer = anonymous.clone();
+    anonymous_peer.parent = false;
+    assert_eq!(anonymous.signature(false), anonymous_peer.signature(false));
     assert_eq!(fixed.file_bytes, o.file_bytes);
     assert_eq!(fixed.region, o.region);
     assert_eq!(fixed.depth, o.depth);
