@@ -1080,10 +1080,23 @@ pub enum UrmaRegistrationMode {
     Cached,
 }
 
+/// Backing for completed-file Cached sources. Piece registrations keep their
+/// existing backing regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UrmaSourceBacking {
+    #[default]
+    File,
+    Anonymous,
+}
+
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UrmaRegistration {
     pub mode: UrmaRegistrationMode,
+
+    /// Anonymous copies each Region once before registering; counted in Source budgets.
+    pub backing: UrmaSourceBacking,
 
     /// Whole-file threshold and fixed Region size ceiling for completed files.
     #[serde(with = "bytesize_serde")]
@@ -1094,6 +1107,7 @@ impl Default for UrmaRegistration {
     fn default() -> Self {
         Self {
             mode: UrmaRegistrationMode::Piece,
+            backing: UrmaSourceBacking::File,
             max_region_bytes: ByteSize::gib(1),
         }
     }
@@ -2268,6 +2282,7 @@ mod tests {
     fn urma_completed_file_registration_configuration() {
         let default = UrmaReadServer::default();
         assert_eq!(default.registration.mode, UrmaRegistrationMode::Piece);
+        assert_eq!(default.registration.backing, UrmaSourceBacking::File);
         assert_eq!(default.registration.max_region_bytes, ByteSize::gib(1));
         let read: UrmaReadServer =
             serde_yaml::from_str("registration:\n  mode: cached\n  maxRegionBytes: 256MiB\n")
@@ -2275,6 +2290,15 @@ mod tests {
         assert_eq!(read.registration.mode, UrmaRegistrationMode::Cached);
         assert_eq!(read.registration.max_region_bytes, ByteSize::mib(256));
         assert!(read.validate().is_ok());
+        let anonymous: UrmaReadServer = serde_yaml::from_str(
+            "registration:\n  mode: cached\n  backing: anonymous\n  maxRegionBytes: 256MiB\n",
+        )
+        .unwrap();
+        assert_eq!(anonymous.registration.backing, UrmaSourceBacking::Anonymous);
+        assert!(anonymous.validate().is_ok());
+        assert!(
+            serde_yaml::from_str::<UrmaReadServer>("registration:\n  backing: typo\n").is_err()
+        );
         let invalid: UrmaReadServer =
             serde_yaml::from_str("registration:\n  mode: cached\n  maxRegionBytes: 0B\n").unwrap();
         assert!(invalid.validate().is_err());

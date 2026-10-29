@@ -58,6 +58,7 @@ const EXACT_TEST_NAME: &str = "urma::read_session_harness::rm_read_memory_to_mem
 fn read_budget() -> ReadRuntimeConfig {
     let cap = |bytes: u64, entries| ReadCapacity { bytes, entries };
     ReadRuntimeConfig {
+        cached_source_backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking::File,
         control_bytes: 16 * 1024 * 1024,
         provider_revocation_validated: true,
         source_workers: 0,

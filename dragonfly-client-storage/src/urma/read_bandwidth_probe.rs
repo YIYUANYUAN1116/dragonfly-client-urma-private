@@ -117,19 +117,19 @@ fn source_memory(
     length: u64,
     backing: SourceBacking,
 ) -> Result<ReadSourceMemory> {
-    let mapped = checked(unsafe { file.map_range(offset, length) })?;
-    match backing {
-        SourceBacking::File => Ok(ReadSourceMemory::Mapped(mapped)),
-        SourceBacking::Anonymous => {
-            let mut anonymous = checked(memmap2::MmapMut::map_anon(checked(usize::try_from(
-                length,
-            ))?))?;
-            anonymous.copy_from_slice(mapped.as_slice());
-            Ok(ReadSourceMemory::ProbeAnonymous(checked(
-                anonymous.make_read_only(),
-            )?))
-        }
-    }
+    checked(unsafe {
+        ReadSourceMemory::from_file(
+            file,
+            offset,
+            length,
+            match backing {
+                SourceBacking::File => dragonfly_client_config::dfdaemon::UrmaSourceBacking::File,
+                SourceBacking::Anonymous => {
+                    dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous
+                }
+            },
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,10 +256,6 @@ impl Options {
         self.file_bytes / self.piece
     }
     fn validate_mode(&self, cached: bool) -> Result<()> {
-        require(
-            !cached || self.source_backing == SourceBacking::File,
-            "anonymous source backing is supported only by probe B",
-        )?;
         require(
             !cached || matches!(self.destination_layout, DestinationLayout::Segments),
             "contiguous destination layout is supported only by probe B",
@@ -1065,6 +1061,14 @@ fn fabric(o: &Options) -> Result<UrmaFabricHandle> {
             &o.device,
             o.eid,
             ReadRuntimeConfig {
+                cached_source_backing: match o.source_backing {
+                    SourceBacking::File => {
+                        dragonfly_client_config::dfdaemon::UrmaSourceBacking::File
+                    }
+                    SourceBacking::Anonymous => {
+                        dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous
+                    }
+                },
                 budget: cached_budget(o),
                 max_outstanding_per_peer: o.depth,
                 max_outstanding_per_piece: 1,
@@ -1274,6 +1278,13 @@ async fn cached_probe(o: &Options) -> Result<()> {
                     .await?
             });
         }
+        println!(
+            "URMA_BW_CACHED_SOURCE backing={} segments={} registered_bytes={} region_bytes={}",
+            o.source_backing.name(),
+            sources.len(),
+            o.file_bytes,
+            o.region
+        );
         let sources = Arc::new(sources);
         let mut supervisor = supervisor(o, listener.as_ref(), session).await?;
         checksums(o, &mut supervisor, digests.clone()).await?;
@@ -1471,7 +1482,7 @@ fn bandwidth_probe_anonymous_source_preserves_region_contents_without_file_alias
     let ReadSourceMemory::Mapped(mapped) = region else {
         panic!("not file-backed")
     };
-    let ReadSourceMemory::ProbeAnonymous(copy) = anonymous else {
+    let ReadSourceMemory::Anonymous(copy) = anonymous else {
         panic!("not anonymous")
     };
     assert_eq!(copy.as_ref(), &bytes[4096..12288]);
@@ -1551,7 +1562,7 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     anonymous.source_backing = SourceBacking::parse("anonymous").unwrap();
     assert!(SourceBacking::parse("typo").is_err());
     anonymous.validate_mode(false).unwrap();
-    assert!(anonymous.validate_mode(true).is_err());
+    anonymous.validate_mode(true).unwrap();
     assert_ne!(anonymous.signature(false), o.signature(false));
     let mut anonymous_peer = anonymous.clone();
     anonymous_peer.parent = false;

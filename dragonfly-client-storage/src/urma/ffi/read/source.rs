@@ -14,19 +14,48 @@ pub(crate) enum ReadSourceMemory {
     /// Piece-exact Storage mmap. Page-aligned mappings are registered directly
     /// and retained through verified revocation.
     Mapped(crate::content::MappedPiece),
-    /// Diagnostic-only anonymous mapping. Uses the same borrowed-pointer native
-    /// registration and verified-retirement ownership as a file mapping.
-    #[cfg(test)]
-    ProbeAnonymous(memmap2::Mmap),
+    /// Owned immutable copy, borrowed by native registration until verified retirement.
+    Anonymous(memmap2::Mmap),
 }
 
 impl ReadSourceMemory {
+    /// Prepare one completed immutable file range. Reservation must precede
+    /// allocation. Anonymous backing has one copy and no shim staging copy.
+    ///
+    /// # Safety
+    /// The caller guarantees immutable completed bytes while mapping/copying;
+    /// file-backed bytes must remain immutable through native retirement.
+    pub(crate) unsafe fn from_file(
+        file: &std::sync::Arc<crate::content::ReadSourceFile>,
+        offset: u64,
+        length: u64,
+        backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
+    ) -> dragonfly_client_core::Result<Self> {
+        let mapped = unsafe { file.map_range(offset, length) }?;
+        if backing == dragonfly_client_config::dfdaemon::UrmaSourceBacking::File {
+            return Ok(Self::Mapped(mapped));
+        }
+        let started = std::time::Instant::now();
+        // copy_from_slice uses the platform memcpy implementation. Allocate once,
+        // touch by copying once, then retain this exact allocation for registration.
+        let mut copy = memmap2::MmapMut::map_anon(mapped.as_slice().len())?;
+        copy.copy_from_slice(mapped.as_slice());
+        let copy = copy.make_read_only()?;
+        tracing::debug!(
+            cached_backing_bytes = length,
+            cached_backing_prepare_ns = started.elapsed().as_nanos() as u64,
+            source_offset = offset,
+            "urma READ anonymous source backing prepared"
+        );
+        // Dropping mapped releases the file mapping, but cache identity bookkeeping
+        // may still retain the opened file. Never claim this also releases the inode.
+        Ok(Self::Anonymous(copy))
+    }
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Bytes(bytes) => bytes,
             Self::Mapped(mapped) => mapped.as_slice(),
-            #[cfg(test)]
-            Self::ProbeAnonymous(mapped) => mapped,
+            Self::Anonymous(mapped) => mapped,
         }
     }
 
@@ -357,6 +386,36 @@ mod tests {
         unsafe {
             drop(Box::from_raw(guard_pointer));
         }
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn anonymous_backing_registers_directly_and_rejection_returns_same_allocation() {
+        let mut allocation = memmap2::MmapMut::map_anon(8192).unwrap();
+        allocation.fill(7);
+        let memory = ReadSourceMemory::Anonymous(allocation.make_read_only().unwrap());
+        assert!(memory.can_register_directly());
+        let pointer = memory.bytes().as_ptr();
+        let drops = Rc::new(Cell::new(0));
+        let mut runtime = NativeRuntime {
+            raw: None,
+            _not_send_sync: PhantomData,
+        };
+        let result = unsafe {
+            ReadSource::register(
+                &mut runtime,
+                ReadBacking::new(memory, Guard(drops.clone())),
+                &ReadToken::new(1),
+            )
+        };
+        let SourceRegistration::Rejected { backing, .. } = result else {
+            panic!("expected rejection")
+        };
+        assert_eq!(drops.get(), 0);
+        let (memory, guard) = backing.into_parts();
+        assert_eq!(memory.bytes().as_ptr(), pointer);
+        assert!(memory.bytes().iter().all(|&byte| byte == 7));
+        drop(guard);
         assert_eq!(drops.get(), 1);
     }
 

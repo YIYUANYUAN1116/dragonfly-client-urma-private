@@ -111,6 +111,7 @@ enum Job {
         token: ReadToken,
     },
     RegisterFile {
+        backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
         submitted: Instant,
         id: ReadOwnerId,
         file: std::sync::Arc<crate::content::ReadSourceFile>,
@@ -321,6 +322,7 @@ impl SourceWorkers {
                                 Outcome::Register(backend.register(id, backing, token)),
                             ),
                             Job::RegisterFile {
+                                backing,
                                 id,
                                 file,
                                 range,
@@ -335,19 +337,17 @@ impl SourceWorkers {
                                     .checked_sub(range.start)
                                     .ok_or(dragonfly_client_core::Error::InvalidParameter)
                                     .and_then(|length| unsafe {
-                                        file.map_range(range.start, length)
+                                        super::ffi::read::source::ReadSourceMemory::from_file(
+                                            &file,
+                                            range.start,
+                                            length,
+                                            backing,
+                                        )
                                     });
                                 let outcome = match mapped {
-                                    Ok(mapped) => backend.register(
-                                        id,
-                                        ReadBacking::new(
-                                            super::ffi::read::source::ReadSourceMemory::Mapped(
-                                                mapped,
-                                            ),
-                                            (),
-                                        ),
-                                        token,
-                                    ),
+                                    Ok(mapped) => {
+                                        backend.register(id, ReadBacking::new(mapped, ()), token)
+                                    }
                                     Err(error) => Registration::BackingRejected(error.to_string()),
                                 };
                                 (id, submitted, "register", Outcome::Register(outcome))
@@ -438,10 +438,12 @@ impl SourceWorkers {
         file: std::sync::Arc<crate::content::ReadSourceFile>,
         range: std::ops::Range<u64>,
         token: ReadToken,
+        backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
     ) -> std::result::Result<(), Reply> {
         self.enqueue_registration(
             id,
             Job::RegisterFile {
+                backing,
                 id,
                 file,
                 range,
@@ -662,12 +664,17 @@ mod tests {
             }
             let length = backing.len();
             let (memory, keepalive) = backing.into_parts();
-            if let super::super::ffi::read::source::ReadSourceMemory::Mapped(mapped) = &memory {
-                self.gate
-                    .mapped_bytes
-                    .lock()
-                    .unwrap()
-                    .push(mapped.as_slice().to_vec());
+            let bytes = match &memory {
+                super::super::ffi::read::source::ReadSourceMemory::Mapped(mapped) => {
+                    Some(mapped.as_slice())
+                }
+                super::super::ffi::read::source::ReadSourceMemory::Anonymous(mapped) => {
+                    Some(mapped.as_ref())
+                }
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                self.gate.mapped_bytes.lock().unwrap().push(bytes.to_vec());
             }
             let backing = ReadBacking::new(memory, keepalive);
             self.sources.insert(id, backing);
@@ -800,6 +807,16 @@ mod tests {
     }
     #[test]
     fn cached_mapping_uses_opened_inode_after_unlink_and_path_replacement() {
+        cached_backing_after_replacement(
+            dragonfly_client_config::dfdaemon::UrmaSourceBacking::File,
+        );
+        cached_backing_after_replacement(
+            dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous,
+        );
+    }
+    fn cached_backing_after_replacement(
+        backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
+    ) {
         let (mut pool, gate, entered) = setup(1);
         let first = id();
         let receiver = submit(&mut pool, first);
@@ -811,7 +828,7 @@ mod tests {
         let mut registry = registry();
         let source = registry.reserve_source(16).unwrap();
         assert!(pool
-            .register_file(source, file, 8..24, ReadToken::new(9))
+            .register_file(source, file, 8..24, ReadToken::new(9), backing)
             .is_ok());
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, vec![255; 64]).unwrap();
@@ -844,7 +861,13 @@ mod tests {
         let mut registry = registry();
         let source = registry.reserve_source(8).unwrap();
         assert!(pool
-            .register_file(source, file, 8..16, ReadToken::new(9))
+            .register_file(
+                source,
+                file,
+                8..16,
+                ReadToken::new(9),
+                dragonfly_client_config::dfdaemon::UrmaSourceBacking::File
+            )
             .is_ok());
         let results = wait(&mut pool, 1);
         assert!(matches!(

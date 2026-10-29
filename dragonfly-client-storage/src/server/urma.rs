@@ -940,6 +940,7 @@ impl UrmaServerHandler {
             task_id = %locator.task_id,
             piece_id,
             source_cached,
+            source_backing = ?self.read.registration.backing,
             source_id = ?pending.source_id,
             source_e2e_ns = source_e2e_start.elapsed().as_nanos() as u64,
             source_open_ns,

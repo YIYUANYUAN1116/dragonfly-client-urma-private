@@ -173,6 +173,7 @@ impl ReadRuntimeConfig {
             max_outstanding_per_piece: read.max_outstanding_per_piece as usize,
             buffer_alignment: 4096,
             source_workers: read.source_workers as usize,
+            cached_source_backing: read.registration.backing,
             provider_revocation_validated: read.provider_revocation_validated,
             control_bytes: read.control_bytes.as_u64(),
         })
@@ -181,6 +182,7 @@ impl ReadRuntimeConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadRuntimeConfig {
+    pub(crate) cached_source_backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
     pub(crate) control_bytes: u64,
     pub(crate) provider_revocation_validated: bool,
     pub(crate) source_workers: usize,
@@ -492,6 +494,7 @@ mod native {
         next_cache_idle_check: Instant,
         next_cache_maintenance: Instant,
         cached_revocation_validated: bool,
+        cached_source_backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
         controls: HashMap<u16, crate::urma::native_control::NativeControl>,
         control_bytes: u64,
         _not_send_sync: PhantomData<Rc<()>>,
@@ -561,6 +564,7 @@ mod native {
             debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
             let cached_revocation_validated = config.read.provider_revocation_validated;
             let control_bytes = config.read.control_bytes;
+            let cached_source_backing = config.read.cached_source_backing;
             let read = {
                 let read = config.read;
                 let credits = match ReadWrCredits::new(
@@ -619,6 +623,7 @@ mod native {
                 next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated,
+                cached_source_backing,
                 controls: HashMap::new(),
                 control_bytes,
                 _not_send_sync: PhantomData,
@@ -1261,7 +1266,13 @@ mod native {
             if claim.register {
                 if let Some(workers) = &mut self.source_workers {
                     if workers
-                        .register_file(claim.source, claim.file, claim.range.clone(), request.token)
+                        .register_file(
+                            claim.source,
+                            claim.file,
+                            claim.range.clone(),
+                            request.token,
+                            self.cached_source_backing,
+                        )
                         .is_err()
                     {
                         let _ = self.read.owners.reject_worker_source(claim.source);
@@ -1270,19 +1281,17 @@ mod native {
                     // Baseline sourceWorkers=0 remains synchronous. There is no
                     // shared Storage/Fabric mutex held across mmap or native calls.
                     let mapped = unsafe {
-                        claim
-                            .file
-                            .map_range(claim.range.start, claim.range.end - claim.range.start)
+                        super::super::ffi::read::source::ReadSourceMemory::from_file(
+                            &claim.file,
+                            claim.range.start,
+                            claim.range.end - claim.range.start,
+                            self.cached_source_backing,
+                        )
                     };
                     match mapped {
                         Ok(mapped) => {
                             if let Some(native) = self.native.as_mut() {
-                                let backing = ReadBacking::new(
-                                    super::super::ffi::read::source::ReadSourceMemory::Mapped(
-                                        mapped,
-                                    ),
-                                    (),
-                                );
+                                let backing = ReadBacking::new(mapped, ());
                                 let result = unsafe {
                                     self.read.owners.register_cached_source(
                                         claim.source,
@@ -2145,6 +2154,7 @@ mod native {
                 next_cache_idle_check: Instant::now(),
                 next_cache_maintenance: Instant::now(),
                 cached_revocation_validated: true,
+                cached_source_backing: read.cached_source_backing,
                 controls: HashMap::new(),
                 control_bytes: read.control_bytes,
                 _not_send_sync: PhantomData,
@@ -2180,6 +2190,7 @@ mod native {
                     claim.file.clone(),
                     claim.range.clone(),
                     ReadToken::new(1),
+                    runtime.cached_source_backing,
                 )
                 .is_ok());
             (dir, claim)
