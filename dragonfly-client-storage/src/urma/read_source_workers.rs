@@ -813,6 +813,9 @@ mod tests {
         cached_backing_after_replacement(
             dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous,
         );
+        cached_backing_after_replacement(
+            dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse,
+        );
     }
     fn cached_backing_after_replacement(
         backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,

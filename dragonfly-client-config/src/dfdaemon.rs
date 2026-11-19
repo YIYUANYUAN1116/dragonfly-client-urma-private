@@ -1087,6 +1087,9 @@ pub enum UrmaRegistrationMode {
 pub enum UrmaSourceBacking {
     #[default]
     File,
+    /// Best-effort synchronous file THP collapse before Cached registration.
+    #[serde(rename = "file-collapse")]
+    FileCollapse,
     Anonymous,
 }
 
@@ -2296,6 +2299,15 @@ mod tests {
         .unwrap();
         assert_eq!(anonymous.registration.backing, UrmaSourceBacking::Anonymous);
         assert!(anonymous.validate().is_ok());
+        let collapsed: UrmaReadServer = serde_yaml::from_str(
+            "registration:\n  mode: cached\n  backing: file-collapse\n  maxRegionBytes: 256MiB\n",
+        )
+        .unwrap();
+        assert_eq!(
+            collapsed.registration.backing,
+            UrmaSourceBacking::FileCollapse
+        );
+        assert!(collapsed.validate().is_ok());
         assert!(
             serde_yaml::from_str::<UrmaReadServer>("registration:\n  backing: typo\n").is_err()
         );

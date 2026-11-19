@@ -89,21 +89,24 @@ impl SourcePattern {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceBacking {
     File,
+    FileCollapse,
     Anonymous,
 }
 impl SourceBacking {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "file" => Ok(Self::File),
+            "file-collapse" => Ok(Self::FileCollapse),
             "anonymous" => Ok(Self::Anonymous),
             _ => Err(Error::Protocol(
-                "source backing must be file|anonymous".into(),
+                "source backing must be file|file-collapse|anonymous".into(),
             )),
         }
     }
     fn name(self) -> &'static str {
         match self {
             Self::File => "file",
+            Self::FileCollapse => "file-collapse",
             Self::Anonymous => "anonymous",
         }
     }
@@ -124,6 +127,9 @@ fn source_memory(
             length,
             match backing {
                 SourceBacking::File => dragonfly_client_config::dfdaemon::UrmaSourceBacking::File,
+                SourceBacking::FileCollapse => {
+                    dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse
+                }
                 SourceBacking::Anonymous => {
                     dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous
                 }
@@ -279,6 +285,7 @@ impl Options {
             MAGIC,
             u64::from(cached)
                 | (u64::from(self.source_backing == SourceBacking::Anonymous) << 3)
+                | (u64::from(self.source_backing == SourceBacking::FileCollapse) << 4)
                 | (u64::from(self.source_pattern == SourcePattern::Fixed) << 1)
                 | (u64::from(matches!(
                     self.destination_layout,
@@ -1065,6 +1072,9 @@ fn fabric(o: &Options) -> Result<UrmaFabricHandle> {
                     SourceBacking::File => {
                         dragonfly_client_config::dfdaemon::UrmaSourceBacking::File
                     }
+                    SourceBacking::FileCollapse => {
+                        dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse
+                    }
                     SourceBacking::Anonymous => {
                         dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous
                     }
@@ -1563,6 +1573,12 @@ fn bandwidth_probe_geometry_and_peer_signature_are_bounded() {
     assert!(SourceBacking::parse("typo").is_err());
     anonymous.validate_mode(false).unwrap();
     anonymous.validate_mode(true).unwrap();
+    let mut collapse = o.clone();
+    collapse.source_backing = SourceBacking::parse("file-collapse").unwrap();
+    collapse.validate_mode(false).unwrap();
+    collapse.validate_mode(true).unwrap();
+    assert_ne!(collapse.signature(false), o.signature(false));
+    assert_ne!(collapse.signature(false), anonymous.signature(false));
     assert_ne!(anonymous.signature(false), o.signature(false));
     let mut anonymous_peer = anonymous.clone();
     anonymous_peer.parent = false;

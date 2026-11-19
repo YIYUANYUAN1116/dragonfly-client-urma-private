@@ -32,7 +32,30 @@ impl ReadSourceMemory {
         backing: dragonfly_client_config::dfdaemon::UrmaSourceBacking,
     ) -> dragonfly_client_core::Result<Self> {
         let mapped = unsafe { file.map_range(offset, length) }?;
-        if backing == dragonfly_client_config::dfdaemon::UrmaSourceBacking::File {
+        if backing != dragonfly_client_config::dfdaemon::UrmaSourceBacking::Anonymous {
+            if backing == dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse {
+                // Only Cached misses (and explicit probes) enter this path. Run
+                // before native registration pins the pages; failure keeps the
+                // same valid file mapping, including partially collapsed ranges.
+                let started = std::time::Instant::now();
+                let hint_errno = madvise_source(mapped.as_slice(), libc::MADV_HUGEPAGE);
+                let errno = madvise_source(mapped.as_slice(), libc::MADV_COLLAPSE);
+                let elapsed_ns = started.elapsed().as_nanos() as u64;
+                tracing::info!(
+                    collapse_bytes = length,
+                    source_offset = offset,
+                    collapse_succeeded = (errno == 0),
+                    collapse_errno = errno,
+                    collapse_hint_errno = hint_errno,
+                    collapse_ns = elapsed_ns,
+                    "urma READ file source collapse attempted"
+                );
+                // Ignored B/C probes do not install the application subscriber.
+                // Keep their actual attempt/outcome evidence outside the timer.
+                #[cfg(test)]
+                println!("URMA_BW_COLLAPSE bytes={} offset={} succeeded={} errno={} hint_errno={} elapsed_ns={}",
+                    length, offset, errno == 0, errno, hint_errno, elapsed_ns);
+            }
             return Ok(Self::Mapped(mapped));
         }
         let started = std::time::Instant::now();
@@ -62,6 +85,23 @@ impl ReadSourceMemory {
     fn can_register_directly(&self) -> bool {
         !matches!(self, Self::Bytes(_))
             && (self.bytes().as_ptr() as usize) % PROVIDER_PAGE_ALIGNMENT == 0
+    }
+}
+
+// Neither advice changes byte contents or invalidates the mapping. The kernel
+// clamps to eligible hugepage boundaries; it may decline or partly succeed.
+// Preserve errno immediately and never convert advisory failure into READ failure.
+fn madvise_source(bytes: &[u8], advice: libc::c_int) -> i32 {
+    // SAFETY: the slice covers a live immutable mmap, which remains owned by the
+    // caller through both advice and subsequent native registration. Only the
+    // HugePage/Collapse advice values above are used; neither discards data.
+    let result = unsafe { libc::madvise(bytes.as_ptr().cast_mut().cast(), bytes.len(), advice) };
+    if result == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     }
 }
 
@@ -387,6 +427,37 @@ mod tests {
             drop(Box::from_raw(guard_pointer));
         }
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn file_collapse_keeps_small_file_range_usable_when_hugepages_are_unavailable() {
+        use std::io::Write;
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        fixture.write_all(&vec![0x5a; 4096]).unwrap();
+        let file = crate::content::ReadSourceFile::open(fixture.path()).unwrap();
+        // Sub-hugepage writable fixture cannot rely on any kernel/FS THP support.
+        // A failed advice must return the same direct-registerable file bytes.
+        let memory = unsafe {
+            ReadSourceMemory::from_file(
+                &file,
+                0,
+                4096,
+                dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse,
+            )
+        }
+        .unwrap();
+        assert!(matches!(&memory, ReadSourceMemory::Mapped(_)));
+        assert!(memory.can_register_directly());
+        assert_eq!(memory.bytes(), &[0x5a; 4096]);
+        assert!(unsafe {
+            ReadSourceMemory::from_file(
+                &file,
+                4096,
+                4096,
+                dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse,
+            )
+        }
+        .is_err());
     }
 
     #[test]
