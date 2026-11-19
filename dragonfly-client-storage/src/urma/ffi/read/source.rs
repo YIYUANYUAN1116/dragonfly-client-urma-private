@@ -39,7 +39,11 @@ impl ReadSourceMemory {
                 // same valid file mapping, including partially collapsed ranges.
                 let started = std::time::Instant::now();
                 let hint_errno = madvise_source(mapped.as_slice(), libc::MADV_HUGEPAGE);
-                let errno = madvise_source(mapped.as_slice(), libc::MADV_COLLAPSE);
+                let outcome = collapse_with_writeback(
+                    || madvise_source(mapped.as_slice(), libc::MADV_COLLAPSE),
+                    || file.writeback_range(offset, length),
+                );
+                let errno = outcome.errno;
                 let elapsed_ns = started.elapsed().as_nanos() as u64;
                 tracing::info!(
                     collapse_bytes = length,
@@ -48,13 +52,18 @@ impl ReadSourceMemory {
                     collapse_errno = errno,
                     collapse_hint_errno = hint_errno,
                     collapse_ns = elapsed_ns,
+                    collapse_initial_errno = outcome.initial_errno,
+                    collapse_retries = outcome.retries,
+                    collapse_writeback_ns = outcome.writeback_ns,
+                    collapse_writeback_errno = outcome.writeback_errno,
                     "urma READ file source collapse attempted"
                 );
                 // Ignored B/C probes do not install the application subscriber.
                 // Keep their actual attempt/outcome evidence outside the timer.
                 #[cfg(test)]
-                println!("URMA_BW_COLLAPSE bytes={} offset={} succeeded={} errno={} hint_errno={} elapsed_ns={}",
-                    length, offset, errno == 0, errno, hint_errno, elapsed_ns);
+                println!("URMA_BW_COLLAPSE bytes={} offset={} succeeded={} errno={} hint_errno={} elapsed_ns={} initial_errno={} retries={} writeback_ns={} writeback_errno={}",
+                    length, offset, errno == 0, errno, hint_errno, elapsed_ns,
+                    outcome.initial_errno, outcome.retries, outcome.writeback_ns, outcome.writeback_errno);
             }
             return Ok(Self::Mapped(mapped));
         }
@@ -86,6 +95,46 @@ impl ReadSourceMemory {
         !matches!(self, Self::Bytes(_))
             && (self.bytes().as_ptr() as usize) % PROVIDER_PAGE_ALIGNMENT == 0
     }
+}
+
+#[derive(Debug)]
+struct CollapseOutcome {
+    errno: i32,
+    initial_errno: i32,
+    retries: u8,
+    writeback_errno: i32,
+    writeback_ns: u64,
+}
+
+// Dirty/writeback folios can produce EINVAL. Bound recovery to one range
+// writeback and one retry. Other EINVAL causes remain a valid file fallback.
+fn collapse_with_writeback(
+    mut collapse: impl FnMut() -> i32,
+    writeback: impl FnOnce() -> std::io::Result<()>,
+) -> CollapseOutcome {
+    let initial_errno = collapse();
+    let mut outcome = CollapseOutcome {
+        errno: initial_errno,
+        initial_errno,
+        retries: 0,
+        writeback_errno: 0,
+        writeback_ns: 0,
+    };
+    if matches!(initial_errno, libc::EINVAL | libc::EAGAIN | libc::EBUSY) {
+        let started = std::time::Instant::now();
+        let result = writeback();
+        outcome.writeback_ns = started.elapsed().as_nanos() as u64;
+        match result {
+            Ok(()) => {
+                outcome.retries = 1;
+                outcome.errno = collapse();
+            }
+            Err(error) => {
+                outcome.writeback_errno = error.raw_os_error().unwrap_or(libc::EIO);
+            }
+        }
+    }
+    outcome
 }
 
 // Neither advice changes byte contents or invalidates the mapping. The kernel
@@ -427,6 +476,66 @@ mod tests {
             drop(Box::from_raw(guard_pointer));
         }
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn collapse_retries_only_after_completed_writeback_and_stops_after_one_retry() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut calls = 0;
+        let result = collapse_with_writeback(
+            || {
+                events.borrow_mut().push("collapse");
+                calls += 1;
+                if calls == 1 {
+                    libc::EINVAL
+                } else {
+                    0
+                }
+            },
+            || {
+                events.borrow_mut().push("writeback-complete");
+                Ok(())
+            },
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec!["collapse", "writeback-complete", "collapse"]
+        );
+        assert_eq!(result.initial_errno, libc::EINVAL);
+        assert_eq!(result.errno, 0);
+        assert_eq!(result.retries, 1);
+        let mut calls = 0;
+        let result = collapse_with_writeback(
+            || {
+                calls += 1;
+                libc::EINVAL
+            },
+            || Ok(()),
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(result.errno, libc::EINVAL);
+        assert_eq!(result.retries, 1);
+    }
+
+    #[test]
+    fn collapse_does_not_writeback_on_success_or_retry_after_writeback_failure() {
+        for errno in [0, libc::ENOMEM, libc::ENOSYS] {
+            let result = collapse_with_writeback(|| errno, || panic!("unexpected writeback"));
+            assert_eq!(result.errno, errno);
+            assert_eq!(result.retries, 0);
+        }
+        let mut calls = 0;
+        let result = collapse_with_writeback(
+            || {
+                calls += 1;
+                libc::EAGAIN
+            },
+            || Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(result.errno, libc::EAGAIN);
+        assert_eq!(result.writeback_errno, libc::EIO);
+        assert_eq!(result.retries, 0);
     }
 
     #[test]

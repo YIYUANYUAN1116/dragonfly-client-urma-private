@@ -62,6 +62,36 @@ impl ReadSourceFile {
         Ok(self.file.metadata()?.len())
     }
 
+    /// Finish data writeback of one completed immutable Region before a
+    /// best-effort THP retry. This is not fsync/fdatasync or a durability promise.
+    /// Use the exact opened inode even if Storage has unlinked/replaced its path.
+    pub(crate) fn writeback_range(&self, offset: u64, length: u64) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "writeback range overflow")
+        })?;
+        if length == 0 || end > self.opened_length || end > i64::MAX as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid writeback range",
+            ));
+        }
+        // WRITE alone can leave dirty/writeback folios in collapse_file(). Wait
+        // for previous writeback, submit remaining dirty pages, then wait again.
+        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+            | libc::SYNC_FILE_RANGE_WRITE
+            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+        // SAFETY: this object owns fd; validated bounds fit the Linux off64 ABI.
+        let result = unsafe {
+            libc::sync_file_range(self.file.as_raw_fd(), offset as _, length as _, flags)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     /// Maps a range using the same file handle that supplied the identity.
     /// File length only validates bounds; it does not prove Piece completion.
     ///
@@ -131,6 +161,26 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn range_writeback_uses_open_inode_and_rejects_invalid_ranges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("task");
+        fs::write(&path, vec![7; 8192]).unwrap();
+        let opened = ReadSourceFile::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, vec![9; 8192]).unwrap();
+        opened.writeback_range(4096, 4096).unwrap();
+        let mapped = unsafe { opened.map_range(4096, 4096) }.unwrap();
+        assert_eq!(mapped.as_slice(), &[7; 4096]);
+        assert_eq!(fs::read(&path).unwrap(), vec![9; 8192]);
+        for (offset, length) in [(0, 0), (8192, 1), (u64::MAX, 1)] {
+            assert_eq!(
+                opened.writeback_range(offset, length).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn unlink_and_recreate_separates_old_mapping_from_new_file() {
