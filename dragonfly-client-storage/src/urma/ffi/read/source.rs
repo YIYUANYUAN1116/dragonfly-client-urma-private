@@ -45,6 +45,10 @@ impl ReadSourceMemory {
                 );
                 let errno = outcome.errno;
                 let elapsed_ns = started.elapsed().as_nanos() as u64;
+                // Diagnostic for the deployment's 2 MiB PMD geometry. Matching
+                // VA/file-offset residues matters, not only an aligned length.
+                let va_mod_2m = mapped.as_slice().as_ptr() as usize % (2 << 20);
+                let offset_mod_2m = offset % (2 << 20);
                 tracing::info!(
                     collapse_bytes = length,
                     source_offset = offset,
@@ -56,14 +60,18 @@ impl ReadSourceMemory {
                     collapse_retries = outcome.retries,
                     collapse_writeback_ns = outcome.writeback_ns,
                     collapse_writeback_errno = outcome.writeback_errno,
+                    collapse_va_mod_2m = va_mod_2m,
+                    collapse_offset_mod_2m = offset_mod_2m,
+                    collapse_alignment_2m = (va_mod_2m as u64 == offset_mod_2m),
                     "urma READ file source collapse attempted"
                 );
                 // Ignored B/C probes do not install the application subscriber.
                 // Keep their actual attempt/outcome evidence outside the timer.
                 #[cfg(test)]
-                println!("URMA_BW_COLLAPSE bytes={} offset={} succeeded={} errno={} hint_errno={} elapsed_ns={} initial_errno={} retries={} writeback_ns={} writeback_errno={}",
+                println!("URMA_BW_COLLAPSE bytes={} offset={} succeeded={} errno={} hint_errno={} elapsed_ns={} initial_errno={} retries={} writeback_ns={} writeback_errno={} va_mod_2m={} offset_mod_2m={}",
                     length, offset, errno == 0, errno, hint_errno, elapsed_ns,
-                    outcome.initial_errno, outcome.retries, outcome.writeback_ns, outcome.writeback_errno);
+                    outcome.initial_errno, outcome.retries, outcome.writeback_ns, outcome.writeback_errno,
+                    va_mod_2m, offset_mod_2m);
             }
             return Ok(Self::Mapped(mapped));
         }

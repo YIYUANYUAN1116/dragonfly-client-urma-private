@@ -121,6 +121,16 @@ impl FDCache {
         Ok(fd)
     }
 
+    /// Drops only the cache's write descriptor reference. Returns None when
+    /// absent, or an observational count of other Arc holders at removal time.
+    /// Active writes/background writeback retain their own valid descriptors;
+    /// this is cache eviction, not a write barrier or an inode-wide close.
+    pub fn remove_write(&self, path: &Path) -> Result<Option<usize>> {
+        let removed = self.write_fds.lock()?.pop(path);
+        // Drop the descriptor outside the cache lock.
+        Ok(removed.map(|fd| Arc::strong_count(&fd) - 1))
+    }
+
     /// Removes the cached file descriptors of the path. It needs to be called when
     /// the file is deleted, so a recreated file will not be read through the stale
     /// descriptor.
@@ -136,6 +146,26 @@ mod tests {
     use super::*;
     use std::os::unix::fs::FileExt;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn removing_cached_writer_preserves_active_writer_and_read_cache() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("task");
+        std::fs::write(&path, b"old").unwrap();
+        let cache = FDCache::new(DEFAULT_FD_CACHE_CAPACITY);
+        let reader = cache.open(&path).await.unwrap();
+        let writer = cache.open_write(&path).await.unwrap();
+        assert_eq!(cache.remove_write(&path).unwrap(), Some(1));
+        assert_eq!(Arc::strong_count(&writer), 1);
+        assert!(Arc::ptr_eq(&reader, &cache.open(&path).await.unwrap()));
+        writer.write_all_at(b"new", 0).unwrap();
+        let reopened = cache.open_write(&path).await.unwrap();
+        assert!(!Arc::ptr_eq(&writer, &reopened));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        drop(reopened);
+        assert_eq!(cache.remove_write(&path).unwrap(), Some(0));
+        assert_eq!(cache.remove_write(&path).unwrap(), None);
+    }
 
     #[tokio::test]
     async fn test_fd_cache() {

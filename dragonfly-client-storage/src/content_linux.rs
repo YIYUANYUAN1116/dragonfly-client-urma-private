@@ -393,6 +393,17 @@ impl Content {
         ))
     }
 
+    /// Allow completed immutable files to satisfy file-THP's no-writer check.
+    /// The caller must establish full ordinary-Task completion first. Eviction
+    /// cannot close active writes or background writeback holders.
+    #[cfg(feature = "urma")]
+    pub(crate) fn release_task_write_fd_for_collapse(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<usize>> {
+        self.fd_cache.remove_write(&self.get_task_path(task_id))
+    }
+
     /// Open the current Task file for an URMA cache lookup, bypassing the path FD cache.
     #[cfg(feature = "urma")]
     pub(crate) async fn open_task_read_source(

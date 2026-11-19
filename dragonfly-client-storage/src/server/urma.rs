@@ -583,6 +583,20 @@ impl UrmaServerHandler {
                 {
                     return Ok(None);
                 }
+                if self.read.registration.backing
+                    == dragonfly_client_config::dfdaemon::UrmaSourceBacking::FileCollapse
+                {
+                    let remaining = self
+                        .storage
+                        .content
+                        .release_task_write_fd_for_collapse(task_id)?;
+                    info!(
+                        task_id,
+                        cached_writer_removed = remaining.is_some(),
+                        cached_writer_other_refs = remaining.unwrap_or(0),
+                        "urma READ file collapse cached writer released"
+                    );
+                }
                 // SAFETY: canonical completed disk Pieces cover this whole file;
                 // reuse Dragonfly's existing completed-content immutability contract.
                 unsafe {

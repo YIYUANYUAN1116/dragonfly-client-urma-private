@@ -147,6 +147,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_file_can_release_cached_writer_without_changing_read_source() {
+        let (_dir, storage) = storage().await;
+        for number in 0..3 {
+            finish(&storage, number, number as u8).await;
+        }
+        let source = source(&storage).await;
+        assert!(storage
+            .file_is_complete_for_cache(TASK, &source)
+            .await
+            .unwrap());
+        let identity = source.file.identity();
+        // Background writeback may still have references. Cache removal never
+        // claims those references were drained or forcibly closes them.
+        assert!(storage
+            .content
+            .release_task_write_fd_for_collapse(TASK)
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .content
+            .release_task_write_fd_for_collapse(TASK)
+            .unwrap()
+            .is_none());
+        assert_eq!(source.file.identity(), identity);
+        assert_eq!(source.file.file_length().unwrap(), 19);
+        let mapped = unsafe { source.file.map_range(0, 19) }.unwrap();
+        assert_eq!(&mapped.as_slice()[..8], &[0; 8]);
+        assert_eq!(&mapped.as_slice()[8..16], &[1; 8]);
+        assert_eq!(&mapped.as_slice()[16..], &[2; 3]);
+    }
+
+    #[tokio::test]
     async fn range_finished_flag_does_not_authorize_incomplete_file() {
         let (_dir, storage) = storage().await;
         finish(&storage, 0, 1).await;
